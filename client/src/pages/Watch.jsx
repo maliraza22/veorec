@@ -13,6 +13,16 @@ import VideoPlayer from '../components/VideoPlayer';
 
 const REACTIONS = ['👍', '❤️', '😂', '🎉', '🔥', '👏'];
 
+// Stable per-browser id so an anonymous viewer is counted only once (across reloads
+// and even if their IP changes). Logged-in viewers dedup by their user id server-side.
+function getVisitorId() {
+  try {
+    let v = localStorage.getItem('vr_vid');
+    if (!v) { v = 'v_' + Math.random().toString(36).slice(2) + Date.now().toString(36); localStorage.setItem('vr_vid', v); }
+    return v;
+  } catch { return ''; }
+}
+
 // Translation targets — the full set of languages Whisper large-v3 supports (99),
 // translated via the LLM. Urdu/Hindi/English first. "Original" (the native mixed
 // transcript) is added as the first option in the dropdown itself.
@@ -499,8 +509,11 @@ export default function Watch() {
   }
 
   function afterLoad() {
-    // count a view + load engagement
-    fetch(`${API}/api/watch/${id}/view`, { method: 'POST', headers: authHeaders() })
+    // count a view (unique per viewer; owner self-views don't count) + engagement
+    fetch(`${API}/api/watch/${id}/view`, {
+      method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ visitorId: getVisitorId() }),
+    })
       .then(r => r.json()).then(d => setViews(d.views)).catch(() => {});
     fetch(`${API}/api/watch/${id}/engagement`)
       .then(r => r.json()).then(d => { setViews(d.views); setReactions(d.reactions || []); setComments(d.comments || []); })

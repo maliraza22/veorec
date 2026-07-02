@@ -686,11 +686,28 @@ app.post('/api/watch/:id/unlock', async (req, res) => {
 });
 
 // ── Engagement (public) ───────────────────────────────────────────────────────
-app.post('/api/watch/:id/view', (req, res) => {
+// Count a view ONCE per unique viewer, and NEVER count the owner watching their
+// own video. Uniqueness key = signed-in user id → client visitor id → IP.
+app.post('/api/watch/:id/view', async (req, res) => {
   const viewer = viewerFromAuth(req);
+  const vid = (req.body && typeof req.body.visitorId === 'string') ? req.body.visitorId.slice(0, 64) : '';
+  const ip = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || '';
+  const key = viewer ? `u:${viewer.id}` : (vid ? `v:${vid}` : (ip ? `ip:${ip}` : ''));
+
+  const m0 = meta.get(req.params.id);
+  const keys = Array.isArray(m0.viewKeys) ? m0.viewKeys : [];
+  // Already counted this viewer (unique views) or no usable key → don't re-count.
+  if (!key || keys.includes(key)) return res.json({ views: m0.views || 0 });
+  // A NEW viewer who is the OWNER (signed in, watching their own video) → skip.
+  try { if (viewer && await userOwns(viewer.id, req.params.id)) return res.json({ views: m0.views || 0, self: true }); } catch {}
+
   const updated = meta.update(req.params.id, m => {
-    m.views = (m.views || 0) + 1;
-    if (viewer) m.viewers = [{ name: viewer.name, email: viewer.email, at: Date.now() }, ...(m.viewers || []).slice(0, 199)];
+    const ks = Array.isArray(m.viewKeys) ? m.viewKeys : [];
+    if (!ks.includes(key)) {
+      m.viewKeys = [...ks, key].slice(-5000);          // cap the dedup set
+      m.views = (m.views || 0) + 1;
+      if (viewer) m.viewers = [{ name: viewer.name, email: viewer.email, at: Date.now() }, ...(m.viewers || []).slice(0, 199)];
+    }
     return m;
   });
   res.json({ views: updated.views });
