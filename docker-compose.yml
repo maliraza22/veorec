@@ -1,0 +1,104 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# LOCAL DEVELOPMENT INFRASTRUCTURE (T-101)
+#
+# Development only. This file is NOT the production deployment mechanism —
+# production runs on a provider-agnostic VPS (docs/02 §6) with its own compose/
+# infra definitions under infra/ (added by a later task).
+#
+#   docker compose up -d          start everything
+#   docker compose ps             check health
+#   docker compose down           stop (data kept)
+#   docker compose down -v        stop and DELETE all local data
+#
+# Host ports are deliberately NON-DEFAULT so this stack cannot collide with a
+# Postgres/Redis already installed on the developer's machine. Override any of
+# them in .env (see .env.example).
+#
+# Credentials here are local-development-only placeholders. Production secrets
+# never live in this file (docs/17 §9).
+# ─────────────────────────────────────────────────────────────────────────────
+name: veorec-dev
+
+services:
+  # ── PostgreSQL — the source of application truth (docs/02 §11) ─────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: veorec-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-veorec}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-veorec_local_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-veorec}
+      # Deterministic collation/encoding so local matches CI and production.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - veorec_pgdata:/var/lib/postgresql/data
+      # Runs ONCE on first initialisation of an empty data volume: creates the
+      # separate test database used by `cd db && npm test`.
+      - ./db/docker/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-veorec} -d ${POSTGRES_DB:-veorec}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # ── Redis — BullMQ queues + rate limits (never authoritative, docs/02 §12) ──
+  redis:
+    image: redis:7-alpine
+    container_name: veorec-redis
+    restart: unless-stopped
+    # appendonly keeps queued jobs across a local restart; production tuning is
+    # a separate infra concern.
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6380}:6379"
+    volumes:
+      - veorec_redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  # ── MinIO — LOCAL S3-compatible substitute for Cloudflare R2 ───────────────
+  # Development only. Production storage is R2 via the StorageProvider
+  # abstraction (docs/02 §10.1, arriving in T-201). Nothing in the application
+  # may depend on MinIO specifically.
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    container_name: veorec-minio
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-veorec_dev}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-veorec_local_dev_secret}
+    ports:
+      - "${MINIO_PORT:-9100}:9000"       # S3 API
+      - "${MINIO_CONSOLE_PORT:-9101}:9001"  # web console
+    volumes:
+      - veorec_miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # ── MailHog — captures transactional email locally (never delivers) ────────
+  mailhog:
+    image: mailhog/mailhog:v1.0.1
+    container_name: veorec-mailhog
+    restart: unless-stopped
+    ports:
+      - "${MAILHOG_SMTP_PORT:-1025}:1025"  # SMTP
+      - "${MAILHOG_UI_PORT:-8025}:8025"    # web UI
+    # Image has no shell/curl; rely on the container's own liveness.
+    healthcheck:
+      disable: true
+
+volumes:
+  veorec_pgdata:
+  veorec_redisdata:
+  veorec_miniodata:

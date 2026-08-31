@@ -268,3 +268,24 @@ erDiagram
 | analytics_events | `upgrade_events.json` |
 | contacts, notification_reads, plan_overrides | respective files |
 Importer is idempotent (natural keys), run repeatedly during the dual-write window (`23` Phase 1).
+
+## 14. Implementation & operations (delivered by T-101)
+
+**Package:** `db/` (`@veorec/db`, CommonJS, standalone `package.json` — it becomes a workspace member when the monorepo layout lands). Consumers import from `db/src/index.js`, never from `pg`/`drizzle-orm` directly, so pooling, env resolution, and safety guards stay in one place.
+
+**Roles.** PostgreSQL is the source of application truth. Drizzle is the query builder + migration runner: chosen (§`02` 10.3) because migrations are plain reviewable SQL and raw SQL stays first-class. `pg.Pool` is the only connection mechanism (timeouts, SSL, `application_name` set centrally in `db/src/pool.js`).
+
+**Migration strategy — forward-only, tracked, deterministic.**
+- Migrations are numbered SQL files in `db/migrations/`, applied in the order recorded in `meta/_journal.json`; Drizzle records applied migrations in `drizzle.__drizzle_migrations`.
+- `npm run db:migrate` is the **only** mechanism used in every environment (local, CI, staging, production). It is idempotent — safe on every deploy.
+- **Automatic schema sync (`drizzle-kit push`) is never used** against any environment: it is destructive and unreviewable. `db:generate` only *authors* a migration file for review.
+- **There are no down-migrations.** Rationale: a generated down-migration against real user data is a data-loss instrument, and Drizzle does not track them. The rollback policy is a corrective **forward** migration, authored deliberately. The "down" path exists only for local/test as `db:reset` (drop everything → re-migrate), which is refused unless `APP_ENV` is local/test and **always** refused for production.
+- Migration `0000_foundation` deliberately contains **no application tables** — only `citext` (email columns) and `set_updated_at()` (the `updated_at` trigger convention in §1), so T-102's migration is a pure table diff.
+
+**Commands** (`cd db`): `db:migrate` · `db:status` (0 up-to-date / 1 unreachable / 2 pending — usable as a deploy gate) · `db:reset` (destructive, guarded) · `db:generate` · `npm test`.
+
+**Environments.** `APP_ENV` ∈ local | test | staging | production. Local/test get documented defaults; **staging/production must supply `DATABASE_URL` explicitly** — no default, no fallback to a local database — and default to `DATABASE_SSL=require`. Tests use a separate `DATABASE_URL_TEST` database whose schema is dropped each run. Connection strings are redacted wherever printed.
+
+**Local infrastructure.** `docker-compose.yml` at the repo root: Postgres 16, Redis 7, MinIO, MailHog, on non-default host ports (5433/6380/9100/1025) to avoid collisions. MinIO is a **local-only** S3 substitute — production storage is Cloudflare R2 via the StorageProvider abstraction (T-201); nothing may depend on MinIO. Compose is a development tool only, never the production deployment mechanism (§`02` 6). Developer guide + troubleshooting: `db/README.md`.
+
+**Known limitations at T-101.** No application tables yet (T-102); no dual-write and no reads from Postgres anywhere in the app (later phases per `23`); the API server still uses JSON/Cloudinary unchanged; no connection-pool tuning under real load; no automated backup/restore procedure yet (production runbook lands with the VPS deployment task); the zod boot-schema described in §`02` 6 belongs to the API server and is not part of this package.

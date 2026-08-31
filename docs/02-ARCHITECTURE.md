@@ -218,7 +218,7 @@ flowchart LR
 **Provider-abstraction rule:** application/business code never references Hostinger, Vercel, Cloudflare, R2, or RunPod directly. The realistic replacement boundaries get adapters — `StorageProvider` (R2 ⇄ B2/Wasabi/S3), the `JobQueue` interface (`10` §2), and worker implementations (CPU vs GPU behind identical job contracts). Deployment must be movable to Hetzner/AWS/GCP/another VPS without touching business logic. Do **not** invent abstractions beyond these — provider swap must be realistic and useful, not ceremonial.
 
 **Environments:**
-- `development`: docker-compose with Postgres, Redis, MinIO (S3-compatible, so the storage abstraction is exercised locally), mailhog. `ffmpeg` local.
+- `development`: docker-compose with Postgres, Redis, MinIO (S3-compatible, so the storage abstraction is exercised locally), mailhog. `ffmpeg` local. **Implemented in T-101** — root `docker-compose.yml` (non-default host ports 5433/6380/9100/1025 to avoid collisions with locally installed services) + `.env.example`; database operations documented in `07` §14.
 - `staging`: separate VPS/containers + separate R2 bucket + separate Paddle sandbox; config entirely disjoint from production.
 - `production`: as the table above. **Production credentials never appear in development/staging configuration** (separate env files/secret stores; enforced by the boot-time env schema refusing known-prod markers in dev).
 - All config via env, validated at boot with a schema (zod); the server refuses to start with missing critical vars (extends the existing `JWT_SECRET` boot check pattern from `server/auth.js:6-12`).

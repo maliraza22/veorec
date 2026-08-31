@@ -1,0 +1,23 @@
+// drizzle-kit configuration — used by `npm run db:generate` to diff the schema
+// in src/schema against migrations/ and emit a new reviewable .sql file.
+//
+// NOTE: generation is a development-time authoring aid only. Migrations are
+// applied exclusively by `npm run db:migrate` (the tracked, forward-only
+// runner). `drizzle-kit push` (automatic destructive sync) is never used
+// against any environment — docs/07 §14.
+'use strict';
+
+const path = require('path');
+const { loadEnv } = require('./src/env');
+
+const env = loadEnv();
+
+/** @type {import('drizzle-kit').Config} */
+module.exports = {
+  dialect: 'postgresql',
+  schema: path.join(__dirname, 'src', 'schema', 'index.js'),
+  out: path.join(__dirname, 'migrations'),
+  dbCredentials: { url: env.databaseUrl },
+  strict: true,
+  verbose: true,
+};

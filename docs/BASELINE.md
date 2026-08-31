@@ -29,6 +29,8 @@
 | Typecheck | — | **Not configured** (no TypeScript, no tsconfig anywhere) |
 | Lint | — | **Not configured** (no eslint config anywhere) |
 
+> **Note (T-101):** local infrastructure and database commands were added after this baseline — `docker compose up -d` at the repo root and `cd db && npm run db:migrate|db:status|db:reset|test`. See `07` §14 and `db/README.md`. The legacy commands below are unchanged.
+
 ### Canonical commands (as of baseline)
 
 - Frontend dev: `cd client && npm run dev` (vite, proxies `/api` + `/uploads` → localhost:3001)
@@ -50,8 +52,9 @@
 
 ## Environment assumptions for future tasks
 
-- Production: API on Railway (Dockerfile, Node 20, whisper.cpp + ffmpeg baked in), client on Vercel, media on Cloudinary, JSON data on Railway volume `DATA_DIR`.
+- Production: API on Railway (Dockerfile, Node 20, whisper.cpp + ffmpeg baked in), client on Vercel, media on Cloudinary, JSON data on Railway volume `DATA_DIR`. *(Target hosting moves to a provider-agnostic VPS + R2 — `02` §6 — from Phase 2 onward; the legacy deployment is untouched so far.)*
 - No CI exists; all checks above are manual. (CI introduction is part of later tasks, not baseline.)
+- **Local dev machine has no Docker and no native PostgreSQL** (verified 2026-09-01). T-101's Docker Compose stack is therefore authored-and-reviewed but *unexecuted* here; its migrations were verified against PostgreSQL 16.15 running in WSL2 Ubuntu (same version/port/credentials as the compose service). Docker Compose itself still needs a one-time verification on a machine that has Docker — tracked as a T-102 pre-flight step.
 - `ffmpeg`/`ffprobe` are NOT on the dev machine PATH by assumption — transcription features are exercised only in Docker.
 
 ## Git status

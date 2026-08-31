@@ -1,0 +1,26 @@
+{
+  "name": "@veorec/db",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "description": "PostgreSQL foundation for VeoRec: connection pool, Drizzle client, SQL migrations (T-101).",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "db:migrate": "node src/cli/migrate.js",
+    "db:status": "node src/cli/status.js",
+    "db:reset": "node src/cli/reset.js",
+    "db:generate": "drizzle-kit generate",
+    "test": "node ../tests/db.test.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "drizzle-orm": "^0.45.2",
+    "pg": "^8.23.0"
+  },
+  "devDependencies": {
+    "drizzle-kit": "^0.31.10"
+  }
+}
