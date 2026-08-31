@@ -1,0 +1,182 @@
+# 08 — API Specification
+
+> REST API, base path `/api/v1`. Legacy unversioned routes remain as aliases during migration (`23`). JSON everywhere; errors follow one contract (§2). Endpoints marked ⚿ require auth; ⚿A require admin.
+
+---
+
+## 1. Conventions
+
+- Auth: `Authorization: Bearer <sessionToken>` (opaque token → `sessions` table; see `17` §2). 401 = missing/invalid, 403 = authenticated but not allowed.
+- IDs in paths are typed ids (`rec_…`). Unknown id or not-owned → **404** (never 403 — don't leak existence; same convention the current code follows).
+- Pagination: `?limit=` (≤100, default 50) `&cursor=` (opaque); responses `{items, nextCursor|null}`.
+- Idempotency: unsafe endpoints that clients may retry accept `Idempotency-Key` (uuid). The server stores `(user_id, key) → response hash` for 24h and replays the stored response on repeat. Endpoints with natural idempotency note it instead.
+- Rate limits (Redis, per user or IP): auth 10/15min·IP, signup 15/h·IP, forgot 5/h·IP, comments/reactions 30/min·IP, views/progress 60/min·IP, uploads 10 sessions/h·user, AI endpoints 10/h·user. 429 + `Retry-After`.
+- Validation errors: 400 with `details` array (zod-derived).
+
+## 2. Response & error contract
+
+Success: resource JSON or `{items,...}`. No envelope.
+Error (every non-2xx):
+```json
+{ "error": { "code": "storage_limit", "message": "Human-readable, user-facing.",
+             "details": [ ... ],            // optional, machine-readable
+             "upgradeRequired": true,        // optional, paywall errors only
+             "requestId": "req_abc123" } }
+```
+`code` values come from the taxonomy in `18` §2. Legacy clients read `error` as a string — during migration the legacy aliases keep the old flat shape `{error, code, upgradeRequired}`; `/api/v1` uses the nested shape.
+
+## 3. Auth
+
+| Method & path | Auth | Request | Response | Notes |
+|---|---|---|---|---|
+| POST `/auth/signup` | – | `{name,email,password}` | `{token,user}` | pw ≥ 8 (raise from 6); rate-limited; creates personal workspace |
+| POST `/auth/login` | – | `{email,password}` | `{token,user}` | generic 401 on bad creds |
+| POST `/auth/google` | – | `{credential}` | `{token,user}` | server-side tokeninfo verify, audience + email_verified checks (keep `index.js:191-214` logic) |
+| POST `/auth/logout` | ⚿ | – | `{ok}` | revokes the session row |
+| GET `/auth/me` | ⚿ | – | `user` (publicUser shape: id,name,email,entitlements,isAdmin,hasSlack,created_at) | |
+| PATCH `/auth/profile` | ⚿ | `{name?,email?,slackWebhook?}` | `user` | email uniqueness 409; slack webhook regex as today |
+| PATCH `/auth/password` | ⚿ | `{currentPassword,newPassword}` | `{ok}` | revokes all other sessions |
+| POST `/auth/forgot` | – | `{email}` | `{ok}` always | token **hash** stored; email via Brevo |
+| POST `/auth/reset` | – | `{email,token,password}` | `{token,user}` | single-use; revokes all sessions |
+| GET `/auth/config` | – | – | `{googleClientId,emailEnabled}` | |
+
+`user.entitlements` = the summary from `entitlements.summary()` (ported unchanged).
+
+## 4. Recordings
+
+| Method & path | Auth | Request → Response | Errors / idempotency / side effects |
+|---|---|---|---|
+| POST `/recordings` | ⚿ | `{title?, source:'extension'|'web_upload', clientMeta?}` → `201 {id,status:'recording'}` | Idempotency-Key supported. Side effect: row only. Entitlement `canCreateVideo` **advisory** here, authoritative at upload complete |
+| GET `/recordings` | ⚿ | `?folder=&archived=&q=&cursor=` → `{items:[RecordingSummary], nextCursor}` | one indexed query; kills the Cloudinary dual-fetch |
+| GET `/recordings/:id` | ⚿ owner | → `RecordingDetail` (incl. assets summary, status, capability flags `canTranscribe/canStitch`) | 404 if not owner |
+| PATCH `/recordings/:id` | ⚿ owner | `{title}` → `{title}` | title 1–200 after trim |
+| PATCH `/recordings/:id/meta` | ⚿ owner | any of `{description,tags,audience,cta,privacy,password,folder,trimStart,trimEnd,segments,recommendedSpeed,animatedThumbnail,archived,removeBranding}` → updated meta | validation identical to current route (`index.js:926-1019`); Pro gates: password (`passwordProtection`), requireEmail (`leadCapture`), removeBranding — each 403 `feature_locked` + paywall analytics event |
+| DELETE `/recordings/:id` | ⚿ owner | → `{ok}` | soft delete; tx decrements usage from stored size/duration; hard purge after 30d. Idempotent (deleting deleted → 200) |
+| POST `/recordings/:id/duplicate` | ⚿ owner | → `{id,title}` | enqueues a copy job (server-side R2 copy of source + re-process); returns new recording with status 'processing' |
+| POST `/recordings/:id/thumbnail` | ⚿ owner, Pro | small image upload (≤5MB, the one multipart the API accepts) → `{ok}` | gate `customThumbnailEnabled` |
+
+`RecordingSummary`: `{id,title,status,duration,size_bytes,created_at,privacy,folder_id,thumbnailUrl,posterUrl,views,commentCount,archived,tags,ai_status}` — URLs are signed (`12` §5).
+
+## 5. Upload (full detail in `06`)
+
+| Method & path | Auth | Notes |
+|---|---|---|
+| POST `/uploads` | ⚿ | create session; Idempotency-Key; 409 `upload_session_conflict` if another active session for the recording (returns it) |
+| GET `/uploads/:id` | ⚿ owner | status + parts (server⊕storage reconciled) — the resume source of truth |
+| POST `/uploads/:id/parts` | ⚿ owner | `{partNumbers:[≤20]}` → presigned URLs; repeatable |
+| PUT `/uploads/:id/parts/:n` | ⚿ owner | `{etag,size,crc32c}` → upsert; naturally idempotent |
+| POST `/uploads/:id/complete` | ⚿ owner | idempotent (completed → replay canonical result); tx per `06` §7; enqueues probe |
+| DELETE `/uploads/:id` | ⚿ owner | abort; idempotent |
+
+## 6. Processing & assets
+
+| Method & path | Auth | Response |
+|---|---|---|
+| GET `/recordings/:id/status` | ⚿ owner (or public shape via watch) | `{status, failureCode, jobs:[{queue,status,progress}], assets:[{kind,variant,status}]}` — the watch page polls this while `status!='ready'` |
+| POST `/recordings/:id/reprocess` | ⚿ owner | re-enqueue failed pipeline stages (dedupe keys prevent duplicates) → `{ok}` |
+
+## 7. Watch (public, privacy-aware — enforcement per `12`)
+
+| Method & path | Auth | Request → Response |
+|---|---|---|
+| GET `/watch/:id` | optional | → `WatchPayload` or `401 {code:'login_required'}` or `200 {requiresPassword:true,title}` or `403 {code:'link_expired'}`; `?shareToken=` for share-link access |
+| POST `/watch/:id/unlock` | optional | `{password}` → `WatchPayload`; 401 wrong password; rate-limited 10/15min·IP |
+| POST `/watch/:id/view` | optional | `{visitorId?}` → `{views}`; upserts `view_sessions` (unique viewer_key; owner ⇒ `is_owner`, not counted); naturally idempotent |
+| POST `/watch/:id/progress` | optional | `{pct}` (0–1, sendBeacon) → 204; upsert max_progress |
+| GET `/watch/:id/engagement` | optional | `{views,reactions,comments}` |
+| POST `/watch/:id/comment` | optional | `{text,name?,t?,parentId?}` → `Comment`; 403 if audience.comments=false; rate-limited |
+| POST `/watch/:id/react` | optional | `{emoji,t?,name?}` → `{reactions}`; 403 if disabled; rate-limited |
+| POST `/watch/:id/lead` | optional | `{email,name?}` → `{ok}`; unique per (recording,email) |
+| GET `/watch/:id/transcript` | optional | `{status:'none'|'queued'|'running'|'done'|'failed', configured, language, text, segments}` — real statuses at last (today only done/none) |
+| GET `/watch/:id/media` | optional | `{playback:{mp4Url?,hlsUrl?,posterUrl,expiresAt}}` — **signed URLs**, TTL per privacy (`12` §5); 403 if privacy unsatisfied. Player refreshes before expiry |
+
+`WatchPayload`: recording public fields + `author`, `branding`, `status` (viewers see 'processing' honestly), chapters, audience, cta, trim/segments, recommendedSpeed — media URLs only via `/media`.
+
+## 8. Sharing
+
+| Method & path | Auth | Request → Response |
+|---|---|---|
+| GET `/recordings/:id/share-links` | ⚿ owner | list |
+| POST `/recordings/:id/share-links` | ⚿ owner | `{label?,password?,expiresAt?,maxViews?}` → `{id, url}` (token shown once) |
+| DELETE `/share-links/:id` | ⚿ owner | revoke (sets revoked_at); idempotent |
+| POST `/recordings/:id/share/slack` | ⚿ owner, Pro `slackEnabled` | → `{ok}`; 400 `needsWebhook`; 502 slack errors (as today) |
+
+## 9. Analytics & notifications
+
+| Method & path | Auth | Response |
+|---|---|---|
+| GET `/recordings/:id/analytics` | ⚿ owner, Pro `analyticsEnabled` | `{views, uniqueViewers, viewers:[{name,email,at,maxProgress}], engagement:{avgViewThrough,completionRate,samples}, reactions, comments, leads}` — SQL aggregates over view_sessions |
+| GET `/analytics/overview` | ⚿, Pro | per-recording rollup for the analytics page |
+| GET `/notifications` | ⚿ | `{items:[Event], unread, lastReadAt}` — query over comments/reactions/view_sessions newer-than, excluding actor==owner **by user_id** (not display-name matching) |
+| POST `/notifications/read` | ⚿ | `{lastReadAt}` |
+
+## 10. Folders
+
+CRUD as today: GET/POST `/folders`, PATCH/DELETE `/folders/:id` (⚿ owner; name 1–60; delete sets recordings.folder_id NULL). POST returns 409 on duplicate name.
+
+## 11. Editing (full spec `14`)
+
+| Method & path | Auth | Request → Response |
+|---|---|---|
+| POST `/recordings/:id/edit-sessions` | ⚿ owner | `{timeline}` → `{editSessionId}` (draft) |
+| PATCH `/edit-sessions/:id` | ⚿ owner | `{timeline}` / `{op}` append → updated |
+| POST `/edit-sessions/:id/render` | ⚿ owner | `{mode:'overwrite'|'copy'}` → `{renderJobId}` (202) — multi-clip requires Pro `clipStitchEnabled`; enqueues render job |
+| GET `/render-jobs/:id` | ⚿ owner | `{status,progress,outputRecordingId?}` — editor polls |
+| POST `/recordings/:id/remove-silences` | ⚿ owner | → `202 {jobId}` then `{segments,keptSeconds,removedSeconds}` via job result (async — today it blocks on transcription) |
+| POST `/recordings/stitch` | ⚿, Pro | `{ids[2..10], title?}` → `{editSessionId, renderJobId}` (sugar over edit-sessions) |
+
+Virtual trim stays synchronous via PATCH `/recordings/:id/meta` (no render needed).
+
+## 12. Transcription & AI (all async; full job specs `10`, `15`)
+
+| Method & path | Auth/gate | Behavior |
+|---|---|---|
+| POST `/recordings/:id/transcribe` | ⚿ owner, `transcriptionEnabled` | `{language?}` → `202 {jobId}`; transcript.status → 'queued'. 501 `transcription_unconfigured` if no provider |
+| DELETE `/recordings/:id/transcribe` | ⚿ owner | clears transcript; idempotent |
+| POST `/recordings/:id/transcript/translate` | ⚿ owner, `aiDocsEnabled` | `{lang}` → cached translation or `202 {jobId}` |
+| POST `/recordings/:id/title/auto` | ⚿ owner, `transcriptionEnabled` | `202 {jobId}` → job writes title |
+| POST `/recordings/:id/summary` | ⚿ owner, `aiDocsEnabled` | `202 {jobId}` → writes description |
+| POST `/recordings/:id/chapters` | ⚿ owner, `aiDocsEnabled` | `202 {jobId}` → writes chapters |
+
+Clients poll `GET /recordings/:id/status` (or the transcript endpoint) — replacing today's long-held HTTP requests that die on restart.
+
+## 13. Plans, billing, usage
+
+| Method & path | Auth | Notes |
+|---|---|---|
+| GET `/plans` | – | public catalog (`plans.listPublicPlans`) |
+| GET `/me/entitlements` | ⚿ | entitlement summary (extension recorder reads this) |
+| GET `/me/usage` | ⚿ | usage vs limits |
+| GET `/billing/config` | – | Paddle bootstrap (as today) |
+| POST `/billing/checkout` | ⚿ | `{billingCycle}` → checkout config w/ customData {userId,planSlug,billingCycle} |
+| GET `/billing/subscription` | ⚿ | local + remote view |
+| POST `/billing/sync` / `/cancel` / `/resume` / `/change-plan` | ⚿ | as today via billing.service |
+| GET `/billing/portal` | ⚿ | portal session URL |
+| POST `/webhooks/paddle` | signature | **New behavior:** verify signature → insert `billing_events` (dup event id ⇒ 200 skip) → process in tx → 200; processing error ⇒ mark failed + **500** (Paddle retries). Never blind-200 (fixes `webhooks.paddle.js:173-178`) |
+| POST `/events/upgrade-intent` | ⚿ | writes `analytics_events(event:'paywall_hit')` |
+
+## 14. Contact & misc
+
+POST `/contact` (public, rate-limited 5/h·IP, honeypot field) → `{ok,id}`; admin email best-effort as today.
+
+## 15. Admin (⚿A; every mutation writes `audit_logs`)
+
+| Method & path | Notes |
+|---|---|
+| GET `/admin/metrics` | totals, MRR, churn, conversion summary — SQL aggregates replacing `buildAdminMetrics` |
+| GET `/admin/business` | cost/P&L dashboard (infra model retained; storage usage from `usage` sum) |
+| GET `/admin/users?q=` | list w/ plan/usage/subscription |
+| POST `/admin/users` | create/invite (invite = reset-token email flow, as today) |
+| PATCH `/admin/users/:id/plan` | comp grant/revoke (`manualPlan`, optional days) |
+| DELETE `/admin/users/:id/subscription` | clear local record (does NOT cancel in Paddle — keep the current doc comment) |
+| DELETE `/admin/users/:id` | soft delete; cannot delete self/admins |
+| GET `/admin/plans`, PATCH `/admin/plans/:slug`, DELETE `/admin/plans/:slug/override` | plan overrides (whitelisted fields as `plans.js` OVERRIDABLE) |
+| GET `/admin/contacts`, PATCH `/admin/contacts/:id` | contact inbox |
+| GET `/admin/jobs?status=failed` , POST `/admin/jobs/:id/retry` | **new**: processing-job triage |
+
+## 16. Deprecated / removed vs current API
+
+- `POST /api/upload` (multipart video through server) → removed after migration; legacy alias kept until extension fleet updates (`23` Phase 3).
+- `POST /recordings/:id/replace` (memory-multer) → removed; renders + web-upload protocol replace it.
+- `POST /recordings/:id/trim` & `/compose` synchronous Cloudinary paths → replaced by edit-sessions + render jobs (legacy aliases respond 202 by internally creating an edit session during migration).
+- Embed: `GET /watch/:id` + `/media` power `/embed/:id` unchanged.

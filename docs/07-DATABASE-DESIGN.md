@@ -1,0 +1,252 @@
+# 07 — Database Design (PostgreSQL)
+
+> The complete schema. PostgreSQL 16, Drizzle ORM, SQL migrations in `db/migrations/`. Conventions first, then every table, then the ER diagram.
+
+---
+
+## 1. Conventions
+
+- **IDs**: `text` primary keys with typed prefixes (`usr_`, `rec_`, `ast_`, `up_`, `job_`, `cmt_`, …), generated app-side (uuidv7 base — sortable). Existing UUIDs migrate as-is (prefixed).
+- **Timestamps**: `created_at timestamptz not null default now()`, `updated_at timestamptz not null default now()` (trigger-updated) on every table. Domain times are explicit columns.
+- **Soft delete**: only where the product needs undelete/audit — `users`, `recordings` (`deleted_at timestamptz null`). Everything else hard-deletes via FK cascade. All queries on soft-deleted tables filter `deleted_at is null` through the repository layer.
+- **Enums**: Postgres `text` + `CHECK` constraints (cheaper to migrate than native enums).
+- **Money**: integer cents. **Bytes**: `bigint`. **Durations**: `numeric(10,3)` seconds.
+- **JSONB** only for genuinely open-shaped data (job payloads, audience settings, event props) — never for anything queried relationally.
+
+## 2. Identity & workspaces
+
+### `users`
+| column | type | notes |
+|---|---|---|
+| id | text PK | `usr_` |
+| email | citext NOT NULL UNIQUE (partial: where deleted_at is null) | |
+| name | text NOT NULL | |
+| password_hash | text NULL | null for Google-only accounts |
+| google_id | text NULL UNIQUE | |
+| is_admin | boolean NOT NULL default false | replaces `ADMIN_EMAILS` env allowlist (env seeds it) |
+| manual_plan | text NULL, manual_plan_expires timestamptz NULL | admin comp (kept from current model) |
+| slack_webhook | text NULL | |
+| paddle_customer_id | text NULL | |
+| reset_token_hash | text NULL, reset_expires timestamptz NULL | store **hash** of reset token (today plaintext in users.json) |
+| deleted_at | timestamptz NULL | soft delete; cascade policies below |
+Indexes: `(email)`, `(google_id)`, `(paddle_customer_id)`.
+
+### `sessions` (auth)
+| id (`ses_`) PK | user_id FK→users ON DELETE CASCADE | token_hash text NOT NULL UNIQUE (sha256 of opaque token) | client text CHECK in ('web','extension') | user_agent text | ip inet | last_used_at | expires_at NOT NULL | revoked_at NULL |
+Index: `(user_id)`, `(expires_at)`. Cleanup job purges expired.
+
+### `workspaces`, `workspace_members` (schema now, product later — `02` §9)
+`workspaces`: id (`ws_`), name, owner_user_id FK, created/updated. Every user gets a personal workspace at migration.
+`workspace_members`: PK (workspace_id, user_id), role CHECK in ('owner','admin','member','viewer'), invited_by, joined_at.
+`recordings.workspace_id` is nullable now; backfilled to the personal workspace.
+
+## 3. Recordings & media
+
+### `recordings` — the logical entity
+| column | type | notes |
+|---|---|---|
+| id | text PK `rec_` | |
+| user_id | FK→users ON DELETE CASCADE | owner |
+| workspace_id | FK→workspaces NULL | |
+| title | text NOT NULL default 'Untitled Recording' | ≤200 chars app-enforced |
+| description | text NOT NULL default '' | AI summary lands here |
+| status | text CHECK in ('recording','uploading','uploaded','processing','ready','failed','rejected_limit') NOT NULL | lifecycle, `22` diagrams |
+| failure_code | text NULL | from `18` taxonomy when status='failed' |
+| duration | numeric(10,3) NULL | **FFprobe-verified only** (invariant #11) |
+| client_duration_hint | numeric(10,3) NULL | what the client claimed |
+| size_bytes | bigint NULL | source size after complete |
+| width, height | int NULL | from probe |
+| source_kind | text CHECK in ('extension','web_upload','render','duplicate') NOT NULL | |
+| privacy | text CHECK in ('public','unlisted','workspace','login','password') NOT NULL default 'unlisted' | see `12` (current default 'public' migrates as 'public') |
+| password_hash | text NULL | for privacy='password' |
+| folder_id | FK→folders NULL ON DELETE SET NULL | |
+| trim_start, trim_end | numeric(10,3) NULL | virtual trim (player-side) |
+| segments | jsonb NULL | virtual keep-ranges `[{start,end}]` ≤200 |
+| chapters | jsonb NULL | `[{t,title}]` |
+| tags | text[] NOT NULL default '{}' | ≤20 |
+| audience | jsonb NOT NULL default '{}' | {comments,reactions,download,transcript,requireEmail} |
+| cta | jsonb NULL | {label,url} |
+| recommended_speed | numeric(3,2) NULL | 0.25–4 |
+| animated_thumbnail | boolean NOT NULL default true | |
+| archived | boolean NOT NULL default false | |
+| remove_branding | boolean NOT NULL default false | |
+| ai_status | text CHECK in ('none','queued','running','done','failed') NOT NULL default 'none' | AI never gates `status` (invariant #14) |
+| deleted_at | timestamptz NULL | soft delete; cleanup job hard-deletes + purges storage after 30 days |
+Indexes: `(user_id, created_at desc) where deleted_at is null`, `(user_id, folder_id)`, `(status)`, `(workspace_id)`, GIN `(tags)`.
+
+### `video_assets` — physical files (source immutable; derived separate — invariant #13)
+| column | type | notes |
+|---|---|---|
+| id | text PK `ast_` | |
+| recording_id | FK→recordings ON DELETE CASCADE | |
+| kind | text CHECK in ('source','mp4','hls','poster','thumbnail','preview_gif','audio','captions_vtt','render_output') NOT NULL | |
+| storage_key | text NOT NULL UNIQUE | R2 key |
+| status | text CHECK in ('pending','ready','failed') NOT NULL | |
+| size_bytes | bigint NULL, width int, height int, duration numeric(10,3) | probed facts |
+| codec_video, codec_audio, container | text NULL | |
+| variant | text NULL | e.g. '1080p','720p', hls rendition tag |
+| immutable | boolean NOT NULL default false | true for kind='source'; app refuses updates/overwrites |
+| created_by_job_id | FK→processing_jobs NULL | provenance |
+Unique partial: one `ready` asset per (recording_id, kind, variant). Index `(recording_id, kind)`.
+
+### `upload_sessions`
+| id `up_` PK | recording_id FK CASCADE | user_id FK | storage_key text NOT NULL | storage_upload_id text NULL (S3 UploadId) | mode CHECK ('multipart','single') | part_size int NOT NULL | client_mime text | status CHECK ('pending','active','completed','aborted','expired') | idempotency_key text NOT NULL | expires_at NOT NULL | completed_at NULL |
+Unique: `(user_id, idempotency_key)`; partial unique `(recording_id) where status in ('pending','active')`. Index `(status, expires_at)` for the expiry job.
+
+### `upload_parts`
+PK `(upload_session_id, part_number)`; upload_session_id FK CASCADE; size bigint; etag text; crc32c text; status CHECK ('pending','uploaded'); uploaded_at.
+
+### `folders`
+id `fld_` PK | user_id FK CASCADE | name text NOT NULL (≤60) | created/updated. Unique `(user_id, lower(name))`. (`folder_items` not needed — a recording lives in ≤1 folder via `recordings.folder_id`; revisit if multi-folder ever ships.)
+
+## 4. Sharing & access
+
+### `share_links`
+| id `shl_` PK | recording_id FK CASCADE | token_hash text UNIQUE NOT NULL | label text | password_hash text NULL | expires_at timestamptz NULL | max_views int NULL | view_count int NOT NULL default 0 | revoked_at timestamptz NULL | created_by FK→users |
+The default watch URL uses the recording id (back-compat); share_links add expiring/revocable/password links on top (`12` §3). Index `(recording_id)`.
+
+## 5. Engagement & analytics
+
+### `comments`
+| id `cmt_` PK | recording_id FK CASCADE | parent_id FK→comments NULL CASCADE (replies) | user_id FK NULL (anonymous allowed) | author_name text NOT NULL | body text NOT NULL (≤2000) | t numeric(10,3) NULL (timestamp in video) | deleted_at NULL (owner moderation) |
+Index `(recording_id, created_at)`.
+
+### `reactions`
+| id `rct_` PK | recording_id FK CASCADE | user_id NULL | author_name text | emoji text NOT NULL (≤8) | t numeric(10,3) NULL |
+Index `(recording_id)`. Legacy tally-object reactions (`index.js:744-751`) migrate to rows with `t=null`.
+
+### `view_sessions` — replaces meta viewKeys/viewers/engagement
+| id `vs_` PK | recording_id FK CASCADE | viewer_user_id FK NULL | visitor_id text NULL | ip_hash text NULL | viewer_key text NOT NULL (`u:<id>` / `v:<vid>` / `ip:<hash>` — same precedence as today, `index.js:691-695`) | started_at | last_seen_at | max_progress numeric(4,3) NOT NULL default 0 | completed boolean NOT NULL default false (progress ≥ .9) | is_owner boolean NOT NULL default false |
+Unique `(recording_id, viewer_key)` → unique-view counting = `count(*) where not is_owner`. Progress beacons upsert `max_progress`. Index `(recording_id)`, `(viewer_user_id)`.
+
+### `analytics_events` (append-only; monthly partitions when volume demands)
+| id bigserial PK | recording_id FK NULL | user_id NULL | event text NOT NULL ('view','play','progress','reaction','comment','share','lead','paywall_hit','checkout_open', …) | props jsonb NOT NULL default '{}' | created_at |
+Replaces `upgrade_events.json` (conversion tracking writes `paywall_hit` with the same trigger names from `conversion.js` TRIGGERS). Index `(event, created_at)`, `(recording_id, created_at)`.
+
+### `leads`
+| id `led_` PK | recording_id FK CASCADE | email citext NOT NULL | name text | created_at | UNIQUE (recording_id, email) |
+
+## 6. Transcripts & AI
+
+### `transcripts`
+| id `trs_` PK | recording_id FK CASCADE UNIQUE (one current transcript) | status CHECK ('queued','running','done','failed') | language text | text text | source CHECK ('groq','whisper_cpp') | spoken_lang_override text NULL | error text NULL | created/updated |
+
+### `transcript_segments`
+| id bigserial PK | transcript_id FK CASCADE | idx int NOT NULL | start_s numeric(10,3) | end_s numeric(10,3) | text text NOT NULL | language text NULL |
+Unique `(transcript_id, idx)`; index `(transcript_id)`. (Kept relational — powers captions/VTT, search, silence-removal ranges. Cached translations: `transcript_translations` (transcript_id, lang, segments jsonb, created_at, PK (transcript_id, lang)) — today translations are recomputed per request.)
+
+## 7. Editing
+
+### `edit_sessions`
+| id `eds_` PK | recording_id FK CASCADE | user_id FK | status CHECK ('draft','rendering','applied','discarded') | timeline jsonb NOT NULL (ordered clips `[{recordingId, start, end}]`) | mode CHECK ('overwrite','copy') NULL | created/updated |
+
+### `edit_operations` (undo/redo + audit)
+| id bigserial PK | edit_session_id FK CASCADE | idx int | op jsonb NOT NULL ({type:'split'|'delete_range'|'reorder'|'add_clip'|'trim', …}) | created_at | UNIQUE (edit_session_id, idx) |
+
+### `render_jobs`
+| id `rnd_` PK | edit_session_id FK CASCADE | processing_job_id FK→processing_jobs | output_recording_id FK→recordings NULL (copy mode creates a new recording) | output_asset_id FK→video_assets NULL | status CHECK ('queued','running','done','failed') | error text |
+Overwrite mode never touches the source asset: it produces a new `render_output` asset and repoints the recording's active derived assets (`14` §6).
+
+## 8. Jobs
+
+### `processing_jobs` — DB mirror of every queue job (truth for status; queue is transport)
+| column | type |
+|---|---|
+| id text PK `job_` |
+| queue | text NOT NULL ('probe','transcode','thumbnail','hls','transcribe','translate','ai_title','ai_summary','ai_chapters','render','cleanup','usage_sync','subscription_sync') |
+| recording_id | FK NULL CASCADE |
+| dedupe_key | text UNIQUE NOT NULL (e.g. `probe:rec_x`, `transcode:rec_x:mp4:1080`) |
+| payload | jsonb NOT NULL |
+| status | text CHECK ('queued','active','completed','failed','cancelled') |
+| attempts int NOT NULL default 0 | max_attempts int NOT NULL |
+| last_error text | result jsonb NULL |
+| enqueued_at, started_at, finished_at | timestamptz |
+Indexes: `(status)`, `(recording_id)`, `(queue, status)`. Written transactionally with the causing mutation (outbox pattern, `10` §3).
+
+## 9. Billing & usage
+
+### `subscriptions`
+| id `sub_` PK | user_id FK UNIQUE CASCADE | paddle_subscription_id text UNIQUE | paddle_customer_id text | paddle_price_id text | plan_slug text NOT NULL | status CHECK ('active','trialing','past_due','paused','canceled') | billing_cycle CHECK ('monthly','yearly') | current_period_start, current_period_end timestamptz | cancel_at_period_end boolean default false |
+Same semantics as `subscriptions.js` (entitled statuses: active/trialing/past_due).
+
+### `billing_events` — idempotent webhook ledger (fixes `01` §5)
+| id bigserial PK | paddle_event_id text UNIQUE NOT NULL | event_type text NOT NULL | user_id FK NULL | payload jsonb NOT NULL | status CHECK ('received','processed','failed','skipped') | error text | processed_at |
+Webhook flow: insert (`ON CONFLICT DO NOTHING` — duplicate ⇒ 200 skip) → process in a tx → mark processed; processing failure ⇒ status 'failed' + HTTP 500 so Paddle retries.
+
+### `usage`
+| user_id PK FK CASCADE | storage_used_bytes bigint NOT NULL default 0 | video_count int NOT NULL default 0 | recording_seconds bigint NOT NULL default 0 | monthly_uploads int NOT NULL default 0 | monthly_period text (YYYY-MM) | last_recalculated_at |
+Updated in the same tx as the causing event (upload complete, delete, render-copy); nightly `usage_sync` job re-derives from `recordings`/`video_assets` (keeps the good heal-drift idea from `usage.service.js`, now against Postgres — a plain aggregate query).
+
+### `plan_overrides`
+| plan_slug text PK | overrides jsonb NOT NULL | updated_by FK→users | updated_at |
+(Replaces `plan_overrides.json`; plan catalog itself stays in code as today — it is versioned logic, not data.)
+
+## 10. Misc
+
+### `contacts`
+id `ctc_` PK | name, email, subject, message | user_id FK NULL | status CHECK ('new','read','replied','archived') | created_at.
+
+### `notification_reads`
+user_id PK FK CASCADE | last_read_at timestamptz NOT NULL. (Feed itself is derived from comments/reactions/view_sessions by query — no feed table.)
+
+### `audit_logs`
+| id bigserial PK | actor_user_id FK NULL | action text NOT NULL ('admin.plan_grant','admin.user_delete','recording.delete','billing.sync', …) | target_type text | target_id text | detail jsonb | ip inet | created_at |
+Written for every admin mutation and every destructive user action.
+
+## 11. Deletion behavior summary
+
+| Entity deleted | Effect |
+|---|---|
+| user (soft) | sessions revoked; recordings soft-deleted; subscription kept (billing history); hard-purge job after 30 days cascades everything + storage objects |
+| recording (soft) | hidden everywhere immediately; hard delete after 30 days: assets rows cascade → cleanup job deletes R2 objects (storage deletion is driven by `video_assets` rows collected *before* row deletion), usage decremented in the same tx as soft-delete using stored size/duration (no more search-then-guess as in `index.js:563-576`) |
+| folder | recordings.folder_id → NULL |
+| transcript regenerate | old transcript row replaced in one tx (delete + insert) |
+| upload session abort | parts cascade; S3 abort |
+
+## 12. ER diagram
+
+```mermaid
+erDiagram
+    users ||--o{ sessions : has
+    users ||--o{ recordings : owns
+    users ||--o| subscriptions : has
+    users ||--o| usage : has
+    users ||--o{ folders : owns
+    users ||--o{ workspace_members : joins
+    workspaces ||--o{ workspace_members : has
+    workspaces ||--o{ recordings : contains
+    recordings ||--o{ video_assets : "has files"
+    recordings ||--o{ upload_sessions : "uploaded via"
+    upload_sessions ||--o{ upload_parts : has
+    recordings ||--o{ comments : has
+    comments ||--o{ comments : replies
+    recordings ||--o{ reactions : has
+    recordings ||--o{ view_sessions : "viewed in"
+    recordings ||--o{ analytics_events : emits
+    recordings ||--o{ leads : captures
+    recordings ||--o| transcripts : has
+    transcripts ||--o{ transcript_segments : contains
+    recordings ||--o{ share_links : "shared by"
+    recordings ||--o{ edit_sessions : "edited in"
+    edit_sessions ||--o{ edit_operations : logs
+    edit_sessions ||--o{ render_jobs : renders
+    render_jobs }o--|| processing_jobs : "executes as"
+    recordings ||--o{ processing_jobs : "processed by"
+    folders ||--o{ recordings : groups
+    users ||--o{ audit_logs : acts
+    billing_events }o--|| users : "applies to"
+```
+
+## 13. Migration sources (JSON/Cloudinary → Postgres)
+
+| Target | Source |
+|---|---|
+| users, sessions | `users.json` (reset tokens re-hashed or dropped) |
+| recordings + source video_assets | Cloudinary Admin API listing per user folder + context (`rec_id`,`user_id`,`title`,`duration`,`created_at`) merged with `meta.json` (title authoritative from meta — mirrors today's read precedence `index.js:495`) |
+| comments/reactions/view_sessions/leads/transcripts | `meta.json` fields |
+| folders | `folders.json` |
+| subscriptions | `subscriptions.json` |
+| usage | `usage.json`, then immediately re-derived |
+| analytics_events | `upgrade_events.json` |
+| contacts, notification_reads, plan_overrides | respective files |
+Importer is idempotent (natural keys), run repeatedly during the dual-write window (`23` Phase 1).

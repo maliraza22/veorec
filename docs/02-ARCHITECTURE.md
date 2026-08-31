@@ -1,0 +1,292 @@
+# 02 — Target Architecture
+
+> The complete system architecture for the rebuilt VeoRec platform. Non-negotiable invariants are listed in §11 and repeated in `26-CLAUDE-CODE-IMPLEMENTATION-RULES.md`.
+
+---
+
+## 1. High-level architecture
+
+```mermaid
+flowchart TB
+    subgraph Client["Clients"]
+        EXT["Chrome Extension (MV3)\nrecorder state machine + IndexedDB"]
+        WEB["Web App (React/Vite)\nlibrary, watch, editor, billing"]
+    end
+
+    subgraph Edge["Edge"]
+        CDN["CDN (Cloudflare)\ncaches public derived media"]
+    end
+
+    subgraph Core["Application tier"]
+        API["API Server (Node/TS, Express)\nauth, REST /api/v1, signed URLs,\nupload-session orchestration"]
+        WK["Workers (Node/TS, BullMQ)\nffprobe, ffmpeg, thumbnails, HLS,\ntranscription, AI, renders, cleanup"]
+    end
+
+    subgraph Data["Data tier"]
+        PG[("PostgreSQL 16\nSOURCE OF TRUTH:\nusers, recordings, upload_sessions,\nvideo_assets, jobs, comments, usage, billing")]
+        RD[("Redis 7\nBullMQ queues, rate limits,\nshort-lived caches")]
+        R2[("Object Storage (Cloudflare R2)\nSOURCE OF TRUTH FOR BYTES:\nsources/ (immutable), derived/, thumbs/")]
+    end
+
+    subgraph Ext["External services"]
+        GROQ["Groq (Whisper STT + LLM)"]
+        PADDLE["Paddle (billing)"]
+        BREVO["Brevo (email)"]
+        GOOGLE["Google (OAuth)"]
+    end
+
+    EXT -- "REST (metadata only)" --> API
+    WEB -- "REST" --> API
+    EXT -- "PUT parts (presigned URLs)" --> R2
+    WEB -- "GET media (signed URLs)" --> CDN --> R2
+    API --> PG
+    API --> RD
+    API -- "presign, HEAD, complete-multipart" --> R2
+    WK --> PG
+    WK --> RD
+    WK -- "download source / upload derived" --> R2
+    WK --> GROQ
+    API --> PADDLE
+    PADDLE -- "webhooks" --> API
+    API --> BREVO
+    API --> GOOGLE
+```
+
+**The two axioms that shape everything:**
+
+1. **PostgreSQL owns application state.** If a fact matters (does this recording exist, who owns it, is it processed, has this upload finished, is this user entitled), it is a row in Postgres. Object storage, Redis, and external services are never queried to answer application questions.
+2. **The API never carries video bytes.** Upload is client → R2 via presigned multipart URLs. Playback is client → CDN/R2 via signed URLs. The API only orchestrates (creates sessions, signs URLs, records completion). Workers stream bytes from/to R2 only for processing.
+
+## 2. Component responsibilities and boundaries
+
+### 2.1 API server (`apps/api`)
+
+- Owns: authentication/sessions, all REST endpoints (`08-API-SPECIFICATION.md`), authorization (`12`), entitlement enforcement (ported `permissions.service`), upload-session orchestration (`06`), signed playback URL minting, webhook ingestion (Paddle), enqueueing jobs.
+- Must NOT: run FFmpeg/FFprobe, hold long-running work in request handlers (hard cap: any handler doing >2s of compute or third-party fan-out becomes a job), receive file uploads other than small images (custom thumbnails ≤ 5MB).
+- Stateless: no in-process cron, no in-memory rate limiting (Redis), no local files. Horizontally scalable.
+
+### 2.2 Workers (`apps/worker`)
+
+- One deployable running BullMQ processors for every queue in `10-JOBS-AND-QUEUES.md`. Contains FFmpeg/FFprobe binaries (Docker image) and the transcription/AI logic relocated from `server/transcription.js` / `server/ai.js`.
+- Every processor is **idempotent** (safe to run twice) and **crash-safe** (BullMQ stalled-job recovery re-runs it). Progress and results are written to Postgres (`processing_jobs`, `video_assets`, `transcripts`), never only to queue state.
+- Scheduled/repeatable jobs (usage reconciliation, subscription sync, upload-session expiry, orphan cleanup) replace `server/cron.js`.
+
+### 2.3 Extension (`apps/extension`)
+
+- Recorder window hosts the **recording state machine** (`03`) and the **local durability layer** (`05`): every MediaRecorder chunk goes to IndexedDB before anything else.
+- Upload runs from the recorder window (and can be resumed by a later recorder window after a crash) using the multipart protocol (`06`).
+- Service worker stays thin: overlay injection, auth sync, message routing (`04`). It must assume it can be killed at any moment; nothing critical lives in SW memory.
+
+### 2.4 Web app (`apps/web`)
+
+- Same React app, incrementally TypeScript. Talks only to `/api/v1`. The watch page renders explicit processing states from `recordings.status` + `video_assets` instead of guessing (`11`).
+- The web "Record" button keeps delegating to the extension via `bridge.js` messaging.
+
+### 2.5 PostgreSQL
+
+Schema in `07-DATABASE-DESIGN.md`. Key structural decisions:
+
+- `recordings` (logical entity, with `status`: `recording → uploading → uploaded → processing → ready | failed`) is separate from `video_assets` (physical files: `source`, `mp4_1080`, `hls_master`, `thumbnail`, `poster`, `audio`, `render_output`…). One recording has many assets. Source assets are immutable.
+- `upload_sessions` + `upload_parts` make uploads resumable and idempotent server-side.
+- `processing_jobs` mirrors queue jobs for status/audit; the queue is transport, Postgres is truth.
+- All engagement (comments, reactions, view_sessions, analytics_events) and transcripts move out of `meta.json` into rows.
+
+### 2.6 Redis
+
+- BullMQ queues + repeatable schedules.
+- Rate limiting (sliding window per key) for auth, comments/reactions, uploads, watch-view endpoints.
+- Optional short-TTL caches (entitlement summaries, watch payloads). Redis is disposable: full loss must cost at most in-flight job latency, never data.
+
+### 2.7 Object storage (R2) layout
+
+```
+veorec-media/
+  sources/{recordingId}/source.webm        # immutable original (or .mp4 for uploads)
+  derived/{recordingId}/{assetId}/video.mp4
+  derived/{recordingId}/{assetId}/hls/master.m3u8, seg_*.ts|.m4s
+  derived/{recordingId}/{assetId}/poster.jpg, thumb.jpg, preview.gif
+  audio/{recordingId}/audio.m4a            # extraction for STT
+  renders/{editSessionId}/{renderJobId}.mp4
+```
+
+- Bucket is **private**. All reads go through signed URLs (CDN-compatible token or R2 presigned GET). Public videos may use long-TTL signatures + CDN cache; private videos short-TTL (≤ 10 min) signatures.
+- Lifecycle rules: `uploads-tmp/` (incomplete multipart) aborted after 48h; orphan scan job reconciles storage against `video_assets` weekly.
+
+### 2.8 CDN
+
+Cloudflare in front of R2 for derived media. Cache key includes the asset path, not the signature (use signed cookies or edge-verified tokens for public assets; for MVP, R2 presigned GETs with `Cache-Control` on public assets are acceptable — documented tradeoff in `12` §6).
+
+### 2.9 FFmpeg/FFprobe
+
+Only in workers. Uses: probe/verify every uploaded source (`09` §2 — client metadata is never trusted), normalize/transcode to MP4 (faststart) and HLS, thumbnails/posters/preview clips, audio extraction for STT, edit renders (trim/splice/silence-cut), silence detection (replacing transcript-gap heuristics where audio-based VAD is better).
+
+### 2.10 Transcription & AI
+
+Jobs on the queue (`10` §jobs: `transcribe`, `translate`, `ai_title`, `ai_summary`, `ai_chapters`). Keep the Groq VAD-chunking pipeline. **Invariant: AI failure never blocks or degrades video availability** — `recordings.status=ready` is set by media processing alone; AI columns have their own statuses.
+
+### 2.11 Authentication & billing
+
+- Central auth: `sessions` table (opaque token → session row, revocable), 30-day rolling expiry; JWT retained only as transport if needed. Extension and web share the same session token via `bridge.js`. Details: `17-SECURITY.md`.
+- Paddle: webhook events land in `billing_events` (unique on Paddle event id → idempotent), processed transactionally into `subscriptions`; failures return 5xx so Paddle retries. `16-BILLING-USAGE-ENTITLEMENTS.md`.
+
+### 2.12 Observability
+
+pino structured logs with `request_id`, `user_id`, `recording_id`, `upload_id`, `job_id` propagated end-to-end; metrics + alerts per `19-OBSERVABILITY.md`.
+
+## 3. The recording pipeline (target, end-to-end)
+
+```mermaid
+sequenceDiagram
+    participant R as Recorder (state machine)
+    participant IDB as IndexedDB
+    participant API as API
+    participant R2 as R2
+    participant Q as BullMQ
+    participant W as Worker
+    participant PG as Postgres
+
+    R->>API: POST /recordings (draft) → recordingId
+    R->>API: POST /uploads (recordingId) → uploadSessionId, partSize
+    Note over R: MediaRecorder.start(1000)
+    loop every chunk
+        R->>IDB: persist chunk (seq, bytes)
+        R->>R: buffer → when ≥ partSize: seal part
+        R->>API: GET part URL (or from prefetched batch)
+        R->>R2: PUT part (retry w/ backoff)
+        R->>API: PUT /uploads/:id/parts/:n {etag, size, crc32c}
+        API->>PG: upsert upload_parts
+    end
+    R->>R: stop → flush final part
+    R->>API: POST /uploads/:id/complete {parts manifest}
+    API->>R2: CompleteMultipartUpload
+    API->>PG: recording.status=uploaded (tx) + enqueue
+    API->>Q: probe job
+    W->>R2: download source
+    W->>W: ffprobe verify (duration, streams, size)
+    W->>PG: recordings.duration=verified; assets(source)
+    W->>Q: fan-out: transcode-mp4, thumbnail, poster, (hls), transcribe
+    W->>R2: upload derived assets
+    W->>PG: video_assets rows; recording.status=ready (when mp4+poster done)
+    R->>IDB: delete session (only after complete 200)
+```
+
+## 4. Frontend architecture
+
+- `apps/web/src/api/` — typed API client (one module per resource) replacing ad-hoc `fetch` calls scattered in components.
+- Watch page decomposition (`11`): `WatchPage` (data) → `ProcessingState`, `Player`, `Sidebar` (`ActivityTab`, `TranscriptTab`, `EditTab`, `SettingsTab`), `ShareMenu`.
+- Player states are explicit: `processing | ready(mp4) | ready(hls) | blocked(privacy) | error(code)`, driven by API data, not by `readyState` timeouts.
+
+## 5. Extension architecture (summary — full doc `04`)
+
+```mermaid
+flowchart LR
+    subgraph SW["service worker (thin)"]
+        RT["message router"]
+        OI["overlay injector"]
+        AS["auth sync"]
+    end
+    POP["popup\noptions + gesture capture"] -->|OpenRecorder| SW
+    SW -->|create window| REC
+    subgraph REC["recorder window (owner of truth)"]
+        SM["RecorderMachine (FSM)"]
+        CAP["capture manager\n(display/tab/cam/mic + mixer)"]
+        DUR["durability: IndexedDB writer"]
+        UPL["uploader: multipart client"]
+    end
+    OV["overlay.js (per tab)\ntoolbar, bubble host, annotations"] <-->|typed messages| SW <--> REC
+    BUB["bubble.html iframe\ncamera (extension origin)"] --- OV
+    BR["bridge.js on veorec.com\nauth + start messages"] --> SW
+```
+
+## 6. Environments & configuration
+
+- `development`: docker-compose with Postgres, Redis, MinIO (S3-compatible, so the storage abstraction is exercised locally), mailhog. `ffmpeg` local.
+- `production`: Railway (or Fly) services: `api`, `worker`, managed Postgres, managed Redis; R2; Vercel for web; CDN.
+- All config via env, validated at boot with a schema (zod); the server refuses to start with missing critical vars (extends the existing `JWT_SECRET` boot check pattern from `server/auth.js:6-12`).
+- API is versioned at `/api/v1`. The legacy unversioned routes remain during migration (see `23`).
+
+## 7. Concurrency & consistency rules
+
+- Every multi-row mutation is a Postgres transaction (upload completion, recording deletion, billing event application, usage adjustments).
+- Idempotency: mutation endpoints that clients retry accept an `Idempotency-Key` header (or have natural idempotency, e.g. `PUT parts/:n`); details per endpoint in `08`.
+- Usage counters (`usage` table) are updated in the same transaction as the causing event and re-derived by a nightly reconciliation job (keeping the good idea from `usage.service.js` but transactional).
+- Workers use `processing_jobs.dedupe_key` (unique) so the same logical job is never active twice.
+
+## 8. Failure-domain map
+
+| Component dies | Blast radius | Recovery |
+|---|---|---|
+| API instance | In-flight requests fail; uploads to R2 continue unaffected | Client retry; LB restarts |
+| Worker | In-flight jobs stall | BullMQ stalled-detection re-queues; idempotent processors |
+| Redis | New jobs delayed; rate limits open-fail (configurable) | Jobs re-enqueued from `processing_jobs` reconciler on recovery |
+| Postgres | Full outage (by design — it is the truth) | Managed HA/backups; app returns 503 |
+| R2 | Uploads/playback fail; API still serves metadata | Client retry with backoff; status page |
+| Recorder window crash | Chunks up to last IndexedDB write survive | Recovery flow (`05` §6) |
+| Extension SW killed | Nothing critical lost (thin SW) | Chrome restarts on next event |
+
+## 9. What is explicitly out of scope for v1 of the rebuild
+
+Workspaces/teams (schema included in `07` so it is not a rewrite later, but UI/permissions ship post-migration), SSO, custom domains, native desktop capture, live streaming, comments threading UI beyond replies.
+
+## 10. Technology decisions (Phase-6 comparisons)
+
+### 10.1 Object storage
+
+| Option | Pros | Cons | Cost notes |
+|---|---|---|---|
+| **Cloudflare R2 (recommended)** | S3 API; **zero egress fees** (video delivery is egress-dominated); pairs with Cloudflare CDN; multipart supported | No storage lifecycle tiering as rich as S3; presigned URL semantics slightly differ | $0.015/GB-mo storage; free egress |
+| AWS S3 | Gold-standard API, event notifications, tiering | Egress $0.09/GB kills video margins | Highest |
+| Backblaze B2 | Cheap storage ($0.006/GB-mo), free egress via Cloudflare (Bandwidth Alliance) | S3-compat gaps; smaller ecosystem | Cheapest storage |
+| Cloudinary (status quo) | Managed transcoding + delivery | Being used **as a database**; per-credit pricing explodes with scale; 100MB/file free-tier cap already loses recordings | Binding constraint today |
+
+**Decision: R2**, behind a `StorageProvider` interface (`put/get/presignPut/presignGet/createMultipart/uploadPartUrl/completeMultipart/abortMultipart/head/delete/list`) so B2/S3 remain drop-ins. Cloudinary is retired to nothing (transcoding moves to FFmpeg workers).
+
+### 10.2 Database
+
+PostgreSQL vs alternatives: relational integrity (recordings↔assets↔jobs FK graph), transactional billing, JSONB where flexibility is needed (job payloads, audience settings). SQLite rejected (multi-process API+workers), MySQL offers no advantage, MongoDB rejected (transactionality + this schema is relational). **Decision: PostgreSQL 16.**
+
+### 10.3 ORM
+
+| | Prisma | **Drizzle (recommended)** |
+|---|---|---|
+| Type safety | Excellent | Excellent |
+| Raw SQL ergonomics | Awkward escape hatch | First-class — needed for analytics rollups, `FOR UPDATE`, partial indexes |
+| Runtime | Query engine binary, heavier cold start | Thin, plain SQL |
+| Migrations | prisma migrate | drizzle-kit (SQL files, reviewable) |
+
+**Decision: Drizzle.** Migration SQL is checked in and hand-auditable, which matters for the strangler migration.
+
+### 10.4 Queue
+
+BullMQ (Redis) vs pg-boss (Postgres) vs SQS: BullMQ chosen for rate limiting per queue (Groq 20 RPM maps directly), delayed/repeatable jobs, flows (parent-child fan-out matches probe→transcode fan-out), and maturity. pg-boss is the fallback if operating Redis proves burdensome — the `JobQueue` interface in `10` §2 keeps that swappable.
+
+### 10.5 Video delivery
+
+MP4 (H.264/AAC, `+faststart`) always produced — universal, simple, seekable. HLS additionally for recordings > 5 min or > 1080p (adaptive bitrate, faster start, better seeking on long content). WebM sources are never served to viewers post-migration (Safari compatibility + no-duration/seek issues that `fix-webm-duration` currently patches). Rationale detail: `09` §5, `11` §3.
+
+### 10.6 Recorder container format
+
+Keep `MediaRecorder` → WebM (VP9/Opus, VP8 fallback) at record time — it is the only realistic browser option — but treat it strictly as a **source** format that workers normalize. Continue applying `fixWebmDuration` client-side only for the local-download fallback.
+
+## 11. Non-negotiable invariants
+
+These are binding on every future change (violations are bugs even if "it works"):
+
+1. PostgreSQL is the source of truth for application state.
+2. Object storage is the source of truth for media bytes — and only bytes.
+3. Never query Cloudinary/storage search as the application's database.
+4. Never use JSON files as production primary persistence.
+5. Never upload large videos through the application server when direct object-storage upload is possible.
+6. Never rely solely on in-memory MediaRecorder chunks — every chunk is persisted to IndexedDB before it counts.
+7. Recorder state is an explicit state machine; no new ad-hoc booleans representing lifecycle.
+8. Critical asynchronous processing goes through the durable queue with a `processing_jobs` row.
+9. Processing workers are idempotent (safe to run ≥ 1 times).
+10. Upload completion is idempotent (same session completed twice → same canonical result).
+11. Client-reported duration/size/mime are hints, never authoritative.
+12. FFprobe verifies every uploaded media object before it is playable.
+13. Source video is immutable; edits produce new derived assets.
+14. AI failures must not make the video unavailable.
+15. Billing failures must not corrupt recording state (separate transactions, separate tables).
+16. Every event listener/timer/stream has deterministic cleanup (see `03` §10).
+17. Every major failure has a documented recovery path (`18`).
+18. Every production feature has failure-path tests (`20`).
