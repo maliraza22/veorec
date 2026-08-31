@@ -26,14 +26,18 @@ free.max_active_videos              = 50
 free.max_storage_bytes              = 5_368_709_120      // 5 GiB (marketed "5 GB")
 free.max_recording_duration_seconds = 600                // +30s server grace, §3
 free.max_resolution                 = { width: 1920, height: 1080 }   // long edge ≤ 1920
-free.upload_reservation_bytes       = 330_000_000        // worst case: 600 s × 550,000 B/s (§4.3)
+free.max_upload_bytes               = 536_870_912        // 512 MiB per-recording hard byte ceiling (§4.3a)
+free.min_start_bytes                = 67_108_864         // 64 MiB — refuse to start below this much free quota
 
 pro.max_active_videos               = null               // unlimited
 pro.max_storage_bytes               = 1_099_511_627_776  // 1 TiB
 pro.max_recording_duration_seconds  = 36_000             // 600 min
 pro.max_resolution                  = { width: 1920, height: 1080 }
-pro.upload_reservation_bytes        = 5_368_709_120      // 5 GiB flat reservation
+pro.max_upload_bytes                = 21_474_836_480     // 20 GiB (600 min practical max ≈ 18.5 GiB + headroom)
+pro.min_start_bytes                 = 67_108_864
 ```
+
+**How `max_upload_bytes` was derived (verified against the recorder, not assumed):** the recorder's encoder settings are *targets*, not guarantees — current code sets `videoBitsPerSecond` 4/2.5/1 Mbps by quality and leaves audio at the browser default (`extension/recorder.js:262-266`); the target spec pins audio at 128 kbps (`03` §6). MediaRecorder's VBR output averages near its target but can overshoot transiently, so no bitrate arithmetic is a *guarantee*. Practical worst case at 1080p/high: 4.0 Mbps video + 128 kbps audio + ~2% container ≈ 526,000 B/s → 630 s (limit + grace) ≈ **331 MB**. `free.max_upload_bytes = 512 MiB` gives ~62% headroom above that — a legitimate 10-minute 1080p recording can never plausibly hit the ceiling, while a runaway encoder or hostile client is still hard-capped. The ceiling is made **deterministic by enforcement, not by trusting the encoder** — three independent layers, §4.3a.
 
 "Active video" = a `recordings` row whose `status ∈ {recording, uploading, uploaded, processing, ready}` and `deleted_at IS NULL`. Soft-deleted, `failed`, and `rejected_limit` recordings do **not** count. `max_resolution` is enforced at capture (recorder constraints) and at transcode (`09` §3 scale cap) — an over-resolution web upload is downscaled, never rejected for resolution alone.
 
@@ -80,10 +84,11 @@ Derived assets the platform creates (MP4 transcode, HLS, posters, captions) have
 ### 4.2 Quota formula
 
 ```
-available_bytes = plan.max_storage_bytes − retained − reserved
-available_slots = plan.max_active_videos − active_video_count − reserved_video_slots   (null plan cap ⇒ ∞)
+available_bytes   = plan.max_storage_bytes − retained − reserved
+available_slots   = plan.max_active_videos − active_video_count − reserved_video_slots   (null plan cap ⇒ ∞)
+reservation_bytes = min(plan.max_upload_bytes, available_bytes)      // = this recording's hard byte ceiling
 ```
-A new recording/upload is allowed iff `available_bytes ≥ plan.upload_reservation_bytes` **and** `available_slots ≥ 1`. The two limits are independent; either alone blocks.
+A new recording/upload is allowed iff `available_bytes ≥ plan.min_start_bytes` **and** `available_slots ≥ 1`. The two limits are independent; either alone blocks. Reserving `min(ceiling, available)` — instead of a fixed worst case — means a user with 300 MiB free can still record (their take is byte-capped at 300 MiB, disclosed up front, §4.3a) rather than being rejected outright, while concurrent uploads still can't overspend.
 
 ### 4.3 Atomic check-and-reserve (race-condition prevention)
 
@@ -94,6 +99,7 @@ UPDATE usage SET
   storage_reserved_bytes = storage_reserved_bytes + :reserve,
   reserved_video_slots   = reserved_video_slots + 1
 WHERE user_id = :uid
+  AND :reserve >= :min_start_bytes            -- refuse doomed sub-64MiB recordings
   AND storage_retained_bytes + storage_reserved_bytes + :reserve <= :max_storage_bytes
   AND (:max_active_videos IS NULL
        OR active_video_count + reserved_video_slots + 1 <= :max_active_videos)
@@ -101,9 +107,17 @@ RETURNING *;
 ```
 Zero rows updated ⇒ 403 `storage_limit` or `video_limit` (whichever guard failed — checked in that order and reported precisely). A `storage_reservations` row records `{user_id, upload_session_id, reserved_bytes, status:'held', expires_at}`.
 
-`:reserve = plan.upload_reservation_bytes` — the server-computed worst case for a maximum-length recording at the recorder's bitrate ceiling (never a client estimate). This makes the two-tabs race impossible by construction: with 4.7 GB retained of 5 GB, the first tab's reservation either fits or is rejected; the second tab's guarded UPDATE sees `retained + reserved` including the first reservation and is rejected with the storage-limit message. Two concurrent requests can never both conclude the same 300 MB is available, because the check and the reservation are one atomic statement on one row.
+`:reserve = min(plan.max_upload_bytes, available_bytes)` — always server-computed, never a client estimate; the reserved amount **is** that recording's hard byte ceiling (§4.3a). This makes the two-tabs race impossible by construction: with 4.7 GiB retained of 5 GiB, the first tab atomically reserves the remaining ~300 MiB (its take is byte-capped there, disclosed up front); the second tab's guarded UPDATE sees `retained + reserved` including the first reservation, finds less than `min_start_bytes` left, and is rejected with the storage-limit message. Two concurrent requests can never both conclude the same 300 MB is available, because the check and the reservation are one atomic statement on one row.
 
-Uploads are also hard-capped server-side: `complete` rejects a manifest whose total exceeds `reserved_bytes` × 1.05 (tolerance for container overhead) with `upload_manifest_invalid` — a client cannot upload past its reservation. Because reservation covers the worst case, the "final size exceeds quota" condition is **prevented up front rather than punished after the fact**; the only residual path (a plan downgrade racing an in-flight upload) resolves via the existing `rejected_limit` 7-day grace (`06` §7.5) — user content is never silently deleted.
+### 4.3a The byte ceiling is enforced, not estimated
+
+The recorder's encoder settings are **targets, not guarantees** — verified against the current source: `videoBitsPerSecond` 4/2.5/1 Mbps by quality, audio at browser default (`extension/recorder.js:262-266`; target spec pins audio to 128 kbps, `03` §6). MediaRecorder VBR can transiently overshoot its target, so no bitrate arithmetic is a hard bound. The ceiling is therefore made deterministic by three independent enforcement layers:
+
+1. **Recorder auto-stop** (`03` §8): the upload session returns `byteCeiling = reserved_bytes`; the recorder tracks cumulative recorded bytes on every chunk (same encoder-clock pattern as the duration cap), warns at 90%, and hard-stops at `ceiling − 16 MiB` safety margin — the take is finalized and uploaded, never lost. If the ceiling is below a full-length worst case (low remaining quota), the recorder says so **before** capture: "you have storage for about N minutes".
+2. **Presign refusal** (`06` §4): part URLs are signed with an exact `Content-Length` (storage rejects a mismatched PUT), and the server refuses to presign parts whose cumulative declared bytes would exceed the ceiling — a hostile client cannot push bytes past its reservation even holding valid URLs.
+3. **Completion check** (`06` §7): the manifest total, verified against storage `HEAD`, must be ≤ `reserved_bytes` exactly (no tolerance factor — the ceiling is enforced, not guessed). Violation ⇒ `422 upload_manifest_invalid`, no ledger change, multipart aborted.
+
+The "final size exceeds quota" condition is **prevented up front rather than punished after the fact**, and a legitimate 10-minute 1080p recording can never be rejected by a mis-guessed maximum (512 MiB ceiling vs ≈331 MB practical worst case, §1.1). The only residual path (a plan downgrade racing an in-flight upload) resolves via the existing `rejected_limit` 7-day grace (`06` §7.5) — user content is never silently deleted.
 
 ### 4.4 Reservation lifecycle & reconciliation
 
@@ -132,7 +146,7 @@ Nightly `maintenance.usage_sync` re-derives `retained`, `active_video_count`, an
 - The dashboard/billing UI shows **two separate meters** — `Storage 4.2 GB / 5 GB` and `Videos 38 / 50` — never merged into one percentage, because either can independently block recording.
 - Storage-limit block message (exact copy): **“You've reached your 5 GB free storage limit. Delete a video or upgrade to continue recording.”**
 - Video-limit block message (exact copy): **“You've reached your 50-video free limit. Delete a video or upgrade to continue recording.”**
-- **Pre-recording warning**: the recorder's quota pre-flight (`03` §3.0) warns before capture starts when storage is near the limit (`available_bytes < 2 × upload_reservation_bytes`, i.e. < 660 MB free) or when ≥ 45 of 50 videos are used: “You're close to your free limit — this may be one of your last recordings. Free up space or upgrade.”
+- **Pre-recording warning**: the recorder's quota pre-flight (`03` §3.0) warns before capture starts when storage is near the limit (`available_bytes < plan.max_upload_bytes`, i.e. a full-length maximum-quality take may not fit — the warning includes the estimated minutes that DO fit) or when ≥ 45 of 50 videos are used: “You're close to your free limit — this may be one of your last recordings. Free up space or upgrade.”
 - Every quota denial carries `meta` (`usedBytes/limitBytes/videoCount/maxVideos`) so paywall UIs render real numbers (existing UpgradeModal contract).
 
 ## 5. Paddle integration

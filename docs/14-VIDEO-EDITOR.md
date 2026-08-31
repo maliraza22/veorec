@@ -7,7 +7,7 @@
 ## 1. Concepts
 
 - **Virtual edit** — `trim_start/trim_end/segments` on the recording; the player skips gaps client-side. Instant, free, reversible. Unchanged from today.
-- **Edit session** (`edit_sessions`) — a draft timeline: ordered clips `[{recordingId, start, end}]`, possibly spanning multiple owned recordings.
+- **Edit session** (`edit_sessions`) — a draft timeline: ordered clips `[{recordingId, start, end}]`, possibly spanning multiple owned recordings. This is the **edit decision list (EDL)**: edits are structured operations over an immutable source, previewed client-side instantly (virtual skip in the player/editor) — the expensive server render happens **only** on explicit export/save, never on every timeline change.
 - **Render job** — bakes a timeline into a real file via FFmpeg (worker), producing a `render_output` asset. `mode: 'overwrite'` (result becomes the recording's active video) or `'copy'` (result becomes a new recording).
 - **Immutability**: the `source` asset is never modified or deleted by editing. "Overwrite" re-points which derived asset the player serves — the original bytes remain until the recording itself is deleted. This converts today's scary rename-over-original (`index.js:1150-1167`) into a reversible pointer swap.
 

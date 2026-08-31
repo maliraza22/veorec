@@ -47,8 +47,9 @@
 
 ## Quotas (free plan: 50 active videos AND 5 GB retained storage — whichever first)
 
-- [ ] **Exact limits enforced** — `free.max_active_videos=50`, `free.max_storage_bytes=5_368_709_120`, `free.max_recording_duration_seconds=600`, `free.max_resolution=1080p` (`16` §1.1); either cap independently blocks new recordings
-- [ ] **Atomic reservation** — quota check-and-reserve is one guarded statement; Q1/Q16 concurrency tests green (two tabs can never double-spend the last 300 MB)
+- [ ] **Exact limits enforced** — `free.max_active_videos=50`, `free.max_storage_bytes=5_368_709_120`, `free.max_recording_duration_seconds=600`, `free.max_resolution=1080p`, `free.max_upload_bytes=536_870_912` (`16` §1.1); either quota cap independently blocks new recordings
+- [ ] **Atomic reservation** — quota check-and-reserve is one guarded statement (`reserve = min(max_upload_bytes, available)`, floor `min_start_bytes`); Q1/Q16 concurrency tests green (two tabs can never double-spend the last 300 MB)
+- [ ] **Byte ceiling enforced, not estimated** — recorder auto-stop at ceiling (R23), presign refusal + Content-Length-signed part URLs, exact completion check (Q14, Q17); a legitimate 10-min 1080p recording is never rejected by the ceiling
 - [ ] **Server-authoritative accounting** — ledger built only from server-observed sizes (storage HEAD, asset rows); client size/count/duration claims verifiably ignored (hostile-client test Q14)
 - [ ] **Ledger categories** — retained / reserved / temporary-processing / pending-deletion distinguished; temp processing files never count toward user storage; derived platform assets never bill the user
 - [ ] **Deletion semantics** — soft-delete frees video count and storage quota immediately (Q15); hard purge drains pending-deletion within the 30-day window

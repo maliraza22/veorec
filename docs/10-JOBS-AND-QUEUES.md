@@ -14,8 +14,8 @@
 
 ## 2. Infrastructure
 
-- Queues (BullMQ): `media` (probe/transcode/thumbnail/hls/audio), `render`, `stt` (transcribe/translate), `ai` (title/summary/chapters), `maintenance` (cleanup/usage_sync/subscription_sync/upload_expiry), `email`.
-- Interface `JobQueue { enqueue(queue, name, payload, opts): jobId }` wraps BullMQ so pg-boss remains a drop-in (decision `02` §10.4).
+- Queues (BullMQ): `media` (probe/transcode/thumbnail/hls/audio), `render`, `stt` (transcribe/translate), `ai` (title/summary/chapters), `maintenance` (cleanup/usage_sync/subscription_sync/upload_expiry), `email`. Reserved for the future: `render-gpu` — same job payloads/contracts as `render`, consumed by on-demand GPU workers (`02` §2.2); routing a job type between CPU and GPU fleets is a queue-name decision, invisible to the API and to clients.
+- Interface `JobQueue { enqueue(queue, name, payload, opts): jobId }` wraps BullMQ so pg-boss remains a drop-in (decision `02` §10.4). Worker implementations (CPU FFmpeg, future GPU) are provider-agnostic consumers of the same contracts — no RunPod/host-specific logic in job code.
 - **Transactional outbox**: API/worker writes `processing_jobs(status='queued')` inside the business tx; an outbox relay (small loop, 500ms) enqueues rows where `enqueued_at is null` into BullMQ and stamps them. Crash between commit and enqueue → relay picks it up. (Direct enqueue-after-commit is acceptable for non-critical jobs like email.)
 - Workers: `apps/worker` process(es); graceful shutdown = stop taking jobs, finish current (≤ timeout), SIGKILL ffmpeg children.
 - Stalled jobs: BullMQ stalled-check 60s; a stalled `active` job is re-queued (idempotency makes this safe).

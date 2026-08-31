@@ -66,9 +66,10 @@ Part upload/re-upload idempotency; presign expiry re-mint; abort; expiry job abo
 | Q11 | Storage reconciliation (`usage_sync`) after injected drift | re-derived values match asset aggregates; drift logged |
 | Q12 | Server restart between reservation and first part | reservation row survives; recovery resumes or expiry releases — never leaks |
 | Q13 | Worker failure during processing (kill mid-transcode) | retry converges; `counts_toward_quota` assets counted once |
-| Q14 | Upload exceeding its reservation (hostile client, manifest > reserved ×1.05) | 422 `upload_manifest_invalid`; no ledger change |
+| Q14 | Hostile client tries to exceed its byte ceiling | presign refused beyond ceiling (403); oversized PUT rejected by storage (signed Content-Length); manifest > ceiling ⇒ 422 `upload_manifest_invalid`; no ledger change |
 | Q15 | Soft-delete → quota freed immediately; hard purge after 30 d → pending_deletion drained | dual-meter endpoint reflects each step |
-| Q16 | Free user at 4.7/5 GB, reservation 330 MB, two tabs | matches the spec example: first reserves, second blocked; no state where both proceed |
+| Q16 | Free user at 4.7/5 GiB, two tabs | matches the spec example: first tab atomically reserves the remaining ~300 MiB (take byte-capped there, disclosed up front); second tab blocked below `min_start_bytes`; no state where both proceed |
+| Q17 | Recording hits its byte ceiling mid-recording | recorder warns at 90%, auto-stops at ceiling − 16 MiB, take uploads and completes ≤ ceiling (also recorder matrix R23) |
 
 ## 8. Processing/worker tests
 
@@ -100,6 +101,7 @@ Fixture library: 5s webm (vp9/opus), webm w/o duration header, video-only webm, 
 | R20 | mic unplugged mid-recording | continues; `mic_lost` warning; file valid |
 | R21 | device sleep/resume mid-recording | recording stops or recovers; no corrupt upload (probe passes or recovery offered) |
 | R22 | extension reload mid-recording | next launch recovers captured portion |
+| R23 | byte ceiling reached mid-recording (low remaining quota) | pre-start disclosure shown; 90% warning; auto-stop at ceiling − 16 MiB; upload completes within ceiling |
 
 ## 10. Failure injection (chaos, staging)
 

@@ -44,20 +44,22 @@ Rules:
 `POST /api/v1/uploads`
 - Auth: required. Body: `{recordingId, mimeType, estimatedBytes?}`. Header: `Idempotency-Key` (client-generated uuid; retried request returns the same session).
 - Validation: recording exists, is owned by caller, `status ∈ {recording, uploading, upload_failed}`; mimeType ∈ allowlist (`video/webm`, `video/mp4`, `video/quicktime`).
-- **Atomic quota reservation (authoritative — `16` §4.3):** in the same transaction that inserts the session, a single guarded UPDATE on the user's `usage` row reserves `plan.upload_reservation_bytes` + 1 video slot, and a `storage_reservations` row is created. Guard failure ⇒ `403 {code:'storage_limit'|'video_limit', upgradeRequired:true, meta}` and **no session is created**. `estimatedBytes` is a hint only — the reservation amount is always server-computed; the client is never trusted for sizes or counts. Two concurrent sessions (two tabs, two devices) serialize on the `usage` row: quota can never be double-spent.
-- Response `201 {uploadSessionId, partSize, minPartSize, maxParts, expiresAt}`.
+- **Atomic quota reservation (authoritative — `16` §4.3):** in the same transaction that inserts the session, a single guarded UPDATE on the user's `usage` row reserves `min(plan.max_upload_bytes, available_bytes)` + 1 video slot (guard also requires ≥ `plan.min_start_bytes` available), and a `storage_reservations` row is created. Guard failure ⇒ `403 {code:'storage_limit'|'video_limit', upgradeRequired:true, meta}` and **no session is created**. `estimatedBytes` is a hint only — the reservation amount is always server-computed; the client is never trusted for sizes or counts. Two concurrent sessions (two tabs, two devices) serialize on the `usage` row: quota can never be double-spent.
+- Response `201 {uploadSessionId, partSize, minPartSize, maxParts, byteCeiling, expiresAt}` — `byteCeiling = reserved_bytes` is this recording's hard size cap; the recorder enforces it client-side (`03` §8) and the server enforces it at presign (§4) and complete (§7).
 - `partSize`: server-chosen, default **8 MiB** (S3 minimum is 5 MiB for all but the last part; 8 MiB ≈ 30–60s of video at recorder bitrates → steady upload cadence). `maxParts` 10,000 (S3 limit) → 80 GB ceiling, far above any plan.
 - `expiresAt`: now + 48h (recording + upload must finish within; recovery after that rebuilds a fresh session, `05` §6.1).
 
 ## 4. Part presigning
 
-`POST /api/v1/uploads/:id/parts` body `{partNumbers: number[]}` (≤ 20 per call) → `[{partNumber, url, expiresAt}]`.
-- Presigned S3 `UploadPart` URLs, TTL 1h. Clients prefetch the next 2–3 part URLs to avoid a round trip between parts, and re-request on expiry (URL minting is free and repeatable).
+`POST /api/v1/uploads/:id/parts` body `{parts: [{partNumber, size?}]}` (≤ 20 per call; `size` defaults to `partSize`, required for the final short part) → `[{partNumber, url, expiresAt}]`.
+- Presigned S3 `UploadPart` URLs, TTL 1h, **signed with the exact `Content-Length`** — storage itself rejects a PUT whose body size differs from what was presigned. Clients prefetch the next 2–3 part URLs to avoid a round trip between parts, and re-request on expiry (URL minting is free and repeatable).
+- **Byte-ceiling enforcement (`16` §4.3a):** the server tracks cumulative declared bytes per session and refuses to presign parts that would exceed `byteCeiling` (`403 {code:'storage_limit'}` on that call) — a hostile client cannot push bytes past its reservation even holding valid URLs.
 - Authorization: session owner only; session must be `active` (a `pending` session becomes `active` on first presign).
 
 ## 5. Client uploader behavior
 
 - Buffer chunks (from `dataavailable`) into the current part; **seal** at ≥ `partSize` or at finalize (last part may be any size ≥ 1 byte).
+- Track cumulative recorded bytes against the session's `byteCeiling`: warn the machine at 90%, emit `STOP(source:'byte_limit')` at `ceiling − 16 MiB` (`03` §8 / `16` §4.3a) — the recording finalizes and uploads normally.
 - Write the `parts` row locally before PUT (`05` §5), compute `crc32c` of the part, PUT with `Content-Length` (streams a Blob slice; no full-file assembly ever).
 - Concurrency: max **2** parallel part PUTs while recording (leave bandwidth for the meeting being recorded), **4** after stop.
 - After a successful PUT, immediately `PUT /uploads/:id/parts/:n {etag, size, crc32c}` to record it server-side. This call is idempotent (upsert on PK); if it fails transiently, retry with the part-PUT backoff policy; the truth is recoverable from S3 `ListParts` anyway.
@@ -78,10 +80,10 @@ Per part PUT:
 
 Server algorithm (single Postgres transaction around steps 3–5):
 1. Load session `FOR UPDATE`. If `status='completed'` → **return the existing canonical result** (`200 {recordingId, status, watchUrl}`) — never create another asset. (This is the spec's canonical idempotency example.)
-2. Validate the manifest: contiguous partNumbers from 1, every part known in `upload_parts` (or verifiable via `ListParts`), sizes ≥ minPartSize except last.
+2. Validate the manifest: contiguous partNumbers from 1, every part known in `upload_parts` (or verifiable via `ListParts`), sizes ≥ minPartSize except last, **total ≤ the session's `byteCeiling` exactly** (`16` §4.3a — violation ⇒ `422 upload_manifest_invalid`, multipart aborted, reservation released, no ledger change).
 3. Call S3 `CompleteMultipartUpload` with the etag manifest. If S3 says the upload id is already completed (`NoSuchUpload` but object exists with expected size) → treat as success (crash-between-steps recovery).
 4. `HEAD` the object; record `total_size`. Sanity check: `total_size == Σ part sizes`, else fail with `upload_size_mismatch` (500-class, retryable — do not delete anything).
-5. Update: session `completed`; recording `status='uploaded'`, `size_bytes`; create `video_assets` row (`kind='source'`, immutable, `counts_toward_quota=true`); **reservation reconciliation** (`16` §4.4): `retained += total_size`, `reserved −= reservation`, `reserved_slots −= 1`, `active_video_count += 1`, reservation `reconciled` — all in this same transaction. Guards: `total_size` must be ≤ `reserved_bytes × 1.05` (else `422 upload_manifest_invalid` — a client cannot upload past its reservation), and the plan is re-checked with the real size for the residual downgrade-race case — on rejection: recording `status='rejected_limit'`, reservation released, respond `403 {code:'video_limit'|'storage_limit', upgradeRequired:true}`, schedule source deletion after 7 days (grace so an upgrade can rescue it — user content is never silently deleted).
+5. Update: session `completed`; recording `status='uploaded'`, `size_bytes`; create `video_assets` row (`kind='source'`, immutable, `counts_toward_quota=true`); **reservation reconciliation** (`16` §4.4): `retained += total_size`, `reserved −= reservation`, `reserved_slots −= 1`, `active_video_count += 1`, reservation `reconciled` — all in this same transaction. Guards: `total_size` ≤ `byteCeiling` exactly (already validated in step 2 — the ceiling is enforced at presign time, so this is a defense-in-depth re-check), and the plan is re-checked with the real size for the residual downgrade-race case — on rejection: recording `status='rejected_limit'`, reservation released, respond `403 {code:'video_limit'|'storage_limit', upgradeRequired:true}`, schedule source deletion after 7 days (grace so an upgrade can rescue it — user content is never silently deleted).
 6. Enqueue `probe` job (outside the tx, after commit; a transactional-outbox row `processing_jobs(status='queued')` is written inside the tx and a relay enqueues — see `10` §3).
 7. Respond `200 {recordingId, status:'uploaded', watchUrl}`.
 
@@ -113,7 +115,7 @@ Then complete as normal. **Missing-part detection is therefore server-authoritat
 
 ## 12. Small-file path (web uploads, editor "add clip")
 
-Files ≤ 32 MiB may use a single presigned `PUT` (`POST /api/v1/uploads` with `mode:'single'` → one URL; complete is the same endpoint with `parts:[]`, server HEADs the object). Same session bookkeeping, same idempotency, same atomic quota reservation (reservation = 33,554,432 bytes for single mode). The editor's current 500MB memory-multer `replace` path (`index.js:61`, `1023-1086`) is **deleted** — renders happen server-side from source assets (`14`), and user file uploads use this protocol.
+Files ≤ 32 MiB may use a single presigned `PUT` (`POST /api/v1/uploads` with `mode:'single'` → one URL; complete is the same endpoint with `parts:[]`, server HEADs the object). Same session bookkeeping, same idempotency, same atomic quota reservation (reservation = byte ceiling = 33,554,432 bytes for single mode, enforced by signed Content-Length + HEAD at complete). The editor's current 500MB memory-multer `replace` path (`index.js:61`, `1023-1086`) is **deleted** — renders happen server-side from source assets (`14`), and user file uploads use this protocol.
 
 ## 13. API examples
 
@@ -124,11 +126,11 @@ Idempotency-Key: 1c9f7e0a-...
 {"recordingId":"rec_9f2...","mimeType":"video/webm","estimatedBytes":52428800}
 
 201 {"uploadSessionId":"up_31a...","partSize":8388608,"maxParts":10000,
-     "expiresAt":"2026-09-03T12:00:00Z"}
+     "byteCeiling":536870912,"expiresAt":"2026-09-03T12:00:00Z"}
 ```
 ```http
 POST /api/v1/uploads/up_31a/parts
-{"partNumbers":[3,4,5]}
+{"parts":[{"partNumber":3},{"partNumber":4},{"partNumber":5,"size":2097152}]}
 200 [{"partNumber":3,"url":"https://...r2...&X-Amz-Signature=...","expiresAt":"..."}, ...]
 ```
 ```http

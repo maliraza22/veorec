@@ -55,8 +55,8 @@ Notes:
 
 ### 3.0 Quota pre-flight (before `START` is accepted)
 At window load the recorder fetches `GET /me/usage` alongside entitlements (`§8`):
-- **Blocked** (`storage.usedBytes + reserved ≥ limitBytes − upload_reservation_bytes`, or `videos.count ≥ max`): the Start button is replaced by the exact block message from `16` §4.6 (“You've reached your 5 GB free storage limit…” / “You've reached your 50-video free limit…”) with *Manage videos* and *Upgrade* actions. This is UX only — the authoritative gate is the server's atomic reservation at upload-session creation.
-- **Near limit** (storage remaining < 2 × `upload_reservation_bytes`, or ≥ 45/50 videos): show the pre-recording warning banner (`16` §4.6) but allow recording.
+- **Blocked** (available storage < `plan.min_start_bytes`, or `videos.count ≥ max`): the Start button is replaced by the exact block message from `16` §4.6 (“You've reached your 5 GB free storage limit…” / “You've reached your 50-video free limit…”) with *Manage videos* and *Upgrade* actions. This is UX only — the authoritative gate is the server's atomic reservation at upload-session creation.
+- **Near limit** (available storage < `plan.max_upload_bytes` — a full-length maximum-quality take may not fit, so the warning states the estimated minutes that DO fit — or ≥ 45/50 videos): show the pre-recording warning banner (`16` §4.6) but allow recording; the take will be byte-capped at the reservation (§8).
 - Usage fetch failure: proceed (do not block recording on a metadata fetch); the server reservation still enforces.
 - If upload-session creation later returns `storage_limit`/`video_limit` (race with another tab/device), the machine treats it like the offline case: recording proceeds with `uploadSession:null` durability-only **if capture already started**, and at finalize the user gets the block message with *Save to device / Delete a video & retry / Upgrade* — a take in progress is never discarded by a quota verdict.
 
@@ -139,7 +139,7 @@ One `AudioContext` mixes display/tab audio + mic into a single track via `MediaS
 ## 6. MediaRecorder configuration
 
 - Container: `video/webm;codecs=vp9,opus` if `isTypeSupported`, else `video/webm;codecs=vp8,opus`, else `video/webm`. (H.264-in-MP4 MediaRecorder is not reliable in Chrome; normalization to MP4 happens server-side — `09`.)
-- `videoBitsPerSecond` per quality (§4); `audioBitsPerSecond: 128_000`.
+- `videoBitsPerSecond` per quality (§4); `audioBitsPerSecond: 128_000` — **explicitly set** (the legacy recorder left audio at browser default, `recorder.js:266`). Both values are encoder *targets*, not guarantees — VBR output can transiently overshoot — which is why size control is the enforced byte ceiling (§8), never bitrate arithmetic.
 - `start(1000)` — 1s timeslice. Rationale: bounded memory between persists, ~1s max data loss on crash, and the encoder-clock limit enforcement (§8) needs regular callbacks.
 - Handlers registered before `start`: `dataavailable`, `stop`, `error` (→ event `RECORDER_ERROR {error}` → treat as `STOP(source:'recorder_error')` — salvage what exists rather than discarding), `pause`, `resume` (assert-only).
 
@@ -156,15 +156,23 @@ dataavailable(e) [discarding? drop]:
 - The IndexedDB write is fire-and-ordered (writes queue per session; failure → event `PERSIST_FAILED` once, UI banner "recovery protection unavailable", recording continues — better to record un-protected than to stop).
 - Memory rule: chunks are NOT accumulated into a `chunks[]` array anymore. The uploader holds at most `partSize` (8–16MB) plus in-flight parts; assembly of a full blob happens only for the local-download fallback, streamed from IndexedDB.
 
-## 8. Recording limit enforcement
+## 8. Recording limit enforcement — duration AND bytes
 
-Keep the current three-layer defense (it exists because background windows get timer-throttled — comments at `recorder.js:269-296`):
+Two independent caps, both enforced by the same encoder-clock pattern (which exists because background windows get timer-throttled — comments at `recorder.js:269-296`):
 
+**Duration cap** (`plan.max_recording_duration_seconds`):
 1. Primary: check `elapsed >= limit` inside `dataavailable` (encoder clock, fires even when throttled).
 2. Backstop: single re-arming `setTimeout` at `limit - elapsed + 500ms`.
 3. UI: 30s warning.
+On trip → `STOP(source:'limit')`; `clientDuration` reported clamped to the limit; server still verifies with FFprobe and applies the +30s grace (`permissions.canRecord` semantics preserved).
 
-On trip → `STOP(source:'limit')`; `clientDuration` reported clamped to the limit; server still verifies with FFprobe and applies the +30s grace (`permissions.canRecord` semantics preserved). Limit source: `GET /api/v1/me/entitlements` at window load; **fallback when the fetch fails is the cached last-known entitlement (from `chrome.storage`), then free-plan limit** — fixes the current bug where a failed fetch caps Pro users at 10 min (`recorder.js:34-53`).
+**Byte cap** (`byteCeiling` from the upload session = the atomic quota reservation, `16` §4.3a):
+1. Primary: cumulative recorded bytes checked inside `dataavailable` (the chunk pipeline already sums sizes).
+2. Warn at 90% of the ceiling ("running out of storage — about N min left at this rate", rate estimated from the last 30s of chunks).
+3. On reaching `ceiling − 16 MiB` safety margin → `STOP(source:'byte_limit')` — normal finalize + upload; the take is preserved, never rejected.
+4. Pre-flight disclosure: when the ceiling is below the plan's full-length worst case (low remaining quota), the recorder says so **before** capture starts (§3.0). If no upload session exists yet (offline start), the byte cap defaults to `plan.max_upload_bytes` from cached entitlements, and the server re-enforces at presign/complete regardless.
+
+The byte ceiling — not encoder bitrate settings — is the authoritative size control: MediaRecorder bitrates are targets and cannot be trusted as an upper bound (§6). Server-side enforcement (presign refusal + completion check, `06` §4/§7) holds even if the client is hostile. Limit source: `GET /api/v1/me/entitlements` at window load; **fallback when the fetch fails is the cached last-known entitlement (from `chrome.storage`), then free-plan limit** — fixes the current bug where a failed fetch caps Pro users at 10 min (`recorder.js:34-53`).
 
 ## 9. External interruption events
 

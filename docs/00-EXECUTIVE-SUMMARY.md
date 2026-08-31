@@ -59,6 +59,7 @@ PostgreSQL is the single source of truth for all application state (users, recor
 | Database | PostgreSQL (+ Drizzle ORM) | `07-DATABASE-DESIGN.md`, §Phase-6 comparisons in `02-ARCHITECTURE.md` §10 |
 | Object storage | Cloudflare R2 (S3 API, zero egress) | `02-ARCHITECTURE.md` §10.1 |
 | Upload protocol | S3 multipart with presigned part URLs, app-managed `upload_sessions` | `06-UPLOAD-PROTOCOL.md` |
+| API hosting | Dedicated VPS (Hostinger-class initially), Docker, provider-agnostic; Vercel for web | `02-ARCHITECTURE.md` §6, §10.6 |
 | Queue | BullMQ on Redis | `10-JOBS-AND-QUEUES.md` |
 | Recorder state | Explicit finite state machine (hand-rolled, XState-compatible design) | `03-RECORDING-ENGINE-SPECIFICATION.md` |
 | Local durability | IndexedDB in the recorder document, chunk-per-row | `05-LOCAL-RECOVERY-INDEXEDDB.md` |
@@ -104,7 +105,7 @@ PostgreSQL is the single source of truth for all application state (users, recor
 2. **Extension review lag** (Chrome Web Store) — recorder changes must be backward-compatible with the deployed API for at least one version window; version the API (`/api/v1`).
 3. **Recorder regressions** — the single highest-value user flow. Mitigated by the recorder test matrix (`20-TESTING-STRATEGY.md` §9) and by building the state machine behind the current UI before switching defaults.
 4. **In-flight recordings during cutover** — upload protocol v1 and v2 must coexist; old extension versions keep working until forcibly updated.
-5. **Cost** — R2 + Railway/worker compute vs. current Cloudinary free tier; modeled in `02-ARCHITECTURE.md` §10.
+5. **Cost** — R2 + VPS/worker compute vs. current Cloudinary free tier; hosting model and cost principles in `02-ARCHITECTURE.md` §6/§10.
 6. **Single developer bandwidth** — phases are deliberately small; every phase has acceptance criteria so partial progress is still shippable.
 
 ## 9. What NOT to touch until the core recorder is stable

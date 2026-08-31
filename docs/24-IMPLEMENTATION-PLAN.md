@@ -21,7 +21,7 @@ Repo layout target (created incrementally):
 
 ## Phase 1 — PostgreSQL
 
-**T-101 · DB scaffolding** — drizzle + pg pool + migration runner + docker-compose (postgres, redis, minio, mailhog). Files: `/db`, `docker-compose.yml`, `.env.example`. Tests: migration up/down empty DB. Accept: `npm run db:migrate` green locally & on Railway Postgres.
+**T-101 · DB scaffolding** — drizzle + pg pool + migration runner + docker-compose (postgres, redis, minio, mailhog). Files: `/db`, `docker-compose.yml`, `.env.example`. Tests: migration up/down empty DB. Accept: `npm run db:migrate` green locally & against the target environment's Postgres (VPS Docker per `02` §6; provider-agnostic).
 
 **T-102 · Schema migration 0001** — All tables from `07` (including workspaces, jobs, billing_events — empty is fine). Deps: T-101. Tests: schema snapshot test; FK/constraint assertions. Accept: `07` §12 ER diagram matches introspection.
 
@@ -55,7 +55,7 @@ Repo layout target (created incrementally):
 
 **T-305 · Web upload path** — Editor "upload clip" + future web uploads via single-PUT mode (`06` §12). Deps: T-301. Accept: editor upload works; memory-multer path marked deprecated.
 
-**T-306 · Quota ledger & atomic reservation** — New free-plan quota model (`16` §1.1: 50 active videos AND 5 GB retained, whichever first). Ledger columns on `usage` (retained/reserved/pending-deletion/active-count/reserved-slots) + `storage_reservations`; guarded-UPDATE check-and-reserve wired into upload-session creation; reconciliation at complete; release on abort/expiry; soft-delete frees quota; `counts_toward_quota` on assets; dual-meter `/me/usage`; plan catalog updated to the `16` §1.1 integers; grandfathering flag for over-quota legacy users (`23` Phase 3). Deps: T-301, T-302. Tests: Q1–Q16 (`20` §7.1). Accept: Q-suite green incl. 50-parallel-session race; ledger drift 0 after usage_sync on seeded data.
+**T-306 · Quota ledger & atomic reservation** — New free-plan quota model (`16` §1.1: 50 active videos AND 5 GiB retained, whichever first). Ledger columns on `usage` (retained/reserved/pending-deletion/active-count/reserved-slots) + `storage_reservations`; guarded-UPDATE check-and-reserve (`reserve = min(max_upload_bytes, available)`, floor `min_start_bytes`) wired into upload-session creation; **per-recording byte ceiling enforced at three layers** (recorder auto-stop, Content-Length-signed presigns + cumulative refusal, exact completion check — `16` §4.3a); reconciliation at complete; release on abort/expiry; soft-delete frees quota; `counts_toward_quota` on assets; dual-meter `/me/usage`; plan catalog updated to the `16` §1.1 integers; grandfathering flag for over-quota legacy users (`23` Phase 3). Deps: T-301, T-302. Tests: Q1–Q17 (`20` §7.1). Accept: Q-suite green incl. 50-parallel-session race; ledger drift 0 after usage_sync on seeded data.
 
 **T-307 · Quota UX** — Dual meters (“Storage 4.2 GB / 5 GB”, “Videos 38 / 50”) in dashboard/billing; recorder quota pre-flight block + near-limit warning (`03` §3.0); exact block messages from `16` §4.6; recovery-card quota-blocked options (`05` §6.1.3). Deps: T-306, T-403. Tests: Playwright meter rendering + blocked/warning states. Accept: no single blended percentage anywhere; copy matches spec exactly.
 

@@ -13,13 +13,14 @@ flowchart TB
         WEB["Web App (React/Vite)\nlibrary, watch, editor, billing"]
     end
 
-    subgraph Edge["Edge"]
-        CDN["CDN (Cloudflare)\ncaches public derived media"]
+    subgraph Edge["Edge — Cloudflare (CDN / DNS / WAF)"]
+        CDN["CDN\ncaches public derived media,\nfronts veorec.com + api + R2 delivery"]
     end
 
-    subgraph Core["Application tier"]
-        API["API Server (Node/TS, Express)\nauth, REST /api/v1, signed URLs,\nupload-session orchestration"]
-        WK["Workers (Node/TS, BullMQ)\nffprobe, ffmpeg, thumbnails, HLS,\ntranscription, AI, renders, cleanup"]
+    subgraph Core["Application tier — dedicated VPS (Docker), provider-agnostic"]
+        API["API Server (Node/TS, Express)\nauth, REST /api/v1, signed URLs,\nupload-session orchestration, webhooks,\nentitlements, BullMQ producers"]
+        WK["CPU Workers (Node/TS, BullMQ)\nffprobe, ffmpeg, thumbnails, HLS,\ntranscription, AI, renders, cleanup\n(horizontally scalable: worker-1..n)"]
+        GPU["GPU Workers (future, on-demand)\nsame job abstraction — heavy renders,\nAI video, effects; RunPod-class provider"]
     end
 
     subgraph Data["Data tier"]
@@ -50,6 +51,8 @@ flowchart TB
     PADDLE -- "webhooks" --> API
     API --> BREVO
     API --> GOOGLE
+    GPU -.-> RD
+    GPU -.-> R2
 ```
 
 **The two axioms that shape everything:**
@@ -70,6 +73,7 @@ flowchart TB
 - One deployable running BullMQ processors for every queue in `10-JOBS-AND-QUEUES.md`. Contains FFmpeg/FFprobe binaries (Docker image) and the transcription/AI logic relocated from `server/transcription.js` / `server/ai.js`.
 - Every processor is **idempotent** (safe to run twice) and **crash-safe** (BullMQ stalled-job recovery re-runs it). Progress and results are written to Postgres (`processing_jobs`, `video_assets`, `transcripts`), never only to queue state.
 - Scheduled/repeatable jobs (usage reconciliation, subscription sync, upload-session expiry, orphan cleanup) replace `server/cron.js`.
+- **CPU-first; GPU as a worker variant, not an architecture change.** All ordinary Loom-style operations (probe, transcode, HLS, thumbnails, trim/cut/compose, audio extraction) run on CPU FFmpeg workers, horizontally scaled (`worker-1..n`). If/when a workload genuinely benefits from GPU (GPU encoding, heavy compositing, AI video, background removal, high-res exports), it becomes a separate BullMQ queue (`render-gpu`) consumed by an on-demand GPU worker (RunPod-class) implementing the **same job contract** — the API that enqueues exports never knows or cares which fleet renders (`10` §2). No permanent GPU server; no RunPod-specific logic in core code.
 
 ### 2.3 Extension (`apps/extension`)
 
@@ -198,12 +202,29 @@ flowchart LR
     BR["bridge.js on veorec.com\nauth + start messages"] --> SW
 ```
 
-## 6. Environments & configuration
+## 6. Environments, hosting & configuration
 
+**Hosting model (approved direction):**
+
+| Component | Where | Notes |
+|---|---|---|
+| Web app (React/Vite) | **Vercel** | independently deployable from the API; no video processing ever runs in the Vercel runtime (no FFmpeg in serverless functions) |
+| API server | **Dedicated VPS** (initial: Hostinger-class, ~4–8 vCPU / 16–32 GB RAM / NVMe / Ubuntu), Docker-deployed | runs API, webhooks, upload-session coordination, entitlements, BullMQ producers, observability. **Never permanent video storage; never the video delivery layer** |
+| PostgreSQL + Redis | co-located on the VPS via Docker Compose initially (nightly dumps + WAL archiving to R2); documented upgrade path to managed offerings | Postgres = truth; Redis = queues/limits only |
+| CPU workers | same VPS initially; horizontally scalable to additional VPSes (`worker-1..n` all consuming BullMQ) | all ordinary Loom-style processing is CPU FFmpeg — **no GPU required** for the core product |
+| GPU workers (future) | on-demand/independently scalable provider (RunPod-class), only where GPU gives real benefit (heavy compositing, AI video, high-res exports) | same job abstraction — a GPU worker is just another BullMQ consumer; the user-facing export API never changes (§2.2) |
+| Media storage & delivery | **Cloudflare R2** behind Cloudflare CDN/DNS/WAF | browser ⇄ CDN ⇄ R2 directly; §10.1 |
+
+**Provider-abstraction rule:** application/business code never references Hostinger, Vercel, Cloudflare, R2, or RunPod directly. The realistic replacement boundaries get adapters — `StorageProvider` (R2 ⇄ B2/Wasabi/S3), the `JobQueue` interface (`10` §2), and worker implementations (CPU vs GPU behind identical job contracts). Deployment must be movable to Hetzner/AWS/GCP/another VPS without touching business logic. Do **not** invent abstractions beyond these — provider swap must be realistic and useful, not ceremonial.
+
+**Environments:**
 - `development`: docker-compose with Postgres, Redis, MinIO (S3-compatible, so the storage abstraction is exercised locally), mailhog. `ffmpeg` local.
-- `production`: Railway (or Fly) services: `api`, `worker`, managed Postgres, managed Redis; R2; Vercel for web; CDN.
+- `staging`: separate VPS/containers + separate R2 bucket + separate Paddle sandbox; config entirely disjoint from production.
+- `production`: as the table above. **Production credentials never appear in development/staging configuration** (separate env files/secret stores; enforced by the boot-time env schema refusing known-prod markers in dev).
 - All config via env, validated at boot with a schema (zod); the server refuses to start with missing critical vars (extends the existing `JWT_SECRET` boot check pattern from `server/auth.js:6-12`).
 - API is versioned at `/api/v1`. The legacy unversioned routes remain during migration (see `23`).
+
+**Cost-optimization principles (ranked):** 1 low storage cost, 2 low video egress cost, 3 low processing cost, 4 predictable Free-plan consumption (quota model, `16`), 5 horizontal scalability, 6 reliability, 7 simple operations. Explicitly forbidden "optimizations": storing videos on the API VPS, proxying media through Node, synchronous rendering, keeping failed temp files, trusting client-reported storage, removing redundancy that reliability requires, or allowing arbitrary file uploads on Free accounts (abuse controls: `17` §13).
 
 ## 7. Concurrency & consistency rules
 
@@ -265,7 +286,17 @@ BullMQ (Redis) vs pg-boss (Postgres) vs SQS: BullMQ chosen for rate limiting per
 
 MP4 (H.264/AAC, `+faststart`) always produced — universal, simple, seekable. HLS additionally for recordings > 5 min or > 1080p (adaptive bitrate, faster start, better seeking on long content). WebM sources are never served to viewers post-migration (Safari compatibility + no-duration/seek issues that `fix-webm-duration` currently patches). Rationale detail: `09` §5, `11` §3.
 
-### 10.6 Recorder container format
+### 10.6 API hosting
+
+| Option | Pros | Cons |
+|---|---|---|
+| **Dedicated VPS (recommended initial: Hostinger-class 4–8 vCPU / 16–32 GB / NVMe)** | Fixed, low monthly cost; co-locates API + Postgres + Redis + CPU workers on one box early; NVMe scratch is ideal for FFmpeg; Docker keeps it provider-portable (Hetzner/OVH/AWS EC2 are drop-in moves) | Self-managed OS/backups/security; single-node until workers split out |
+| PaaS (Railway/Fly — the earlier draft default) | Zero ops | Metered compute makes FFmpeg workers and always-on queues expensive; less control over scratch disk |
+| Hyperscaler (AWS/GCP/Azure) | Managed everything, infinite scale | Cost and complexity far above this stage; egress pricing hostile to video |
+
+**Decision: dedicated VPS via Docker Compose (API, workers, Postgres, Redis as services), provider-agnostic.** Nothing application-level may assume the provider (no Hostinger API calls in code; deployment scripts isolated under `infra/`). Scale path: split workers to a second VPS → managed Postgres → multi-node, all without code changes. Vercel stays for the web app only; the earlier "Railway (or Fly)" note in drafts of this doc is superseded.
+
+### 10.7 Recorder container format
 
 Keep `MediaRecorder` → WebM (VP9/Opus, VP8 fallback) at record time — it is the only realistic browser option — but treat it strictly as a **source** format that workers normalize. Continue applying `fixWebmDuration` client-side only for the local-download fallback.
 

@@ -69,7 +69,15 @@ Every query is scoped by `user_id`/`workspace_id` through repository methods tha
 ## 13. Abuse prevention
 
 - Signup throttling + disposable-email blocklist (config); contact form honeypot + rate limit.
-- Storage abuse: plan ceilings enforced at complete; upload session count limits; orphan/incomplete-multipart cleanup (`06` §8).
+- **Storage-economics controls** (the Free plan must not become general-purpose cloud storage — `02` §6 cost principles):
+  - *Automated bulk uploads*: upload-session rate limit (10/h·user, `08` §1) + max **3 concurrently open upload sessions per user** + the atomic quota reservation itself (`16` §4.3) — a bot cannot open unlimited reservations.
+  - *Repeated abandoned uploads*: reservations auto-expire (48h) and abandoned multiparts are aborted (`06` §8); a user with ≥ 10 expired-without-completion sessions in 7 days is flagged for review (metric + admin list).
+  - *Non-recorder file uploads*: every upload must pass FFprobe as real video within plan limits (`09` §2) — non-video objects are quarantined and purged, never retained; Free-plan uploads are additionally byte-capped per recording (`max_upload_bytes`) and duration-capped post-probe, so arbitrary large-file storage is structurally impossible.
+  - *Excessive processing*: processing runs only on probe-valid recordings; per-user reprocess/AI trigger rate limits (`08` §1); render jobs capped per user-hour.
+  - *Excessive bandwidth*: playback via short-TTL signed URLs (`12` §5) — no permanently public hotlinkable URLs; download URLs are audience-gated; per-IP watch rate limits; Cloudflare WAF fronting delivery.
+  - *Account farming*: signup throttling per IP, disposable-email blocklist, and per-account quotas mean N accounts cost N× effort for 5 GiB each; anomaly metric on many accounts sharing visitor ids/IP hashes.
+  - *Concurrent upload abuse*: serialized atomic reservations on the `usage` row (`16` §4.3) + the 3-open-session cap.
+- Storage abuse (mechanics): plan ceilings enforced at reservation and complete; orphan/incomplete-multipart cleanup (`06` §8).
 - Content: DMCA/abuse report route on watch pages → `contacts` with category; admin can soft-delete + ban (revoke sessions, disable login).
 - Comment spam: rate limits + owner moderation (`13` §1); links rendered non-clickable for anonymous authors.
 
