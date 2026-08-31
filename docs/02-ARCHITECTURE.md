@@ -210,6 +210,7 @@ flowchart LR
 - Every multi-row mutation is a Postgres transaction (upload completion, recording deletion, billing event application, usage adjustments).
 - Idempotency: mutation endpoints that clients retry accept an `Idempotency-Key` header (or have natural idempotency, e.g. `PUT parts/:n`); details per endpoint in `08`.
 - Usage counters (`usage` table) are updated in the same transaction as the causing event and re-derived by a nightly reconciliation job (keeping the good idea from `usage.service.js` but transactional).
+- Quota enforcement (free plan: 50 active videos AND 5 GB retained storage — whichever first) is an **atomic check-and-reserve** on the user's `usage` row at upload-session/render creation, reconciled to server-observed sizes at completion (`16` §4). Concurrent uploads can never double-spend quota; the client is never trusted for sizes or counts.
 - Workers use `processing_jobs.dedupe_key` (unique) so the same logical job is never active twice.
 
 ## 8. Failure-domain map

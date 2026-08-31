@@ -112,7 +112,7 @@ flowchart TD
 
 1. If `uploadSessionId` exists: `GET /api/v1/uploads/:id` → server returns `{status, parts: [{partNumber, etag, size}]}` (server queried R2 `ListParts` or its own `upload_parts` rows). Local `parts` rows are corrected to match (server view wins for uploaded-ness).
 2. If the server session is `completed` (crash happened after complete succeeded but before local delete): the recording is fine — show "already saved" with the watch link, delete local data. **This is the idempotency of completion paying off** (`06` §7).
-3. If `expired`/`aborted` or `uploadSessionId===null` (recorded offline): start a new session (`06` §3) for the same `recordingId` (or create the recording row too if `recordingId===null`), rebuild parts from chunks, upload all.
+3. If `expired`/`aborted` or `uploadSessionId===null` (recorded offline): start a new session (`06` §3) for the same `recordingId` (or create the recording row too if `recordingId===null`), rebuild parts from chunks, upload all. The new session goes through the normal atomic quota reservation — if quota is now exhausted (`storage_limit`/`video_limit`), the recovery card keeps offering **Download / Delete-a-video-and-retry / Upgrade**; the local data is never discarded by a quota verdict.
 4. Auth failure (401) during recovery: keep data, show sign-in prompt; retry after auth (sessions survive, §1).
 
 ### 6.2 Recovery UI

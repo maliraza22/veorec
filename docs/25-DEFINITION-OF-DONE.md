@@ -45,6 +45,16 @@
 - [ ] **Soft deletion** — recordings/users soft-delete → invisible immediately, hard-purged with storage cleanup after 30 days (E2E)
 - [ ] **Migration** — importer idempotent; reconciliation at zero diffs for 7 days before each legacy read cutover; legacy data archived
 
+## Quotas (free plan: 50 active videos AND 5 GB retained storage — whichever first)
+
+- [ ] **Exact limits enforced** — `free.max_active_videos=50`, `free.max_storage_bytes=5_368_709_120`, `free.max_recording_duration_seconds=600`, `free.max_resolution=1080p` (`16` §1.1); either cap independently blocks new recordings
+- [ ] **Atomic reservation** — quota check-and-reserve is one guarded statement; Q1/Q16 concurrency tests green (two tabs can never double-spend the last 300 MB)
+- [ ] **Server-authoritative accounting** — ledger built only from server-observed sizes (storage HEAD, asset rows); client size/count/duration claims verifiably ignored (hostile-client test Q14)
+- [ ] **Ledger categories** — retained / reserved / temporary-processing / pending-deletion distinguished; temp processing files never count toward user storage; derived platform assets never bill the user
+- [ ] **Deletion semantics** — soft-delete frees video count and storage quota immediately (Q15); hard purge drains pending-deletion within the 30-day window
+- [ ] **Reservation lifecycle** — reconciled at complete, released on abort/expiry; server-restart and abandoned-session leaks healed by expiry job (Q6, Q12); nightly usage_sync drift < 1%
+- [ ] **Dual-meter UX** — storage and video meters shown separately with exact block/warning copy (`16` §4.6); recorder pre-flight warns near limit before capture starts; in-progress takes never discarded by a quota verdict
+
 ## Security
 
 - [ ] **CORS** — allowlist only (web origins + extension id); no `origin:'*'` anywhere

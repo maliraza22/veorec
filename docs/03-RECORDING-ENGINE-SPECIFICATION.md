@@ -53,6 +53,13 @@ Notes:
 
 ## 3. States — invariants, entry/exit actions
 
+### 3.0 Quota pre-flight (before `START` is accepted)
+At window load the recorder fetches `GET /me/usage` alongside entitlements (`§8`):
+- **Blocked** (`storage.usedBytes + reserved ≥ limitBytes − upload_reservation_bytes`, or `videos.count ≥ max`): the Start button is replaced by the exact block message from `16` §4.6 (“You've reached your 5 GB free storage limit…” / “You've reached your 50-video free limit…”) with *Manage videos* and *Upgrade* actions. This is UX only — the authoritative gate is the server's atomic reservation at upload-session creation.
+- **Near limit** (storage remaining < 2 × `upload_reservation_bytes`, or ≥ 45/50 videos): show the pre-recording warning banner (`16` §4.6) but allow recording.
+- Usage fetch failure: proceed (do not block recording on a metadata fetch); the server reservation still enforces.
+- If upload-session creation later returns `storage_limit`/`video_limit` (race with another tab/device), the machine treats it like the offline case: recording proceeds with `uploadSession:null` durability-only **if capture already started**, and at finalize the user gets the block message with *Save to device / Delete a video & retry / Upgrade* — a take in progress is never discarded by a quota verdict.
+
 ### 3.1 `idle`
 No streams, no recorder, no timers, no wake lock. Entry: run all disposers; clear `recSession` projection. The recovery check (`05` §6) runs before first entering `idle` on window load: if an unfinished session exists in IndexedDB, the UI offers *Resume upload / Download / Discard* before anything else.
 
@@ -68,7 +75,7 @@ Entry: start countdown timer (N seconds from config; values 3/5/0). Streams are 
 ### 3.4 `recording`
 Entry (in order):
 1. Create IndexedDB session row (`status:'recording'`) — **before** starting the recorder, so a crash 1s in is recoverable.
-2. Create upload session via `POST /api/v1/uploads` (see `06` §3). If the API is unreachable, recording still starts (`uploadSession:null`) — durability comes from IndexedDB; the uploader retries session creation in the background. This is the "record first, network later" rule.
+2. Create upload session via `POST /api/v1/uploads` (see `06` §3) — this is where the server **atomically reserves quota** (storage bytes + video slot, `16` §4.3). If the API is unreachable, recording still starts (`uploadSession:null`) — durability comes from IndexedDB; the uploader retries session creation in the background. This is the "record first, network later" rule. A quota rejection here follows §3.0's in-progress policy (never discards a running take).
 3. Build `MediaRecorder` (§6) and `start(1000)`.
 4. Start wall-clock: `recordingStartedAt = Date.now()`; `pausedTotal = 0`.
 5. Acquire `navigator.wakeLock.request('screen')` if available (release on exit).

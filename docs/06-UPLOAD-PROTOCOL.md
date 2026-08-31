@@ -43,7 +43,8 @@ Rules:
 
 `POST /api/v1/uploads`
 - Auth: required. Body: `{recordingId, mimeType, estimatedBytes?}`. Header: `Idempotency-Key` (client-generated uuid; retried request returns the same session).
-- Validation: recording exists, is owned by caller, `status ∈ {recording, uploading, upload_failed}`; mimeType ∈ allowlist (`video/webm`, `video/mp4`, `video/quicktime`); entitlement pre-checks (`canCreateVideo`, storage projection with `estimatedBytes` if given) — advisory here, authoritative again at complete (§7) and after probe (`09` §2).
+- Validation: recording exists, is owned by caller, `status ∈ {recording, uploading, upload_failed}`; mimeType ∈ allowlist (`video/webm`, `video/mp4`, `video/quicktime`).
+- **Atomic quota reservation (authoritative — `16` §4.3):** in the same transaction that inserts the session, a single guarded UPDATE on the user's `usage` row reserves `plan.upload_reservation_bytes` + 1 video slot, and a `storage_reservations` row is created. Guard failure ⇒ `403 {code:'storage_limit'|'video_limit', upgradeRequired:true, meta}` and **no session is created**. `estimatedBytes` is a hint only — the reservation amount is always server-computed; the client is never trusted for sizes or counts. Two concurrent sessions (two tabs, two devices) serialize on the `usage` row: quota can never be double-spent.
 - Response `201 {uploadSessionId, partSize, minPartSize, maxParts, expiresAt}`.
 - `partSize`: server-chosen, default **8 MiB** (S3 minimum is 5 MiB for all but the last part; 8 MiB ≈ 30–60s of video at recorder bitrates → steady upload cadence). `maxParts` 10,000 (S3 limit) → 80 GB ceiling, far above any plan.
 - `expiresAt`: now + 48h (recording + upload must finish within; recovery after that rebuilds a fresh session, `05` §6.1).
@@ -80,7 +81,7 @@ Server algorithm (single Postgres transaction around steps 3–5):
 2. Validate the manifest: contiguous partNumbers from 1, every part known in `upload_parts` (or verifiable via `ListParts`), sizes ≥ minPartSize except last.
 3. Call S3 `CompleteMultipartUpload` with the etag manifest. If S3 says the upload id is already completed (`NoSuchUpload` but object exists with expected size) → treat as success (crash-between-steps recovery).
 4. `HEAD` the object; record `total_size`. Sanity check: `total_size == Σ part sizes`, else fail with `upload_size_mismatch` (500-class, retryable — do not delete anything).
-5. Update: session `completed`; recording `status='uploaded'`, `size_bytes`; create `video_assets` row (`kind='source'`, immutable); **entitlement enforcement**: `canCreateVideo` + `canUploadVideo(total_size)` re-checked here with the *real* size — on rejection: recording `status='rejected_limit'`, respond `403 {code:'video_limit'|'storage_limit', upgradeRequired:true}`, schedule source deletion after 7 days (grace so an upgrade can rescue it — improves on today's immediate loss).
+5. Update: session `completed`; recording `status='uploaded'`, `size_bytes`; create `video_assets` row (`kind='source'`, immutable, `counts_toward_quota=true`); **reservation reconciliation** (`16` §4.4): `retained += total_size`, `reserved −= reservation`, `reserved_slots −= 1`, `active_video_count += 1`, reservation `reconciled` — all in this same transaction. Guards: `total_size` must be ≤ `reserved_bytes × 1.05` (else `422 upload_manifest_invalid` — a client cannot upload past its reservation), and the plan is re-checked with the real size for the residual downgrade-race case — on rejection: recording `status='rejected_limit'`, reservation released, respond `403 {code:'video_limit'|'storage_limit', upgradeRequired:true}`, schedule source deletion after 7 days (grace so an upgrade can rescue it — user content is never silently deleted).
 6. Enqueue `probe` job (outside the tx, after commit; a transactional-outbox row `processing_jobs(status='queued')` is written inside the tx and a relay enqueues — see `10` §3).
 7. Respond `200 {recordingId, status:'uploaded', watchUrl}`.
 
@@ -88,8 +89,8 @@ Duration policy: `clientDuration` is stored as `client_duration_hint`. `recordin
 
 ## 8. Abort & expiry
 
-- `DELETE /api/v1/uploads/:id` → S3 `AbortMultipartUpload`, session `aborted`. Called on user Discard. Idempotent (aborting an aborted/absent upload → 200).
-- Expiry job (repeatable, hourly): sessions past `expiresAt` and not `completed` → abort in S3, mark `expired`. R2 bucket lifecycle rule additionally aborts incomplete multiparts at 48h as a backstop.
+- `DELETE /api/v1/uploads/:id` → S3 `AbortMultipartUpload`, session `aborted`, **quota reservation released** in the same transaction (`reserved −= reservation`, `reserved_slots −= 1`). Called on user Discard. Idempotent (aborting an aborted/absent upload → 200; release applies at most once via the reservation status).
+- Expiry job (repeatable, hourly): sessions past `expiresAt` and not `completed` → abort in S3, mark `expired`, **release the reservation**. This is also the healing path for abandoned tabs, browser crashes, and server restarts that left reservations held. R2 bucket lifecycle rule additionally aborts incomplete multiparts at 48h as a backstop.
 - An expired session does not doom the recording: local recovery creates a new session (`05` §6.1.3).
 
 ## 9. Checksums
@@ -112,7 +113,7 @@ Then complete as normal. **Missing-part detection is therefore server-authoritat
 
 ## 12. Small-file path (web uploads, editor "add clip")
 
-Files ≤ 32 MiB may use a single presigned `PUT` (`POST /api/v1/uploads` with `mode:'single'` → one URL; complete is the same endpoint with `parts:[]`, server HEADs the object). Same session bookkeeping, same idempotency. The editor's current 500MB memory-multer `replace` path (`index.js:61`, `1023-1086`) is **deleted** — renders happen server-side from source assets (`14`), and user file uploads use this protocol.
+Files ≤ 32 MiB may use a single presigned `PUT` (`POST /api/v1/uploads` with `mode:'single'` → one URL; complete is the same endpoint with `parts:[]`, server HEADs the object). Same session bookkeeping, same idempotency, same atomic quota reservation (reservation = 33,554,432 bytes for single mode). The editor's current 500MB memory-multer `replace` path (`index.js:61`, `1023-1086`) is **deleted** — renders happen server-side from source assets (`14`), and user file uploads use this protocol.
 
 ## 13. API examples
 

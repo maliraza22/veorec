@@ -45,7 +45,7 @@ stateDiagram-v2
 ## 4. Saving semantics
 
 - **Pure virtual save** (single-recording timeline, no renders wanted): PATCH `/recordings/:id/meta {segments|trimStart|trimEnd}` — unchanged instant path. Full-length timeline clears virtual edits (as `Editor.jsx:226-231`).
-- **Render — copy**: new recording row (`source_kind='render'`, status `processing`), render job output registered as its MP4 asset, poster/thumb jobs run on it, usage +bytes/+count/+seconds in the completion tx. Title: `"<base title> (edited)"`.
+- **Render — copy**: new recording row (`source_kind='render'`, status `processing`), render job output registered as its primary asset (`counts_toward_quota=true`). **Quota**: a copy render takes the same atomic reservation as an upload at render enqueue (`16` §4.3, via `storage_reservations.render_job_id`) — 403 `storage_limit`/`video_limit` before any rendering happens; reconciled to the real output size in the completion tx. Title: `"<base title> (edited)"`.
 - **Render — overwrite**: render output becomes the recording's active `mp4` asset (old derived assets kept 7 days then cleaned); virtual edits cleared; `duration/size_bytes` updated from the render's probe; usage delta = new − old active. Transcript/chapters are marked stale (`transcripts.status` unchanged but a `stale=true` flag surfaces "re-transcribe?" in the UI — cheaper and more honest than silently keeping timestamps that no longer align).
 
 ## 5. Render job (FFmpeg — worker; job contract in `10` §3)

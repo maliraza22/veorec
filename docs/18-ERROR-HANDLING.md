@@ -17,7 +17,7 @@
 |---|---|---|
 | 400 | `validation_failed` (with details), `comment_depth`, `bad_request` | fix input |
 | 401 | `unauthenticated`, `login_required`, `invalid_password` (unlock), `session_expired` | re-auth; extension clears token + prompts sign-in |
-| 403 | `feature_locked`, `video_limit`, `storage_limit`, `recording_limit` (all with `upgradeRequired:true` + meta), `link_expired`, `audience_disabled`, `forbidden` | paywall UI / gate UI |
+| 403 | `feature_locked`, `video_limit`, `storage_limit`, `recording_limit` (all with `upgradeRequired:true` + `meta:{usedBytes,limitBytes,videoCount,maxVideos,…}`), `link_expired`, `audience_disabled`, `forbidden` | paywall UI / gate UI. Exact free-plan copy: `storage_limit` → “You've reached your 5 GB free storage limit. Delete a video or upgrade to continue recording.”; `video_limit` → “You've reached your 50-video free limit. Delete a video or upgrade to continue recording.” |
 | 404 | `not_found` | dead end (also used for unauthorized-owner resources — `12` §2) |
 | 409 | `email_taken`, `upload_session_conflict` (body carries the existing session), `render_in_progress`, `folder_name_taken` | adopt/replace |
 | 410 | `upload_session_expired` | client rebuilds session (`05` §6.1.3) |

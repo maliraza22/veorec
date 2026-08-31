@@ -55,6 +55,10 @@ Repo layout target (created incrementally):
 
 **T-305 · Web upload path** — Editor "upload clip" + future web uploads via single-PUT mode (`06` §12). Deps: T-301. Accept: editor upload works; memory-multer path marked deprecated.
 
+**T-306 · Quota ledger & atomic reservation** — New free-plan quota model (`16` §1.1: 50 active videos AND 5 GB retained, whichever first). Ledger columns on `usage` (retained/reserved/pending-deletion/active-count/reserved-slots) + `storage_reservations`; guarded-UPDATE check-and-reserve wired into upload-session creation; reconciliation at complete; release on abort/expiry; soft-delete frees quota; `counts_toward_quota` on assets; dual-meter `/me/usage`; plan catalog updated to the `16` §1.1 integers; grandfathering flag for over-quota legacy users (`23` Phase 3). Deps: T-301, T-302. Tests: Q1–Q16 (`20` §7.1). Accept: Q-suite green incl. 50-parallel-session race; ledger drift 0 after usage_sync on seeded data.
+
+**T-307 · Quota UX** — Dual meters (“Storage 4.2 GB / 5 GB”, “Videos 38 / 50”) in dashboard/billing; recorder quota pre-flight block + near-limit warning (`03` §3.0); exact block messages from `16` §4.6; recovery-card quota-blocked options (`05` §6.1.3). Deps: T-306, T-403. Tests: Playwright meter rendering + blocked/warning states. Accept: no single blended percentage anywhere; copy matches spec exactly.
+
 ## Phase 4 — Local recovery
 
 **T-401 · RecorderStore (IndexedDB)** — sessions/chunks/parts stores + quota checks + persist() request (`05` §2–5). Tests: fake-indexeddb unit suite incl. ordering + prune. Accept: suite green.
@@ -117,7 +121,7 @@ Repo layout target (created incrementally):
 
 ## Ordering summary (critical path)
 
-T-101→T-106 → T-201→T-204 → T-301→T-305 → T-401→T-403 → T-501→T-503 → T-601→T-603 → T-701→T-706 → T-801→T-803 → then 9–13 in any order → 14.
+T-101→T-106 → T-201→T-204 → T-301→T-306 → T-401→T-403 (→ T-307) → T-501→T-503 → T-601→T-603 → T-701→T-706 → T-801→T-803 → then 9–13 in any order → 14.
 
 ## Definition of done per task
 

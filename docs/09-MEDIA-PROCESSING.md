@@ -92,7 +92,7 @@ Render jobs (trim/splice/silence-cut) are specified in `14` §5 — they run in 
 ## 9. Worker architecture & resource rules
 
 - Concurrency per worker process: transcode/hls/render = 1 (CPU-bound; scale by adding worker replicas); probe/thumbnail/audio = 4; transcribe = 1 with Groq rate-limit group (`10` §6).
-- Scratch space: `/scratch/{jobId}/` — created at start, **always removed in `finally`**; startup sweep deletes orphans older than 24h. Disk guard: refuse jobs when free scratch < 2× source size (job → delayed retry).
+- Scratch space: `/scratch/{jobId}/` — created at start, **always removed in `finally`**; startup sweep deletes orphans older than 24h. Disk guard: refuse jobs when free scratch < 2× source size (job → delayed retry). **Quota rule:** scratch files and any not-yet-promoted outputs are temporary processing storage — they never touch the user's quota ledger (`16` §4.1); only `ready` assets with `counts_toward_quota=true` (the recording's primary media) count, and platform-derived assets (MP4/HLS/posters/captions) are always `counts_toward_quota=false`.
 - Timeouts: probe 5min; transcode/hls/render `max(10min, 3× duration)`; thumbnail 3min. On timeout the process tree is killed (`SIGKILL` after `SIGTERM` grace) — no zombie ffmpeg.
 - Idempotency: outputs are written to asset-id-scoped keys; re-running a job overwrites its own outputs and re-upserts the same asset row (dedupe key prevents concurrent doubles; a retried job after partial upload simply re-uploads).
 - Cost/priority: `priorityProcessingEnabled` (Pro) → higher BullMQ priority, not separate infrastructure.

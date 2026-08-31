@@ -29,6 +29,8 @@ Constraints that shape sequencing: the extension fleet updates slowly (Chrome re
 - **Files:** API upload routes (`08` §5); extension: `uploader.ts` in the recorder (can ship **before** the state machine — it hooks `dataavailable` alongside the existing chunks array); web editor "upload clip" switched.
 - **Compat:** legacy `POST /api/upload` remains for old extension versions, now writing recordings rows + R2 via the server path; removed in Phase 14 after fleet telemetry shows < 1% legacy uploads.
 - **Cutover:** extension release N+1 uses the new protocol behind a remote-config flag; flag flipped gradually.
+- **New free-plan quotas activate with this phase** (50 active videos / 5 GB retained — `16` §1.1), because the atomic reservation mechanism ships with upload-session creation. Includes the quota ledger columns + `storage_reservations` (schema already in Phase 1) and the dual-meter `/me/usage`.
+- **Grandfathering policy (existing free users vs the new limits):** 30→50 videos is a strict increase — no one is harmed. 20 GB→5 GB is a decrease: users already **over 5 GB are never trimmed and nothing is deleted** — they are marked over-quota, blocked from creating new recordings (standard `storage_limit` message + banner) until they delete videos or upgrade. Announce with ≥14 days notice in-app before enforcement flips on. The importer computes each user's retained bytes during backfill so day-one ledgers are accurate.
 - **Risks:** the riskiest phase (client+server+storage). Mitigations: R13/R15 tests green pre-release; per-part telemetry; instant flag rollback to legacy path.
 - **Acceptance:** upload success ≥ 99% on new path over 2 weeks; server video-byte throughput → ~0 for flagged clients; resume verified in production (forced-kill canary).
 

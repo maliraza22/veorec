@@ -49,6 +49,27 @@ Migration up/down on empty + seeded DBs; JSON/Cloudinary importer idempotency (r
 
 Part upload/re-upload idempotency; presign expiry re-mint; abort; expiry job aborts multipart; single-file mode; complete with storage-side ListParts disagreement (server adopts storage view); checksum mismatch rejected by storage → uploader retries.
 
+### 7.1 Quota & concurrency tests (release gate for the quota model, `16` §4)
+
+| # | Scenario | Expected |
+|---|---|---|
+| Q1 | Two simultaneous upload-session creations, one reservation of quota left | exactly one succeeds; the other gets 403 `storage_limit` with correct meta; `usage` row never over-reserved (assert with 50 parallel attempts too) |
+| Q2 | Multiple browser tabs recording concurrently (within quota) | independent sessions, independent reservations; ledger sums correctly |
+| Q3 | Two simultaneous recordings by the same user near the 50-video cap (49 active) | one slot reserved, second gets `video_limit` |
+| Q4 | Retrying session creation with the same Idempotency-Key | same session returned, reservation taken **once** |
+| Q5 | Duplicate upload completion (double POST complete) | canonical replay; retained bytes and video count incremented exactly once |
+| Q6 | Abandoned upload (no parts, tab closed) | expiry job releases reservation + slot; quota back to pre-session values |
+| Q7 | Failed upload (abort mid-parts) | reservation released once; re-abort idempotent |
+| Q8 | Partial upload then resume then complete | reconciliation uses the real HEAD size, not part-sum drift or client claims |
+| Q9 | User deletes a video while another upload is in flight | both txs serialize on the usage row; final ledger = −deleted +uploaded; no deadlock, no negative counters (CHECK constraints) |
+| Q10 | Processing failure after complete (probe_invalid) | retained bytes stay (source exists) until the recording is deleted/purged; status failed doesn't corrupt ledger; reprocess doesn't double-count |
+| Q11 | Storage reconciliation (`usage_sync`) after injected drift | re-derived values match asset aggregates; drift logged |
+| Q12 | Server restart between reservation and first part | reservation row survives; recovery resumes or expiry releases — never leaks |
+| Q13 | Worker failure during processing (kill mid-transcode) | retry converges; `counts_toward_quota` assets counted once |
+| Q14 | Upload exceeding its reservation (hostile client, manifest > reserved ×1.05) | 422 `upload_manifest_invalid`; no ledger change |
+| Q15 | Soft-delete → quota freed immediately; hard purge after 30 d → pending_deletion drained | dual-meter endpoint reflects each step |
+| Q16 | Free user at 4.7/5 GB, reservation 330 MB, two tabs | matches the spec example: first reserves, second blocked; no state where both proceed |
+
 ## 8. Processing/worker tests
 
 Fixture library: 5s webm (vp9/opus), webm w/o duration header, video-only webm, corrupt file, 0-byte, mp4 upload, 1080p+ file, mixed-language audio sample. Assert: probe facts; transcode output probes valid (+faststart present via `ffprobe -show_format`); thumbnail non-black; hls playlist integrity; render concat duration ±2%; **idempotency**: run each job twice, assert single asset row set and identical state; **crash**: kill worker mid-transcode, re-run, converges.

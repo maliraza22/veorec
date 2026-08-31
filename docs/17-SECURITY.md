@@ -34,6 +34,7 @@ Auth endpoints, unlock, comments/reactions, views/progress, contact, upload-sess
 
 - Presigned PUT URLs: 1h TTL, bound to exact key + part number + content checksum (`x-amz-checksum-crc32c`); sessions owned per user; part size/count caps (10k parts, plan-derived total size ceiling at complete).
 - MIME allowlist at session creation; **authoritative validation is FFprobe** (`09` §2) — content sniffing beats extension/mime trust; probe failure quarantines the object (`failed`, never served).
+- **Server-authoritative quotas:** storage usage and active-video counts are computed exclusively from server-side facts (ledger + asset rows, `16` §4); client-reported sizes/durations/counts are hints only. Quota check-and-reserve is a single atomic statement on the user's `usage` row, so concurrent sessions cannot double-spend quota; uploads are hard-capped at their reservation at complete (a hostile client cannot upload past its reserved bytes).
 - The API's only multipart surface is the ≤5MB thumbnail upload (image type sniffed, re-encoded via sharp to strip metadata/polyglots).
 - No SSRF surface: the API never fetches user-supplied URLs except the Slack webhook (strict `https://hooks.slack.com/services/` prefix check, kept from `index.js:156`) and Paddle/Groq/Brevo (fixed hosts).
 

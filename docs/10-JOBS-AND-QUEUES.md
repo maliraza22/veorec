@@ -64,13 +64,13 @@ For each: **input** (payload), **output**, **retry**, **timeout**, **idempotency
 - Retry 2× / max(15m, 4×output duration). Fail: `render_jobs.failed` + editor error toast; sources untouched (invariant #13 makes render failure always recoverable).
 
 ### `maintenance.upload_expiry` (repeat hourly)
-Abort S3 multiparts + mark sessions expired past `expires_at` (`06` §8).
+Abort S3 multiparts + mark sessions expired past `expires_at` (`06` §8), **releasing each session's quota reservation** (`16` §4.4) — the healing path for abandoned tabs, crashes, and server restarts that left reservations held.
 
 ### `maintenance.cleanup` (repeat daily)
 Hard-purge soft-deleted recordings >30d (R2 objects then rows); purge `rejected_limit` >7d; purge expired auth sessions; orphan report weekly (`09` §10).
 
 ### `maintenance.usage_sync` (repeat daily)
-Re-derive `usage` per user from Postgres aggregates; log drift > 1% (replaces `cron.dailyUsageSync`).
+Re-derive the quota ledger per user from Postgres aggregates — `storage_retained_bytes` from `counts_toward_quota` assets, `active_video_count` from recording statuses, `storage_pending_deletion_bytes` from soft-deleted rows — expire orphaned `storage_reservations`, and log drift > 1% (replaces `cron.dailyUsageSync`).
 
 ### `maintenance.subscription_sync` (repeat daily)
 Reconcile each subscription with Paddle via `billing.service.syncSubscription` (replaces `cron.dailySubscriptionSync`). Also `maintenance.storage_verification` — flag over-limit accounts (as `cron.js:45-56`).

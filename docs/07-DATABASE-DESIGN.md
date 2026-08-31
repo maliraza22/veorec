@@ -86,6 +86,7 @@ Indexes: `(user_id, created_at desc) where deleted_at is null`, `(user_id, folde
 | codec_video, codec_audio, container | text NULL | |
 | variant | text NULL | e.g. '1080p','720p', hls rendition tag |
 | immutable | boolean NOT NULL default false | true for kind='source'; app refuses updates/overwrites |
+| counts_toward_quota | boolean NOT NULL default false | true for the recording's **primary media** (kind='source'; kind='render_output' when it is a rendered recording's primary). Derived transcodes/HLS/posters/captions stay false — platform overhead never bills the user (`16` §4.1) |
 | created_by_job_id | FK→processing_jobs NULL | provenance |
 Unique partial: one `ready` asset per (recording_id, kind, variant). Index `(recording_id, kind)`.
 
@@ -173,9 +174,24 @@ Same semantics as `subscriptions.js` (entitled statuses: active/trialing/past_du
 | id bigserial PK | paddle_event_id text UNIQUE NOT NULL | event_type text NOT NULL | user_id FK NULL | payload jsonb NOT NULL | status CHECK ('received','processed','failed','skipped') | error text | processed_at |
 Webhook flow: insert (`ON CONFLICT DO NOTHING` — duplicate ⇒ 200 skip) → process in a tx → mark processed; processing failure ⇒ status 'failed' + HTTP 500 so Paddle retries.
 
-### `usage`
-| user_id PK FK CASCADE | storage_used_bytes bigint NOT NULL default 0 | video_count int NOT NULL default 0 | recording_seconds bigint NOT NULL default 0 | monthly_uploads int NOT NULL default 0 | monthly_period text (YYYY-MM) | last_recalculated_at |
-Updated in the same tx as the causing event (upload complete, delete, render-copy); nightly `usage_sync` job re-derives from `recordings`/`video_assets` (keeps the good heal-drift idea from `usage.service.js`, now against Postgres — a plain aggregate query).
+### `usage` — the per-user quota ledger row (one row per user; acts as the quota lock)
+| column | type | notes |
+|---|---|---|
+| user_id | PK FK CASCADE | |
+| storage_retained_bytes | bigint NOT NULL default 0 CHECK (≥0) | sum of quota-counting `ready` assets on active recordings (`16` §4.1) |
+| storage_reserved_bytes | bigint NOT NULL default 0 CHECK (≥0) | sum of open reservations |
+| storage_pending_deletion_bytes | bigint NOT NULL default 0 CHECK (≥0) | informational: soft-deleted bytes awaiting purge (not counted against quota) |
+| active_video_count | int NOT NULL default 0 CHECK (≥0) | recordings with status ∈ (recording,uploading,uploaded,processing,ready) and deleted_at NULL |
+| reserved_video_slots | int NOT NULL default 0 CHECK (≥0) | slots held by open upload sessions / pending renders |
+| recording_seconds | bigint NOT NULL default 0 | |
+| monthly_uploads int, monthly_period text (YYYY-MM) | | rolling window as today |
+| last_recalculated_at | timestamptz | |
+
+Quota enforcement is a **single guarded UPDATE** on this row (check + reserve atomically — full SQL in `16` §4.3); all quota mutations happen in the same transaction as their causing event. Nightly `usage_sync` re-derives retained/count/pending from `recordings`/`video_assets` aggregates and logs drift (keeps the good heal-drift idea from `usage.service.js`, now against Postgres — a plain aggregate query).
+
+### `storage_reservations`
+| id `rsv_` PK | user_id FK CASCADE | upload_session_id FK→upload_sessions NULL UNIQUE | render_job_id FK→render_jobs NULL | reserved_bytes bigint NOT NULL | reserved_slots int NOT NULL default 1 | status CHECK ('held','reconciled','released','expired') NOT NULL | expires_at timestamptz NOT NULL | reconciled_bytes bigint NULL (actual size applied at completion) |
+Index `(status, expires_at)` for the expiry sweep; exactly one open reservation per upload session. Lifecycle table in `16` §4.4 — created with the session, reconciled at complete (reserved→retained with the real size), released on abort/expiry.
 
 ### `plan_overrides`
 | plan_slug text PK | overrides jsonb NOT NULL | updated_by FK→users | updated_at |
@@ -198,7 +214,7 @@ Written for every admin mutation and every destructive user action.
 | Entity deleted | Effect |
 |---|---|
 | user (soft) | sessions revoked; recordings soft-deleted; subscription kept (billing history); hard-purge job after 30 days cascades everything + storage objects |
-| recording (soft) | hidden everywhere immediately; hard delete after 30 days: assets rows cascade → cleanup job deletes R2 objects (storage deletion is driven by `video_assets` rows collected *before* row deletion), usage decremented in the same tx as soft-delete using stored size/duration (no more search-then-guess as in `index.js:563-576`) |
+| recording (soft) | hidden everywhere immediately; **quota released at deletion confirmation**: in the soft-delete tx, `active_video_count −1` and `storage_retained_bytes −quota_bytes`, with those bytes moved to `storage_pending_deletion_bytes`; hard delete after 30 days: cleanup job deletes R2 objects (keys collected from `video_assets` rows *before* row deletion) and decrements `pending_deletion` (no more search-then-guess as in `index.js:563-576`) |
 | folder | recordings.folder_id → NULL |
 | transcript regenerate | old transcript row replaced in one tx (delete + insert) |
 | upload session abort | parts cascade; S3 abort |
@@ -211,6 +227,8 @@ erDiagram
     users ||--o{ recordings : owns
     users ||--o| subscriptions : has
     users ||--o| usage : has
+    users ||--o{ storage_reservations : reserves
+    upload_sessions ||--o| storage_reservations : "holds quota via"
     users ||--o{ folders : owns
     users ||--o{ workspace_members : joins
     workspaces ||--o{ workspace_members : has

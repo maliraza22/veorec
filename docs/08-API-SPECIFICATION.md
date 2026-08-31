@@ -46,7 +46,7 @@ Error (every non-2xx):
 
 | Method & path | Auth | Request → Response | Errors / idempotency / side effects |
 |---|---|---|---|
-| POST `/recordings` | ⚿ | `{title?, source:'extension'|'web_upload', clientMeta?}` → `201 {id,status:'recording'}` | Idempotency-Key supported. Side effect: row only. Entitlement `canCreateVideo` **advisory** here, authoritative at upload complete |
+| POST `/recordings` | ⚿ | `{title?, source:'extension'|'web_upload', clientMeta?}` → `201 {id,status:'recording'}` | Idempotency-Key supported. Side effect: row only. Entitlement `canCreateVideo` **advisory** here; authoritative enforcement is the atomic reservation at upload-session creation (`16` §4.3) |
 | GET `/recordings` | ⚿ | `?folder=&archived=&q=&cursor=` → `{items:[RecordingSummary], nextCursor}` | one indexed query; kills the Cloudinary dual-fetch |
 | GET `/recordings/:id` | ⚿ owner | → `RecordingDetail` (incl. assets summary, status, capability flags `canTranscribe/canStitch`) | 404 if not owner |
 | PATCH `/recordings/:id` | ⚿ owner | `{title}` → `{title}` | title 1–200 after trim |
@@ -61,12 +61,12 @@ Error (every non-2xx):
 
 | Method & path | Auth | Notes |
 |---|---|---|
-| POST `/uploads` | ⚿ | create session; Idempotency-Key; 409 `upload_session_conflict` if another active session for the recording (returns it) |
+| POST `/uploads` | ⚿ | create session; Idempotency-Key; **atomic quota reservation** (`16` §4.3) — 403 `storage_limit`/`video_limit` (+`upgradeRequired`, `meta`) when either free-plan cap (5 GB storage / 50 active videos) blocks; 409 `upload_session_conflict` if another active session for the recording (returns it, no double reservation) |
 | GET `/uploads/:id` | ⚿ owner | status + parts (server⊕storage reconciled) — the resume source of truth |
 | POST `/uploads/:id/parts` | ⚿ owner | `{partNumbers:[≤20]}` → presigned URLs; repeatable |
 | PUT `/uploads/:id/parts/:n` | ⚿ owner | `{etag,size,crc32c}` → upsert; naturally idempotent |
 | POST `/uploads/:id/complete` | ⚿ owner | idempotent (completed → replay canonical result); tx per `06` §7; enqueues probe |
-| DELETE `/uploads/:id` | ⚿ owner | abort; idempotent |
+| DELETE `/uploads/:id` | ⚿ owner | abort; idempotent; releases the quota reservation exactly once |
 
 ## 6. Processing & assets
 
@@ -146,7 +146,7 @@ Clients poll `GET /recordings/:id/status` (or the transcript endpoint) — repla
 |---|---|---|
 | GET `/plans` | – | public catalog (`plans.listPublicPlans`) |
 | GET `/me/entitlements` | ⚿ | entitlement summary (extension recorder reads this) |
-| GET `/me/usage` | ⚿ | usage vs limits |
+| GET `/me/usage` | ⚿ | **dual quota meters** — `{storage:{usedBytes,reservedBytes,limitBytes}, videos:{count,max}, recordingLimitSeconds, maxResolution}` (exact shape `16` §4.5). The UI renders storage and video count as two separate meters, never one blended percentage |
 | GET `/billing/config` | – | Paddle bootstrap (as today) |
 | POST `/billing/checkout` | ⚿ | `{billingCycle}` → checkout config w/ customData {userId,planSlug,billingCycle} |
 | GET `/billing/subscription` | ⚿ | local + remote view |
