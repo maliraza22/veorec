@@ -61,6 +61,39 @@
 - **Security verification:** `extension.pem` and all `.crx` files were **never committed** — `git log --all -- "*.pem"` / `-- "*.crx"` return empty. The signing key has not leaked via git; no rotation forced (docs `17` §9 corrected accordingly).
 - T-001 work is on branch `migration/t-001-baseline`.
 
-## Baseline KPIs
+## Baseline KPIs (instrumented by T-003 — `server/kpi.js`)
 
-Runtime KPIs (upload success rate, watch 404-retries) require production log instrumentation and are deferred to **T-002/T-003** as planned — nothing is instrumented at baseline beyond `console.log`.
+### What is captured and how
+
+All KPI data is **log-derived**: structured pino events (T-002 foundation) correlated by `request_id`, plus a periodic in-memory aggregate. No new endpoints, no behavior change, no personal data (only outcome classes, byte sizes, durations, recording ids).
+
+| Event (`kpi` field) | Emitted where | Fields | Meaning |
+|---|---|---|---|
+| `upload_started` | both `/api/upload` handler entries | `store: local\|cloudinary`, `sizeBytes` | one upload attempt |
+| `upload_finished` | every handler exit path + error middleware | `outcome: success\|rejected_limit\|error`, `code` (`recording_limit`/`video_limit`/`storage_limit`/`file_too_large`/`cloudinary_error`/`unhandled`), `sizeBytes`, `durationMs`, `store` | attempt resolution |
+| `watch_404_retry` | `GET /api/watch/:id` on a repeat 404 of the same id | `recordingId`, `attempt`, `sinceFirstMs` | the client's 6×1.5s retry loop hitting Cloudinary index lag |
+| `watch_recovered_after_404` | watch hit ≤ 5 min after misses of that id | `recordingId`, `retries`, `waitedMs` | **how long index lag lasted** — the metric migration should drive to ~0 |
+| `kpi_snapshot` | every 15 min (in-process timer) | `counters{…}`, `upload{successRatePct, acceptRatePct, inFlightOrLost, durationMsP50/P95, durationSamples}`, `uptimeSec` | rolling aggregate since boot |
+
+### How the KPIs are calculated
+
+- **Upload attempts** = count of `upload_started` (+ implied attempts for multer-level failures that never reach the handler).
+- **Upload success rate (reliability)** = `success / (success + error)` — plan/policy rejections (`rejected_limit`) are excluded from reliability but reported separately as **accept rate** = `success / (success + error + rejected_limit)`.
+- **Upload duration**: `durationMs` on `upload_finished` covers handler entry → response (i.e. the server→Cloudinary phase; multer has already received the client body). **Total** request duration including client transfer = `responseTime` on the T-002 completion line for `req.url="/api/upload"`. Use both when comparing against the migrated direct-to-R2 path.
+- **Watch 404/lag**: per-event lines above; totals also derivable from completion lines (`/api/watch/<id>` + status). `inFlightOrLost` in snapshots (started − finished) signals hung/crashed uploads.
+
+### How to compare after migration
+
+For each production day, aggregate from logs: attempts, successRatePct, acceptRatePct, p50/p95 durations (both handler-scoped and responseTime), count of `watch_404_retry` and `watch_recovered_after_404` (+ median `waitedMs`), `unhandledError`. The migrated pipeline (Phases 3–8) must beat: success rate (target ≥ 99%), time-to-playable (legacy proxy: upload responseTime + observed index lag `waitedMs`), and drive `watch_404_retry` to ~0 (Postgres reads have no index lag). Record 7 days of pre-cutover numbers in the table below before Phase 3 ships.
+
+| Day | Attempts | Success % | Accept % | p50/p95 ms (handler) | 404-retries | Recovered (median waitedMs) | Unhandled |
+|---|---|---|---|---|---|---|---|
+| *(fill from production logs)* | | | | | | | |
+
+### Limitations of the legacy baseline
+
+1. Counters/snapshots are in-memory — reset on every deploy/restart (per-event lines are the durable record; snapshots are conveniences).
+2. `durationMs` excludes the client→server transfer (use `responseTime` for totals); neither captures the client-side blob-assembly time before the request starts.
+3. Watch "hit/miss" is server-side only — a viewer who gave up before a retry isn't distinguishable from one who succeeded later on another id.
+4. Local-mode (`store:'local'`) numbers from dev machines must be filtered out (`store` field) when computing the production baseline.
+5. No persistence/dashboarding — analysis is grep/jq over Railway logs until the migration's metrics stack (docs/19) exists.

@@ -17,7 +17,7 @@ Rule: any log line about a recording/upload/job includes its id as a structured 
 
 ## 2. Structured logging (pino)
 
-> Implemented for the legacy server in **T-002** (`server/log.js`): request-id middleware + per-request completion lines + optional Sentry. Config env: `LOG_LEVEL` (default info in prod, debug in dev), `LOG_PRETTY=false` to force JSON in dev, `SENTRY_DSN` / `SENTRY_ENVIRONMENT` / `SENTRY_RELEASE` (all optional — absent DSN disables Sentry cleanly). Legacy `console.*` calls inside route handlers remain until their subsystems migrate.
+> Implemented for the legacy server in **T-002** (`server/log.js`): request-id middleware + per-request completion lines + optional Sentry. Config env: `LOG_LEVEL` (default info in prod, debug in dev), `LOG_PRETTY=false` to force JSON in dev, `SENTRY_DSN` / `SENTRY_ENVIRONMENT` / `SENTRY_RELEASE` (all optional — absent DSN disables Sentry cleanly). Legacy `console.*` calls inside route handlers remain until their subsystems migrate. **T-003** added log-derived baseline KPI events on top (`server/kpi.js`: `upload_started/finished`, `watch_404_retry`, `watch_recovered_after_404`, `kpi_snapshot`) — schema and analysis rules in `docs/BASELINE.md`.
 
 - JSON lines; fields: `ts, level, msg, service (api|worker|web|ext), env, request_id?, user_id?, recording_id?, upload_id?, job_id?, code?, duration_ms?`.
 - Redaction paths enforced (`17` §10): authorization headers, tokens, presigned query strings, emails outside owner scope, raw IPs.

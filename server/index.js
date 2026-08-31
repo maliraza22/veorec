@@ -2,6 +2,8 @@
 // change any behavior — see server/log.js header for the guarantees.
 const { logger, httpLogger, initSentry, captureException } = require('./log');
 initSentry();
+// Baseline KPI capture (T-003) — counters + structured events, no behavior change.
+const kpi = require('./kpi').initKpi(logger);
 
 const express = require('express');
 const cors = require('cors');
@@ -284,18 +286,21 @@ if (!USE_CLOUDINARY) {
     const user = users.findById(req.userId);
     const durationSec = parseInt(duration) || 0;
     const sizeBytes = req.file.size || 0;
+    kpi.uploadStarted(req, { store: 'local', sizeBytes });
 
     // Server-side enforcement (mirrors the Cloudinary branch).
     const recCheck = permissions.canRecord(user, durationSec);
     if (!recCheck.allowed) {
       if (req.file?.path && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
       conversion.track({ userId: user.id, userPlan: recCheck.meta?.plan, featureRequested: conversion.TRIGGERS.RECORDING_LIMIT, meta: recCheck.meta });
+      kpi.uploadFinished(req, 'rejected_limit', { code: 'recording_limit', sizeBytes });
       return res.status(403).json({ error: recCheck.reason, upgradeRequired: true, code: 'recording_limit', meta: recCheck.meta });
     }
     const storeCheck = permissions.canUploadVideo(user, sizeBytes);
     if (!storeCheck.allowed) {
       if (req.file?.path && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
       conversion.track({ userId: user.id, userPlan: storeCheck.meta?.plan, featureRequested: conversion.TRIGGERS.STORAGE_FULL, meta: storeCheck.meta });
+      kpi.uploadFinished(req, 'rejected_limit', { code: 'storage_limit', sizeBytes });
       return res.status(403).json({ error: storeCheck.reason, upgradeRequired: true, code: 'storage_limit', meta: storeCheck.meta });
     }
 
@@ -304,6 +309,7 @@ if (!USE_CLOUDINARY) {
       duration: durationSec, created_at: Date.now() });
     usageService.updateUsage(req.userId, { bytes: sizeBytes, videos: 1, seconds: durationSec, upload: true });
     const base = process.env.PUBLIC_URL || `http://localhost:${PORT}`;
+    kpi.uploadFinished(req, 'success', { sizeBytes });
     res.json({ id, url: `${base}/watch/${id}` });
   });
 
@@ -395,6 +401,7 @@ if (!USE_CLOUDINARY) {
       const user = users.findById(req.userId);
       const durationSec = parseInt(duration) || 0;
       const sizeBytes = req.file?.size || 0;
+      kpi.uploadStarted(req, { store: 'cloudinary', sizeBytes });
 
       // ── SERVER-SIDE ENFORCEMENT (never trust the client) ───────────────────
       // 1) Recording length limit.
@@ -402,6 +409,7 @@ if (!USE_CLOUDINARY) {
       if (!recCheck.allowed) {
         conversion.track({ userId: user.id, userPlan: recCheck.meta?.plan,
           featureRequested: conversion.TRIGGERS.RECORDING_LIMIT, meta: recCheck.meta });
+        kpi.uploadFinished(req, 'rejected_limit', { code: 'recording_limit', sizeBytes });
         return res.status(403).json({ error: recCheck.reason, upgradeRequired: true, code: 'recording_limit', meta: recCheck.meta });
       }
       // 2) Video-count limit (primary free-plan limiter — 30 videos).
@@ -409,6 +417,7 @@ if (!USE_CLOUDINARY) {
       if (!countCheck.allowed) {
         conversion.track({ userId: user.id, userPlan: countCheck.meta?.plan,
           featureRequested: conversion.TRIGGERS.STORAGE_FULL, meta: countCheck.meta });
+        kpi.uploadFinished(req, 'rejected_limit', { code: 'video_limit', sizeBytes });
         return res.status(403).json({ error: countCheck.reason, upgradeRequired: true, code: 'video_limit', meta: countCheck.meta });
       }
       // 3) Storage size (generous safety cap).
@@ -416,6 +425,7 @@ if (!USE_CLOUDINARY) {
       if (!storeCheck.allowed) {
         conversion.track({ userId: user.id, userPlan: storeCheck.meta?.plan,
           featureRequested: conversion.TRIGGERS.STORAGE_FULL, meta: storeCheck.meta });
+        kpi.uploadFinished(req, 'rejected_limit', { code: 'storage_limit', sizeBytes });
         return res.status(403).json({ error: storeCheck.reason, upgradeRequired: true, code: 'storage_limit', meta: storeCheck.meta });
       }
 
@@ -444,6 +454,7 @@ if (!USE_CLOUDINARY) {
 
       const base = process.env.PUBLIC_URL || `https://${req.get('host')}`;
       const clientBase = process.env.CLIENT_URL || base;
+      kpi.uploadFinished(req, 'success', { sizeBytes: result.bytes || sizeBytes });
       res.json({ id, url: `${clientBase}/watch/${id}` });
 
       // Fire-and-forget: transcribe + auto-name the video so it lands in the
@@ -459,6 +470,7 @@ if (!USE_CLOUDINARY) {
       // offer its local "save to your device" fallback, so a take is never lost.
       const msg = String((e && e.message) || e || 'Upload failed');
       const tooBig = /too large|maximum.*size|file size|413/i.test(msg);
+      kpi.uploadFinished(req, 'error', { code: tooBig ? 'file_too_large' : 'cloudinary_error' });
       res.status(tooBig ? 413 : 500).json({
         error: tooBig
           ? 'This recording is too large to upload on your current plan — it’s still on your device. Use “Save recording to your device” below.'
@@ -662,7 +674,8 @@ function viewerFromAuth(req) {
 app.get('/api/watch/:id', async (req, res) => {
   try {
     const video = await findVideo(req.params.id);
-    if (!video) return res.status(404).json({ error: 'Not found' });
+    if (!video) { kpi.watchMiss(req, req.params.id); return res.status(404).json({ error: 'Not found' }); }
+    kpi.watchHit(req, req.params.id);
     const m = meta.get(req.params.id);
 
     if (m.privacy === 'login' && !viewerFromAuth(req)) {
@@ -673,6 +686,7 @@ app.get('/api/watch/:id', async (req, res) => {
     }
     res.json({ ...video, title: m.title || video.title, description: m.description, cta: m.cta, privacy: m.privacy, trimStart: m.trimStart, trimEnd: m.trimEnd, segments: m.segments, tags: m.tags, audience: m.audience, recommendedSpeed: m.recommendedSpeed, animatedThumbnail: m.animatedThumbnail, archived: !!m.archived, chapters: m.chapters || [], folder: m.folder });
   } catch {
+    kpi.watchMiss(req, req.params.id);
     res.status(404).json({ error: 'Not found' });
   }
 });
@@ -1990,6 +2004,7 @@ if (fs.existsSync(clientDist)) {
 // to the same JSON the extension understands, so it offers the local-save
 // fallback and a recording is never silently lost.
 app.use((err, req, res, next) => {
+  if (err) kpi.requestError(req, err);   // KPI classification only — responses unchanged
   if (err && err.code === 'LIMIT_FILE_SIZE') {
     // Expected client condition — log as warn, never to Sentry.
     (req.log || logger).warn({ err: { message: err.message, code: err.code } }, 'upload rejected: file too large');
