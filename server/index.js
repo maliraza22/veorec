@@ -1,3 +1,8 @@
+// Observability first (T-002): structured logging + optional Sentry. Must not
+// change any behavior — see server/log.js header for the guarantees.
+const { logger, httpLogger, initSentry, captureException } = require('./log');
+initSentry();
+
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
@@ -47,6 +52,9 @@ if (USE_CLOUDINARY) {
 // ── Middleware ────────────────────────────────────────────────────────────────
 // Behind Railway's proxy — trust it so req.ip / X-Forwarded-For is the real client.
 app.set('trust proxy', 1);
+// Request id + one structured completion line per request (adds the
+// X-Request-Id response header; no other externally visible change).
+app.use(httpLogger);
 app.use(cors({ origin: '*' }));
 // Capture the raw body so we can verify Paddle webhook signatures.
 app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
@@ -1983,10 +1991,21 @@ if (fs.existsSync(clientDist)) {
 // fallback and a recording is never silently lost.
 app.use((err, req, res, next) => {
   if (err && err.code === 'LIMIT_FILE_SIZE') {
+    // Expected client condition — log as warn, never to Sentry.
+    (req.log || logger).warn({ err: { message: err.message, code: err.code } }, 'upload rejected: file too large');
     return res.status(413).json({ error: 'This recording is too large to upload — it’s still on your device. Use “Save recording to your device” below.', saveLocally: true });
   }
-  if (err) { console.error('[unhandled]', err.message || err); return res.status(500).json({ error: 'Server error' }); }
+  if (err) {
+    // Response is unchanged (500 "Server error") — this only adds capture.
+    (req.log || logger).error({ err }, 'unhandled request error');
+    captureException(err, {
+      requestId: req.id,
+      route: String(req.originalUrl || req.url || '').split('?')[0],
+      method: req.method,
+    });
+    return res.status(500).json({ error: 'Server error' });
+  }
   next();
 });
 
-app.listen(PORT, () => console.log(`Server :${PORT} | Cloudinary: ${USE_CLOUDINARY}`));
+app.listen(PORT, () => logger.info({ port: Number(PORT), cloudinary: USE_CLOUDINARY }, `Server :${PORT} | Cloudinary: ${USE_CLOUDINARY}`));

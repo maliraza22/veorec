@@ -17,6 +17,8 @@ Rule: any log line about a recording/upload/job includes its id as a structured 
 
 ## 2. Structured logging (pino)
 
+> Implemented for the legacy server in **T-002** (`server/log.js`): request-id middleware + per-request completion lines + optional Sentry. Config env: `LOG_LEVEL` (default info in prod, debug in dev), `LOG_PRETTY=false` to force JSON in dev, `SENTRY_DSN` / `SENTRY_ENVIRONMENT` / `SENTRY_RELEASE` (all optional — absent DSN disables Sentry cleanly). Legacy `console.*` calls inside route handlers remain until their subsystems migrate.
+
 - JSON lines; fields: `ts, level, msg, service (api|worker|web|ext), env, request_id?, user_id?, recording_id?, upload_id?, job_id?, code?, duration_ms?`.
 - Redaction paths enforced (`17` §10): authorization headers, tokens, presigned query strings, emails outside owner scope, raw IPs.
 - Levels: `error` = actionable defect; `warn` = degraded/fallback taken (e.g. whisper.cpp fallback, poster placeholder); `info` = domain events (recording ready, upload completed, job finished w/ duration); `debug` = dev only.
