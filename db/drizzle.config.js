@@ -15,7 +15,7 @@ const env = loadEnv();
 /** @type {import('drizzle-kit').Config} */
 module.exports = {
   dialect: 'postgresql',
-  schema: path.join(__dirname, 'src', 'schema', 'index.js'),
+  schema: './src/schema/*.js',
   out: path.join(__dirname, 'migrations'),
   dbCredentials: { url: env.databaseUrl },
   strict: true,

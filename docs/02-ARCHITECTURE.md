@@ -114,6 +114,17 @@ veorec-media/
 ```
 
 - Bucket is **private**. All reads go through signed URLs (CDN-compatible token or R2 presigned GET). Public videos may use long-TTL signatures + CDN cache; private videos short-TTL (≤ 10 min) signatures.
+
+#### Storage roles and the Cloudinary decommissioning path
+
+| System | Role | Status |
+|---|---|---|
+| **PostgreSQL** | Sole source of application truth: identity, ownership, recording lifecycle, upload sessions, quota ledger, processing state, engagement, billing. Stores **no media bytes**. | Schema live as of **T-102** |
+| **Cloudflare R2** | Target object storage for all media bytes — sources, MP4/HLS, thumbnails, posters, audio, exports — addressed by the provider-neutral `video_assets.storage_key` and reached only through `StorageProvider`. **Not an application database.** | Arrives **T-201/T-202**; new uploads mirrored **T-203**; existing media backfilled **T-204** |
+| **MinIO** | Local development substitute for R2 (S3-compatible). Never a production dependency. | Available since T-101 |
+| **Cloudinary** | **LEGACY ONLY.** Still serving the pre-migration application. Not part of the target architecture: no new features may depend on it, it is never the target of `StorageProvider`, and no PostgreSQL column models it. | Frozen; media backfilled out in **T-204**; code and account removed in **T-1402/T-1403** (Phase 14) |
+
+The end state contains PostgreSQL + R2 + Redis/BullMQ + FFmpeg workers and **no Cloudinary dependency**. Legacy Cloudinary identifiers required to locate existing media during the T-204 backfill live in an isolated, migration-only mapping table introduced by T-104 and dropped at Phase 14 — never as columns on `recordings`/`video_assets` (`07` §13).
 - Lifecycle rules: `uploads-tmp/` (incomplete multipart) aborted after 48h; orphan scan job reconciles storage against `video_assets` weekly.
 
 ### 2.8 CDN

@@ -269,6 +269,8 @@ erDiagram
 | contacts, notification_reads, plan_overrides | respective files |
 Importer is idempotent (natural keys), run repeatedly during the dual-write window (`23` Phase 1).
 
+**Legacy provider identifiers are isolated, not modelled.** The application schema is storage-provider-neutral: media is addressed solely by `video_assets.storage_key` through `StorageProvider`. To locate existing media during the T-204 Cloudinary→R2 backfill, **T-104 adds a single migration-only table** — `legacy_media_map (recording_id PK → legacy_provider text, legacy_public_id text, legacy_url text, imported_at, backfilled_at)` — explicitly marked temporary. It is populated by the importer, consumed by the backfill copier, and **dropped in Phase 14 (T-1402)** together with the Cloudinary SDK. No `cloudinary_*` column ever appears on `recordings` or `video_assets`; a test asserts this (`tests/schema.test.js`, "provider neutrality").
+
 ## 14. Implementation & operations (delivered by T-101)
 
 **Package:** `db/` (`@veorec/db`, CommonJS, standalone `package.json` — it becomes a workspace member when the monorepo layout lands). Consumers import from `db/src/index.js`, never from `pg`/`drizzle-orm` directly, so pooling, env resolution, and safety guards stay in one place.
@@ -287,5 +289,15 @@ Importer is idempotent (natural keys), run repeatedly during the dual-write wind
 **Environments.** `APP_ENV` ∈ local | test | staging | production. Local/test get documented defaults; **staging/production must supply `DATABASE_URL` explicitly** — no default, no fallback to a local database — and default to `DATABASE_SSL=require`. Tests use a separate `DATABASE_URL_TEST` database whose schema is dropped each run. Connection strings are redacted wherever printed.
 
 **Local infrastructure.** `docker-compose.yml` at the repo root: Postgres 16, Redis 7, MinIO, MailHog, on non-default host ports (5433/6380/9100/1025) to avoid collisions. MinIO is a **local-only** S3 substitute — production storage is Cloudflare R2 via the StorageProvider abstraction (T-201); nothing may depend on MinIO. Compose is a development tool only, never the production deployment mechanism (§`02` 6). Developer guide + troubleshooting: `db/README.md`.
+
+**Schema implementation (T-102).** All 30 tables in §2–§10 exist as of migration `0001_application_schema` (30 CREATE TABLEs, 46 foreign keys, 52 CHECK constraints, 58 indexes, plus `updated_at` triggers on the 19 tables that carry the column). Drizzle table definitions live in `db/src/schema/` (one module per domain, re-exported from `index.js`); the SQL was produced by `drizzle-kit generate` from those definitions, with the trigger statements appended by hand (drizzle-kit does not model triggers).
+
+Practical notes discovered while implementing:
+- **drizzle-kit will not accept a `.js` file path** for `schema` — it requires a glob (`./src/schema/*.js`) or TypeScript files. The config uses the glob; when `db/` moves to TypeScript this can revert to a direct path.
+- Cross-module foreign keys use a lazy resolver (`_types.lazyRef`) so CommonJS modules can reference each other (`video_assets → processing_jobs → recordings`) without a require cycle.
+- `NULL` variants would defeat a plain unique index, so "one READY asset per (recording, kind, variant)" is enforced with `coalesce(variant,'')` in a partial unique index.
+- The `users` email uniqueness is partial (`WHERE deleted_at IS NULL`) so a soft-deleted account frees its address for re-registration — verified by test.
+
+**Known limitations at T-102.** The schema exists but **nothing writes to it yet**: no repositories (T-103), no importer (T-104), no dual-write (T-105), and no application code reads Postgres. `workspaces`/`workspace_members` are provisioned for the future product surface and stay empty. Quota *enforcement* logic (the guarded UPDATE of `16` §4.3) is T-306 — T-102 provides only the ledger columns and the CHECK constraints that make negative counters impossible. Partitioning of `analytics_events` is deferred until volume demands it.
 
 **Known limitations at T-101.** No application tables yet (T-102); no dual-write and no reads from Postgres anywhere in the app (later phases per `23`); the API server still uses JSON/Cloudinary unchanged; no connection-pool tuning under real load; no automated backup/restore procedure yet (production runbook lands with the VPS deployment task); the zod boot-schema described in §`02` 6 belongs to the API server and is not part of this package.

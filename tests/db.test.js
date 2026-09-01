@@ -103,10 +103,13 @@ async function dbTests() {
 
   // Start from a genuinely clean database: reset drops everything, then
   // migrates. This is also the "migration runner against a clean DB" case.
+  // Count-agnostic: the journal grows with every future migration.
+  const journalCount = readJournal(path.join(DB_DIR, 'migrations')).length;
   const reset = runCli('reset.js');
   ok(reset.status === 0, `db:reset succeeds (exit ${reset.status})\n${reset.stderr || ''}`);
   ok(/schema dropped and recreated/.test(reset.stdout || ''), 'db:reset reports dropping the schema');
-  ok(/applied 1 migration/.test(reset.stdout || ''), 'db:reset re-applies migrations from scratch');
+  ok(new RegExp(`applied ${journalCount} migration`).test(reset.stdout || ''),
+    `db:reset re-applies all ${journalCount} migration(s) from scratch`);
   ok(!/veorec_local_dev/.test((reset.stdout || '') + (reset.stderr || '')), 'db:reset never prints the password');
 
   const pool = createPool({ env, max: 2, applicationName: 'veorec-db-test' });
@@ -130,7 +133,8 @@ async function dbTests() {
 
     // db:status exits 0 when up to date.
     const status = runCli('status.js');
-    ok(status.status === 0 && /1\/1 applied/.test(status.stdout || ''), 'db:status reports an up-to-date database');
+    ok(status.status === 0 && new RegExp(`${journalCount}/${journalCount} applied`).test(status.stdout || ''),
+      'db:status reports an up-to-date database');
 
     // ── Constraint conventions (docs/07 §1) verified on scratch tables ───────
     // Proves the foundation supports what T-102's tables will rely on, without
