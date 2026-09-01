@@ -127,6 +127,120 @@ veorec-media/
 The end state contains PostgreSQL + R2 + Redis/BullMQ + FFmpeg workers and **no Cloudinary dependency**. Legacy Cloudinary identifiers required to locate existing media during the T-204 backfill live in an isolated, migration-only mapping table introduced by T-104 and dropped at Phase 14 — never as columns on `recordings`/`video_assets` (`07` §13).
 - Lifecycle rules: `uploads-tmp/` (incomplete multipart) aborted after 48h; orphan scan job reconciles storage against `video_assets` weekly.
 
+### 2.7.1 `StorageProvider` — the storage abstraction (delivered by T-201)
+
+`@veorec/storage` is the **only** way application code reaches object bytes.
+Package: `storage/` (the plan's `apps/api/src/storage/` path is aspirational —
+that app does not exist yet, the same deviation T-104 recorded).
+
+**Responsibility.** A `StorageProvider` owns object bytes and nothing else. It
+never learns about users, ownership, quota, or lifecycle:
+
+| Owns | System |
+|---|---|
+| recording, owner, status, `size_bytes`, duration, upload/processing state, quota ledger | **PostgreSQL** |
+| source media, derived MP4/HLS, thumbnails, posters, audio, exports | **R2** |
+
+There is deliberately no `provider.deleteRecording(userId, …)`. Ownership is
+resolved by a repository *before* a key is built; authorization never happens in
+the storage layer. R2 is **not** an application database and is never listed to
+answer a user-facing query — `listObjects` exists for maintenance and
+reconciliation only.
+
+**Interface.** `putObject` · `getObject` · `getObjectBuffer` · `headObject` ·
+`objectExists` · `deleteObject` · `deleteObjects` · `listObjects` ·
+`getSignedDownloadUrl` · `getSignedUploadUrl` · `createMultipartUpload` ·
+`getSignedPartUrl` · `listParts` · `completeMultipartUpload` ·
+`abortMultipartUpload`.
+
+**One implementation, two configurations.** R2 and MinIO both speak S3, so there
+is a single `S3StorageProvider` and no code path branches on which one is in
+use — `STORAGE_PROVIDER` selects a *configuration flavour*, never behaviour. A
+second code path would mean the thing tested locally is not the thing that runs
+in production, which is precisely the failure this abstraction exists to prevent.
+The AWS SDK is confined to `src/s3-provider.js`; a test asserts no other file
+imports it, which is what keeps R2 swappable for B2/Wasabi/S3 without touching
+business logic (§11 provider-abstraction rule).
+
+**Configuration** comes entirely from the environment (`.env.example`). Nothing
+is hardcoded — no account ids, keys, buckets, or endpoints. `staging` and
+`production` have **no defaults** and fail fast rather than silently falling back
+to the local MinIO; deployed endpoints must be `https://`. The bucket is server
+configuration and is never taken from user input. Credentials never appear in
+`describe()`, `JSON.stringify(config)`, `util.inspect(config)`, or any thrown
+message.
+
+**Object keys** follow §2.7 and are built only by `keys.*`. Identifiers are
+validated against a strict charset *before* interpolation — there is no escaping
+step; anything outside the charset is rejected — and every key is re-validated
+inside the provider as defence in depth. A client filename is never used as, or
+inside, a key; the extension comes from a server-side allow-list. Keys are
+deterministic (a retried copy overwrites rather than duplicating) and carry
+opaque ids only, no personal data. Traversal, absolute paths, backslashes,
+percent-encoding, control characters and empty/dot segments are all rejected.
+
+**Signed URLs.** The bucket is private; every read is a time-limited signed URL
+scoped to one object and one method. The signature covers method, bucket, key
+and expiry, so a URL for one recording cannot be edited into a URL for another,
+and a GET URL cannot be used to write. TTL is capped by configuration
+(`STORAGE_MAX_SIGNED_URL_TTL`); a request above the ceiling is **refused rather
+than silently shortened**, so the mistake surfaces. Defaults: 10 min GET
+(`12` §6), 1 h PUT. A signed URL is a bearer credential — never logged, never
+stored. **No object is ever made permanently public.**
+
+**Byte ceiling.** `getSignedUploadUrl`/`getSignedPartUrl` accept a
+`contentLength` which is included in the **signed headers**, so the provider
+itself rejects a body of any other size. This is the enforceable ceiling the
+quota work depends on: an actual storage-layer constraint rather than a
+client-side promise, and the reason the free-plan limit need not rest on a
+guessed MediaRecorder bitrate. T-201 supplies the primitive only — it invents no
+limit of its own, and the reservation algorithm remains T-306.
+
+**Multipart lifecycle.** `create → presign part URLs → (client PUTs parts) →
+complete | abort`. The API signs and orchestrates; **bytes go browser → R2
+directly**. The upload id is returned to the caller to persist in PostgreSQL —
+R2 does not hold that state — so an upload survives an API restart. An
+in-progress upload is **not** a visible object: the object appears atomically at
+completion, so a crashed upload can never be mistaken for a finished recording.
+Completion is keyed by `(key, uploadId)`, so a retry after a lost response either
+re-completes the same upload or reports it gone — never a duplicate object.
+Abort and delete are safely repeatable; an already-gone target resolves rather
+than throwing, because cleanup paths run more than once.
+
+**Error model.** `object_not_found` · `permission_denied` · `conflict` ·
+`invalid_request` · `upload_not_found` · `multipart_failed` ·
+`provider_unavailable` · `timeout` · `unknown_storage_error` ·
+`storage_config_error`. Every error carries `retryable`, distinguishing "retry
+this part" from "this upload is dead" for the future queue. An explicit S3 code
+beats the HTTP status (a 404 means *no such key* for GET but *no such upload* for
+a part). No raw SDK error escapes — its message and `$metadata` can carry the
+bucket, endpoint host and request ids — and **no HTTP status is attached**: the
+provider stays transport-agnostic and the HTTP layer maps codes per `18` §2.
+
+**Why the VPS filesystem is not permanent video storage.** Local disk is bound to
+one machine, so it cannot be read by a second API instance or a worker fleet,
+defeats the multi-instance rule in §7, and makes the box's disk the capacity
+ceiling. It also puts bytes behind the API, forcing byte proxying and losing
+Cloudflare's edge cache and R2's zero egress. VPS disk is scratch space for
+in-flight FFmpeg work only; the durable copy is always in R2.
+
+**Why the API does not proxy video bytes.** Proxying multiplies bandwidth,
+occupies a Node process for the duration of every upload and playback, makes
+restarts destructive to in-flight transfers, and scales with viewers rather than
+with requests. Presigned URLs move the bytes browser ⇄ Cloudflare ⇄ R2 while the
+API keeps the only thing it must own: the authorization decision about who gets a
+signed URL, and for how long (§1.2).
+
+**Cloudinary isolation.** Cloudinary is legacy migration infrastructure. It is
+never a `StorageProvider` target, never a fallback for R2, and never referenced
+by this package — asserted by a test over the source files and the manifest.
+
+**Deliberately NOT delivered by T-201:** bucket provisioning, lifecycle rules and
+CORS (T-202) · mirroring new uploads (T-203) · backfill (T-204) · the
+browser-facing upload-session API (T-301) · quota reservation (T-306) ·
+processing (Phase 5) · **no application code calls this package yet**, and no
+legacy behaviour changed.
+
 ### 2.8 CDN
 
 Cloudflare in front of R2 for derived media. Cache key includes the asset path, not the signature (use signed cookies or edge-verified tokens for public assets; for MVP, R2 presigned GETs with `Cache-Control` on public assets are acceptable — documented tradeoff in `12` §6).

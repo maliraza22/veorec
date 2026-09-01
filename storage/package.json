@@ -1,0 +1,21 @@
+{
+  "name": "@veorec/storage",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "description": "Provider-agnostic object storage for VeoRec: StorageProvider contract + S3-compatible implementation (Cloudflare R2 in production, MinIO locally) (T-201).",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node ../tests/storage.test.js && node ../tests/storage-contract.test.js",
+    "test:unit": "node ../tests/storage.test.js",
+    "test:contract": "node ../tests/storage-contract.test.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.899.0",
+    "@aws-sdk/s3-request-presigner": "^3.899.0",
+    "dotenv": "^17.4.2"
+  }
+}
