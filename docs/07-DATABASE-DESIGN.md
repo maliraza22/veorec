@@ -298,6 +298,51 @@ Practical notes discovered while implementing:
 - `NULL` variants would defeat a plain unique index, so "one READY asset per (recording, kind, variant)" is enforced with `coalesce(variant,'')` in a partial unique index.
 - The `users` email uniqueness is partial (`WHERE deleted_at IS NULL`) so a soft-deleted account frees its address for re-registration — verified by test.
 
+## 15. Repository layer (delivered by T-103)
+
+`db/src/repositories/` is the application's **only** data-access boundary. Everything above it (API handlers, services, workers) calls repositories; nothing above writes SQL, and nothing inside them knows about HTTP, storage providers, FFmpeg or the browser. Storage-provider work belongs to `StorageProvider` (T-201) — a repository never resolves a `storage_key` to bytes or a URL.
+
+**Repositories** (18, bound by `createRepositories(db)`): `users`, `sessions`, `recordings`, `folders`, `assets`, `uploads`, `usage`, `shareLinks`, `comments`, `reactions`, `viewSessions`, `leads`, `analytics`, `transcripts`, `jobs`, `subscriptions`, `billingEvents`, `audit`.
+
+### Scope / ownership rules
+
+Every method touching user-owned data takes a **Scope** (`{ userId, workspaceId? }`) as its first argument and applies the ownership predicate itself — `user_id = scope.userId AND deleted_at IS NULL`, or an `INNER JOIN recordings` for child rows (assets, comments, jobs, transcripts). There is no unscoped entry point for owned data, so a caller cannot "forget the WHERE clause". Passing a missing or malformed scope raises `ScopeError` rather than widening the query.
+
+Three deliberately-named exceptions carry the unscoped surface, chosen so they are obvious in review and greppable:
+- `*ForPublicWatch` — public watch page; the caller must apply the privacy/share-link rules in `12` first.
+- `*System` — background workers and maintenance jobs, which have no user; **requires a stated reason string** (`getSystem(id, 'probe worker')`) that appears in nothing but the call site, forcing the author to justify the unscoped access.
+- `*AsAdmin` — admin tooling; also reason-required, and every mutation is expected to write an `audit_logs` row.
+
+Field-level protection complements row-level scoping: owner updates are whitelisted, so `status`, FFprobe-verified facts (`duration`/`width`/`height`/`size_bytes`) and ownership columns cannot be set by a user — only by `*System` writers (invariant #11). `users.updateSelf` likewise cannot set `is_admin`.
+
+### Transaction model
+
+`createRepositories(db)` binds **one executor** — the pool client or a transaction — to every repository, so a unit of work cannot accidentally straddle both. `withTransaction(fn)` hands back a transaction-bound repo set; returning commits, throwing rolls back.
+
+Mutual exclusion for the quota work lands via `usage.getForUpdate(scope)` (`SELECT … FOR UPDATE` on the user's ledger row), which **refuses to run outside a transaction** — a lock on a pooled connection would be released immediately and provide no isolation, silently. T-306's atomic check-and-reserve is therefore expressible as lock → read → decide → `applyDelta`/`createReservation` inside one `withTransaction`, with no need to bypass this layer. A concurrency test proves the pattern: two parallel 600-byte reservations against a 1000-byte budget yield exactly one grant.
+
+### Error model
+
+Repositories translate driver failures into a small stable set and never leak raw pg errors (whose `detail`/`constraint` can expose column values): `NotFoundError` (`not_found`), `ConflictError` (`conflict`, unique violation), `ConstraintViolationError` (`constraint_violation`: CHECK/FK/NOT NULL), `InvalidStateError` (`invalid_state`), `DatabaseError` (`database_error`, with `retryable` set for serialization/deadlock/connection failures). Callers branch on `error.code`; the HTTP layer maps those codes to the wire contract in `18` §2 — repositories contain no status codes or response shapes. Note drizzle wraps driver errors, so the mapper walks the `cause` chain to find the SQLSTATE.
+
+### How services will consume repositories
+
+```js
+const { repositories, withTransaction } = require('@veorec/db');
+const repos = repositories();                        // shared pool
+const rec = await repos.recordings.get(scope, id);   // ownership enforced here
+
+await withTransaction(async (tx) => {                // atomic unit
+  await tx.usage.getForUpdate(scope);
+  await tx.usage.applyDelta(scope, { storageReservedBytes: bytes });
+  await tx.uploads.createReservation(scope, { ... });
+});
+```
+
+Method sets are intentionally minimal — methods are added when a consuming task needs them, rather than speculatively.
+
+**Known limitations at T-103.** The layer is complete but **unused**: no application code calls it yet (the legacy server still runs on JSON/Cloudinary), there is no dual-write (T-105), no importer (T-104), and no quota algorithm (T-306). Workspace scoping is accepted in the Scope type and stored on recordings, but no repository filters by it yet — that activates with the workspaces product surface. Keyset pagination is implemented on `recordings.list` only. `analytics` is the one repository expected to grow raw aggregate SQL (`07` §14 acceptance note).
+
 **Known limitations at T-102.** The schema exists but **nothing writes to it yet**: no repositories (T-103), no importer (T-104), no dual-write (T-105), and no application code reads Postgres. `workspaces`/`workspace_members` are provisioned for the future product surface and stay empty. Quota *enforcement* logic (the guarded UPDATE of `16` §4.3) is T-306 — T-102 provides only the ledger columns and the CHECK constraints that make negative counters impossible. Partitioning of `analytics_events` is deferred until volume demands it.
 
 **Known limitations at T-101.** No application tables yet (T-102); no dual-write and no reads from Postgres anywhere in the app (later phases per `23`); the API server still uses JSON/Cloudinary unchanged; no connection-pool tuning under real load; no automated backup/restore procedure yet (production runbook lands with the VPS deployment task); the zod boot-schema described in §`02` 6 belongs to the API server and is not part of this package.

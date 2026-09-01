@@ -13,8 +13,9 @@
     "db:status": "node src/cli/status.js",
     "db:reset": "node src/cli/reset.js",
     "db:generate": "drizzle-kit generate",
-    "test": "node ../tests/db.test.js && node ../tests/schema.test.js",
-    "test:schema": "node ../tests/schema.test.js"
+    "test": "node ../tests/db.test.js && node ../tests/schema.test.js && node ../tests/repositories.test.js",
+    "test:schema": "node ../tests/schema.test.js",
+    "test:repos": "node ../tests/repositories.test.js"
   },
   "dependencies": {
     "dotenv": "^17.4.2",
