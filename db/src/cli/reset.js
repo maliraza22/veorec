@@ -27,11 +27,20 @@ async function main() {
   const pool = createPool({ env, max: 1, statementTimeoutMs: 0, applicationName: 'veorec-db-reset' });
   console.log(`[reset] env=${env.appEnv} target=${env.databaseUrlRedacted}`);
   try {
-    // Drop the public schema (all application objects) and Drizzle's own
-    // migration bookkeeping, then restore an empty public schema.
-    await pool.query('DROP SCHEMA IF EXISTS public CASCADE');
-    await pool.query('DROP SCHEMA IF EXISTS drizzle CASCADE');
+    // Drop EVERY non-system schema — application objects (public), Drizzle's
+    // migration bookkeeping (drizzle) and any auxiliary schema such as the
+    // transitional `legacy` one. Enumerating rather than hard-coding names
+    // means a schema added by a future migration cannot silently survive a
+    // reset and leak rows into the next run.
+    const { rows: schemas } = await pool.query(`
+      SELECT nspname FROM pg_namespace
+      WHERE nspname NOT IN ('pg_catalog','information_schema')
+        AND nspname NOT LIKE 'pg_toast%' AND nspname NOT LIKE 'pg_temp%'`);
+    for (const { nspname } of schemas) {
+      await pool.query(`DROP SCHEMA IF EXISTS "${nspname.replace(/"/g, '""')}" CASCADE`);
+    }
     await pool.query('CREATE SCHEMA public');
+    console.log(`[reset] dropped schema(s): ${schemas.map((s) => s.nspname).join(', ') || '(none)'}`);
     const { rows } = await pool.query('SELECT current_user AS u');
     await pool.query(`GRANT ALL ON SCHEMA public TO "${rows[0].u.replace(/"/g, '""')}"`);
     console.log('[reset] schema dropped and recreated');

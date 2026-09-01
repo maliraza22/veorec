@@ -298,6 +298,56 @@ Practical notes discovered while implementing:
 - `NULL` variants would defeat a plain unique index, so "one READY asset per (recording, kind, variant)" is enforced with `coalesce(variant,'')` in a partial unique index.
 - The `users` email uniqueness is partial (`WHERE deleted_at IS NULL`) so a soft-deleted account frees its address for re-registration — verified by test.
 
+## 16. Legacy importer (delivered by T-104)
+
+**Purpose.** Move existing application state out of the legacy JSON stores and into PostgreSQL, so the new stack has real data to run against. It is an **operator-run migration tool**: nothing in the application imports it — not startup, requests, cron or workers — and it changes no runtime behaviour. The legacy app keeps running on JSON/Cloudinary until a later cutover phase.
+
+**Legacy sources** (all read-only): `users.json`, `meta.json`, `folders.json`, `subscriptions.json`, `usage.json`, `contacts.json`, `notif-reads.json`, `plan_overrides.json`, `upgrade_events.json`, `recordings.json` — plus a **media listing export** describing where recordings' bytes currently live.
+
+**Cloudinary is a migration source, not architecture.** The importer contains no Cloudinary SDK, credentials or API calls: it reads a plain JSON listing. A single isolated script, `db/src/migration/export-legacy-media.js`, produces that listing by resolving the SDK from the **legacy server's** `node_modules` (via `createRequire`), so `db/` never declares a Cloudinary dependency. Phase 14 deletes that one file.
+
+### Entity mapping
+
+| Legacy source | PostgreSQL target | Notes |
+|---|---|---|
+| `users.json` | `users` | id `usr_<legacyUuid>`; password hashes carried over so sign-in keeps working; **reset tokens deliberately dropped** (legacy stored them in clear; the column stores hashes and they expire in 1h) |
+| — | `sessions` | nothing to import — legacy auth was stateless JWT |
+| `folders.json` | `folders` | `fld_<legacyUuid>` |
+| `recordings.json` + media listing | `recordings` | ownership from the local store's `userId` or the listing's `screenrec/<userId>/<recId>` path; metadata merged from `meta.json`; imported as `status='ready'` |
+| media listing | `legacy.media_map` | where the bytes are **today**; no `video_assets` row is created |
+| `meta.json` → comments/reactions/viewKeys/leads/transcript | `comments`, `reactions`, `view_sessions`, `leads`, `transcripts` + `transcript_segments` | `viewKeys` map 1:1 to view sessions, preserving unique-view counts exactly; the legacy tally-style reactions object is expanded to rows |
+| `meta.engagement` | `analytics_events` (`legacy_engagement_summary`) | legacy only stored an aggregate, so it is preserved as an event rather than fabricating per-viewer rows |
+| `usage.json` | `usage` | minutes → seconds; re-derived authoritatively by the nightly `usage_sync` job after cutover |
+| `subscriptions.json` | `subscriptions` | unknown statuses imported as `canceled` and reported |
+| `upgrade_events.json` | `analytics_events` (`paywall_hit`) | canonical trigger names preserved |
+| `contacts.json`, `notif-reads.json`, `plan_overrides.json` | `contacts`, `notification_reads`, `plan_overrides` | |
+| — | `billing_events` | legacy webhooks were never persisted; the ledger starts empty |
+
+### Idempotency, resumability and safety
+
+- **Deterministic ids**: new ids are pure functions of legacy identifiers (`rec_<legacyUuid>`), so re-importing targets the same primary key. Records that never had an id (reactions, view sessions, leads) get a stable SHA-256-derived id. Every write is an `ON CONFLICT DO NOTHING`/`DO UPDATE`.
+- **Append-only sources** (`upgrade_events.json`, engagement summaries) have no natural key, so they use `legacy.import_checkpoints` instead.
+- **Resume = re-run.** Committed work is skipped as `alreadyImported`; a crash halfway through never requires starting over. Each applied run is recorded in `legacy.import_runs` with its report.
+- **Read-only sources.** There is no write path to the legacy stores. The CLI SHA-256-fingerprints every source file before and after a run and **aborts with exit code 3** if any changed.
+- **Ownership is never guessed.** A recording known only to `meta.json` (no ownership-bearing source) is quarantined as an orphan and reported, never assigned to a user.
+- **Malformed JSON throws** rather than silently importing an empty dataset — the failure mode the legacy stores themselves have (`01` §2.2).
+
+### Dry run and reconciliation
+
+Dry run is the **default**; writing requires `--apply`. A dry run reads everything, resolves mappings, validates relationships and produces the full report while performing zero writes (asserted by test). The report gives per-entity `source / imported / alreadyImported / skipped / conflict / orphan / unmappedMedia / failed` counts plus an itemised problem list; `failed`, `orphan` and `conflict` are never folded into `imported`, and a run containing them exits **2**.
+
+```
+cd db
+npm run db:import -- --data-dir=/path/to/volume --media-listing=media.json          # dry run
+npm run db:import -- --data-dir=/path/to/volume --media-listing=media.json --apply  # writes
+```
+
+### The Cloudinary → R2 boundary
+
+`unmappedMedia` counts recordings whose bytes are still outside R2. T-104 imports **no `video_assets` rows** for them: the absence of an asset row is the honest signal that no object exists in R2, and no storage key is invented for an object that isn't there. `legacy.media_map` records the current location with `backfilled_at IS NULL`. **T-201/T-202** build `StorageProvider` and the buckets; **T-204** copies each object into R2, creates the `video_assets` row with a real `storage_key`, and stamps `backfilled_at`. Once nothing is pending, **Phase 14 (T-1402/T-1403)** removes the Cloudinary code and `DROP SCHEMA legacy CASCADE` removes this tooling entirely.
+
+**Known limitations at T-104.** Not run against production yet (this machine has neither the production JSON volume nor Cloudinary credentials — verified, recorded in `BASELINE.md`), so the reconciliation numbers below are from fixtures. Per-viewer watch progress cannot be recovered (legacy stored only an aggregate). `is_admin` is not imported — it derives from the `ADMIN_EMAILS` env allowlist and is set explicitly after cutover. Workspaces are not populated; recordings import with `workspace_id = NULL`.
+
 ## 15. Repository layer (delivered by T-103)
 
 `db/src/repositories/` is the application's **only** data-access boundary. Everything above it (API handlers, services, workers) calls repositories; nothing above writes SQL, and nothing inside them knows about HTTP, storage providers, FFmpeg or the browser. Storage-provider work belongs to `StorageProvider` (T-201) — a repository never resolves a `storage_key` to bytes or a URL.

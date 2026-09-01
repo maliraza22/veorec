@@ -18,6 +18,9 @@ module.exports = {
   schema: './src/schema/*.js',
   out: path.join(__dirname, 'migrations'),
   dbCredentials: { url: env.databaseUrl },
+  // Only the application model is diffed; the transitional `legacy` schema
+  // (T-104) is invisible to drizzle-kit and is dropped wholesale in Phase 14.
+  schemaFilter: ['public'],
   strict: true,
   verbose: true,
 };

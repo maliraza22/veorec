@@ -54,6 +54,7 @@
 
 - Production: API on Railway (Dockerfile, Node 20, whisper.cpp + ffmpeg baked in), client on Vercel, media on Cloudinary, JSON data on Railway volume `DATA_DIR`. *(Target hosting moves to a provider-agnostic VPS + R2 — `02` §6 — from Phase 2 onward; the legacy deployment is untouched so far.)*
 - No CI exists; all checks above are manual. (CI introduction is part of later tasks, not baseline.)
+- **Production legacy data is not available on this machine** (verified 2026-09-01 during T-104): no Cloudinary credentials in the environment and no copy of the Railway `DATA_DIR` volume. The importer is therefore fixture-tested here; its production dry run must be executed by an operator who has both, and its report attached to the Phase-1 record.
 - **Local dev machine has no Docker and no native PostgreSQL** (verified 2026-09-01). T-101's Docker Compose stack is therefore authored-and-reviewed but *unexecuted* here; its migrations were verified against PostgreSQL 16.15 running in WSL2 Ubuntu (same version/port/credentials as the compose service). Docker Compose itself still needs a one-time verification on a machine that has Docker — tracked as a T-102 pre-flight step.
 - `ffmpeg`/`ffprobe` are NOT on the dev machine PATH by assumption — transcription features are exercised only in Docker.
 

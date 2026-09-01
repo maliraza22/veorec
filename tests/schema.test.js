@@ -96,7 +96,11 @@ async function main() {
     cwd: DB_DIR, env: { ...process.env, APP_ENV: 'test' }, encoding: 'utf8',
   });
   ok(reset.status === 0, `clean-database migration succeeds\n${reset.stderr || ''}`);
-  ok(/applied 2 migration/.test(reset.stdout || ''), 'both migrations applied from scratch');
+  // Count-agnostic: the journal grows with every future migration.
+  const { readJournal } = require(path.join(DB_DIR, 'src', 'migration-state.js'));
+  const journalCount = readJournal(path.join(DB_DIR, 'migrations')).length;
+  ok(new RegExp(`applied ${journalCount} migration`).test(reset.stdout || ''),
+    `all ${journalCount} migrations applied from scratch`);
 
   const pool = createPool({ env, max: 3, applicationName: 'veorec-schema-test' });
   try {

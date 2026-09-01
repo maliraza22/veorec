@@ -219,7 +219,7 @@ flowchart LR
 
 | Component | Where | Notes |
 |---|---|---|
-| Web app (React/Vite) | **Vercel** | independently deployable from the API; no video processing ever runs in the Vercel runtime (no FFmpeg in serverless functions) |
+| Web app (React/Vite) | **The same VPS**, served as static assets behind Cloudflare | built to static files and served by the VPS (nginx/Caddy or the API's static handler); independently deployable from the API. **No Vercel** — the platform is deliberately single-provider for compute, and static hosting behind Cloudflare needs nothing more |
 | API server | **Dedicated VPS** (initial: Hostinger-class, ~4–8 vCPU / 16–32 GB RAM / NVMe / Ubuntu), Docker-deployed | runs API, webhooks, upload-session coordination, entitlements, BullMQ producers, observability. **Never permanent video storage; never the video delivery layer** |
 | PostgreSQL + Redis | co-located on the VPS via Docker Compose initially (nightly dumps + WAL archiving to R2); documented upgrade path to managed offerings | Postgres = truth; Redis = queues/limits only |
 | CPU workers | same VPS initially; horizontally scalable to additional VPSes (`worker-1..n` all consuming BullMQ) | all ordinary Loom-style processing is CPU FFmpeg — **no GPU required** for the core product |
@@ -305,7 +305,7 @@ MP4 (H.264/AAC, `+faststart`) always produced — universal, simple, seekable. H
 | PaaS (Railway/Fly — the earlier draft default) | Zero ops | Metered compute makes FFmpeg workers and always-on queues expensive; less control over scratch disk |
 | Hyperscaler (AWS/GCP/Azure) | Managed everything, infinite scale | Cost and complexity far above this stage; egress pricing hostile to video |
 
-**Decision: dedicated VPS via Docker Compose (API, workers, Postgres, Redis as services), provider-agnostic.** Nothing application-level may assume the provider (no Hostinger API calls in code; deployment scripts isolated under `infra/`). Scale path: split workers to a second VPS → managed Postgres → multi-node, all without code changes. Vercel stays for the web app only; the earlier "Railway (or Fly)" note in drafts of this doc is superseded.
+**Decision: dedicated VPS via Docker Compose (API, workers, Postgres, Redis as services), provider-agnostic.** Nothing application-level may assume the provider (no Hostinger API calls in code; deployment scripts isolated under `infra/`). Scale path: split workers to a second VPS → managed Postgres → multi-node, all without code changes. The web app is built to static assets and served from the same VPS behind Cloudflare — **no Vercel, and no PaaS**; the earlier "Railway (or Fly)" and Vercel notes in drafts of this doc are superseded.
 
 ### 10.7 Recorder container format
 

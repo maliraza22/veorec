@@ -13,9 +13,11 @@
     "db:status": "node src/cli/status.js",
     "db:reset": "node src/cli/reset.js",
     "db:generate": "drizzle-kit generate",
-    "test": "node ../tests/db.test.js && node ../tests/schema.test.js && node ../tests/repositories.test.js",
+    "db:import": "node src/cli/import-legacy.js",
+    "test": "node ../tests/db.test.js && node ../tests/schema.test.js && node ../tests/repositories.test.js && node ../tests/importer.test.js",
     "test:schema": "node ../tests/schema.test.js",
-    "test:repos": "node ../tests/repositories.test.js"
+    "test:repos": "node ../tests/repositories.test.js",
+    "test:import": "node ../tests/importer.test.js"
   },
   "dependencies": {
     "dotenv": "^17.4.2",

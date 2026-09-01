@@ -50,7 +50,7 @@ Per `12` §5–6: private bucket; TTL-bound signatures (10 min private / 24h pub
 
 ## 9. Secrets & configuration
 
-- All secrets via env (Railway/Vercel secret stores); never committed (`.gitignore` covers `.env`). T-001 verified `extension.pem`/`.crx` were **never** in git history (only stale release zips were tracked, now untracked) — no rotation forced; keep the signing key out of the repo and move signing to CI secrets when a build pipeline exists.
+- All secrets via env (the VPS deployment's secret store / Docker secrets — provider-neutral); never committed (`.gitignore` covers `.env`). T-001 verified `extension.pem`/`.crx` were **never** in git history (only stale release zips were tracked, now untracked) — no rotation forced; keep the signing key out of the repo and move signing to CI secrets when a build pipeline exists.
 - Rotation runbook: JWT/session secret (sessions table makes rotation seamless), R2 keys, Paddle webhook secret (dual-secret window), Groq/Brevo keys.
 - Separate R2 credentials for API (sign-only where possible) and workers (read/write).
 

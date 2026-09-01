@@ -59,7 +59,7 @@ PostgreSQL is the single source of truth for all application state (users, recor
 | Database | PostgreSQL (+ Drizzle ORM) | `07-DATABASE-DESIGN.md`, §Phase-6 comparisons in `02-ARCHITECTURE.md` §10 |
 | Object storage | Cloudflare R2 (S3 API, zero egress) | `02-ARCHITECTURE.md` §10.1 |
 | Upload protocol | S3 multipart with presigned part URLs, app-managed `upload_sessions` | `06-UPLOAD-PROTOCOL.md` |
-| API hosting | Dedicated VPS (Hostinger-class initially), Docker, provider-agnostic; Vercel for web | `02-ARCHITECTURE.md` §6, §10.6 |
+| Hosting | Single dedicated VPS (Hostinger-class initially), Docker, provider-agnostic — API, workers, Postgres, Redis **and** the static web app; Cloudflare for DNS/CDN/WAF. No Vercel. | `02-ARCHITECTURE.md` §6, §10.6 |
 | Queue | BullMQ on Redis | `10-JOBS-AND-QUEUES.md` |
 | Recorder state | Explicit finite state machine (hand-rolled, XState-compatible design) | `03-RECORDING-ENGINE-SPECIFICATION.md` |
 | Local durability | IndexedDB in the recorder document, chunk-per-row | `05-LOCAL-RECOVERY-INDEXEDDB.md` |
