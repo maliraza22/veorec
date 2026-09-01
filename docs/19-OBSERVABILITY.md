@@ -31,6 +31,7 @@ Rule: any log line about a recording/upload/job includes its id as a structured 
 **API**: `http_requests_total{route,method,status}`, `http_request_duration_seconds` (histogram), `rate_limited_total{limiter}`.
 **Upload**: `upload_sessions_created_total`, `upload_sessions_completed_total`, `upload_sessions_expired_total`, `upload_parts_recorded_total`, `upload_complete_duration_seconds`, `upload_bytes_total`.
 **Quota**: `quota_reservations_total{result=granted|storage_limit|video_limit}`, `quota_reserved_bytes` (gauge), `quota_ledger_drift_bytes` (from usage_sync), `quota_blocked_users` (gauge — free users at either cap; also a paywall-conversion signal).
+**Dual-write (T-105, migration window only)**: `dualWriteAttempt/Success/Failure/Retryable` counters in the KPI snapshot as `dualWrite{attempts, successRatePct, failures, retryableFailures, reconciliationPending}`. Alert if `successRatePct` drops below 95% or `reconciliationPending` grows steadily — the response to either is `PG_DUAL_WRITE=false` (legacy is unaffected) followed by a reconciling import.
 **Pipeline**: `jobs_enqueued/completed/failed_total{queue}`, `job_duration_seconds{queue}` (histogram), `job_attempts` on completion, `queue_depth{queue}` (gauge), `recordings_ready_total`, `time_to_ready_seconds` (upload-complete → ready; the product's core latency).
 **Playback**: `media_url_minted_total{privacy}`, watch API latency; client beacons for `player_error_total{code}` (sampled).
 **STT/AI**: `groq_requests_total{kind,status}`, `stt_job_duration_seconds`, fallback counter.

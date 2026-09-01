@@ -298,6 +298,82 @@ Practical notes discovered while implementing:
 - `NULL` variants would defeat a plain unique index, so "one READY asset per (recording, kind, variant)" is enforced with `coalesce(variant,'')` in a partial unique index.
 - The `users` email uniqueness is partial (`WHERE deleted_at IS NULL`) so a soft-deleted account frees its address for re-registration — verified by test.
 
+## 17. Dual-write mirror (delivered by T-105)
+
+> **T-105 does NOT make PostgreSQL authoritative.** The legacy JSON/Cloudinary application remains the source of truth for every read and every decision. PostgreSQL is a *secondary mirror* that is written after a legacy write already succeeded, and nothing in the application reads from it.
+
+```
+legacy operation ──► JSON / Cloudinary   (authoritative — unchanged)
+                 └─► PostgreSQL mirror   (secondary, best-effort, journaled)
+```
+
+### `PG_DUAL_WRITE`
+
+| Value | Behaviour |
+|---|---|
+| absent (**default**) | Dual-write completely off. `server/dualwrite.js` loads no database code, opens no pool, creates no journal; every mirror call returns immediately. |
+| `false` / anything else | Same as absent — only the exact string `true` enables it. |
+| `true` | The legacy operation runs unchanged, then a mirror write is attempted. |
+
+Tuning (all optional): `PG_DUAL_WRITE_TIMEOUT_MS` (5000), `PG_DUAL_WRITE_MAX_QUEUED` (500), `PG_DUAL_WRITE_CIRCUIT_THRESHOLD` (3), `PG_DUAL_WRITE_CIRCUIT_COOLDOWN_MS` (30000).
+
+### Legacy-wins guarantee
+
+A mirror failure can never change a legacy response. Mirrors are queued **after** the response is produced, all errors are contained inside `dualwrite.js`, and no mirror result is awaited by a request handler. This is asserted by tests that run the same flows against a server whose mirror database is unreachable and compare status codes, response bodies and the JSON stores byte-for-byte against a mirror-disabled run.
+
+### Operations mirrored
+
+Hooked at the legacy **store** choke-points (so no call site can be missed) or at the route where request context is needed:
+
+| Legacy write | Hook | PostgreSQL effect | Idempotency key |
+|---|---|---|---|
+| user create/update (signup, Google, profile, password, reset, admin grant) | `users.js` create/update | upsert `users` | `usr_<legacyUuid>` |
+| folder create/rename/delete | `meta.js` folders | upsert / delete `folders` | `fld_<legacyUuid>` |
+| notification read | `meta.js` notifReads | upsert `notification_reads` | `user_id` |
+| subscription change (Paddle webhook, sync, cancel) | `subscriptions.js` upsert | upsert `subscriptions` | `user_id` |
+| usage counter change (upload, delete, render) | `usage.service.js` updateUsage | upsert `usage` **snapshot** | `user_id` |
+| contact form | `contacts.js` create | insert `contacts` | `ctc_<legacyUuid>` |
+| recording created (upload) | `index.js` both upload branches | insert `recordings` + `legacy.media_map` | `rec_<legacyUuid>` |
+| recording metadata / rename | `index.js` meta + title routes | update owner-editable fields | `rec_<legacyUuid>` |
+| comment / reaction / view / lead | `index.js` watch routes | insert `comments` / `reactions` / upsert `view_sessions` / `leads` | id or content-derived hash |
+
+Ordering, failure behaviour and reconciliation are uniform across all of them (below). All writes reuse the **same** `db/src/migration/mirrors.js` mappers as the T-104 importer, so a mirrored row and an imported row are identical — which is what lets the importer repair a failed mirror instead of duplicating it.
+
+### Ordering, bounding and the circuit breaker
+
+Mirrors run through a **single FIFO lane**, preserving the causal order of the legacy writes — a user exists before their folder, a recording before its comments. (Running them concurrently raced foreign keys under ordinary request timing; that was a real defect found in testing.) The lane is bounded at `MAX_QUEUED`; overflow is journaled rather than queued, so memory cannot grow without limit and nothing is lost on restart. After `CIRCUIT_THRESHOLD` consecutive failures a **circuit breaker** opens: mirrors are journaled immediately instead of each waiting out a timeout, and it closes on the next success.
+
+### Failure handling and reconciliation
+
+Every failed, shed or circuit-skipped mirror is appended to **`dual-write-failures.jsonl`** in `DATA_DIR` — a durable file that works precisely when PostgreSQL is the thing that is down. Each line carries `at, op, entity, legacyId, pgId, requestId, errorCode, constraint, retryable, reason` — enough to reconcile without depending on log retention. Secrets, tokens, request bodies and connection strings never appear.
+
+```
+cd db
+npm run db:reconcile -- --data-dir=/path/to/volume            # what is still missing?
+npm run db:import    -- --data-dir=/path/to/volume --apply    # repair (idempotent)
+npm run db:reconcile -- --data-dir=/path/to/volume --prune    # drop repaired entries
+```
+
+Reconciliation is verification-based: it checks whether each journaled record now exists in PostgreSQL, reports what is outstanding (exit 2), and only prunes entries it has confirmed. Repair deliberately reuses the T-104 importer rather than introducing a second write path.
+
+### Observability
+
+KPI counters `dualWriteAttempt / dualWriteSuccess / dualWriteFailure / dualWriteRetryable` feed the 15-minute snapshot as `dualWrite{attempts, successRatePct, failures, retryableFailures, reconciliationPending}`. Failures log at error level with the fields above.
+
+### Rollout and rollback
+
+| Stage | Action |
+|---|---|
+| 0 | `PG_DUAL_WRITE` unset in production (current state). |
+| 1 | Enable in development/staging; run the flows; confirm mirrored rows. |
+| 2 | Verify: `db:reconcile` reports nothing outstanding and `dualWrite.successRatePct` is ~100. |
+| 3 | Enable in production during a low-traffic window; watch failures and latency. |
+| 4 | Leave enabled; run `db:import --apply` periodically so any drift converges. |
+
+**Rollback is immediate and total: set `PG_DUAL_WRITE=false` (or remove it) and restart.** The legacy path is untouched by the flag, so the application continues exactly as before; PostgreSQL simply stops receiving updates, and the importer can catch it up later. No data is lost by disabling it.
+
+**Known limitations at T-105.** Mirrors are single-process: a multi-instance deployment mirrors from each instance independently (safe — all writes are idempotent — but ordering is only guaranteed within an instance). Recording **deletions** are not mirrored yet (the legacy delete path also removes Cloudinary assets; mirroring deletes belongs with the read cutover so a mirrored-but-not-deleted row cannot cause a false "missing" signal) — the importer reconciles this. `is_admin` still comes from `ADMIN_EMAILS`. Transcripts and AI output are not mirrored (they are rewritten wholesale by the pipeline in a later phase).
+
 ## 16. Legacy importer (delivered by T-104)
 
 **Purpose.** Move existing application state out of the legacy JSON stores and into PostgreSQL, so the new stack has real data to run against. It is an **operator-run migration tool**: nothing in the application imports it — not startup, requests, cron or workers — and it changes no runtime behaviour. The legacy app keeps running on JSON/Cloudinary until a later cutover phase.

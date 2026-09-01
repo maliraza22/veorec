@@ -1,5 +1,8 @@
 const fs = require('fs');
 const path = require('path');
+// T-105: mirror successful user writes into PostgreSQL. Legacy stays
+// authoritative; the mirror is a no-op unless PG_DUAL_WRITE=true.
+const dualwrite = require('./dualwrite');
 
 // DATA_DIR points to a persistent volume in production (Railway volume mounted
 // at /data). Falls back to the app directory for local dev. This is critical:
@@ -29,6 +32,8 @@ module.exports = {
     const rows = load();
     rows.push(user);
     save(rows);
+    dualwrite.user(user);
+    return user;
   },
   update(id, fields) {
     const rows = load();
@@ -36,6 +41,7 @@ module.exports = {
     if (i === -1) return null;
     rows[i] = { ...rows[i], ...fields };
     save(rows);
+    dualwrite.user(rows[i]);
     return rows[i];
   },
   remove(id) {

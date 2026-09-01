@@ -14,6 +14,7 @@
 //   createdAt, updatedAt
 // }
 const { createKeyedStore } = require('./store');
+const dualwrite = require('./dualwrite');   // T-105 PostgreSQL mirror (flag-gated)
 
 const store = createKeyedStore('subscriptions.json');
 
@@ -39,7 +40,7 @@ module.exports = {
 
   upsert(userId, fields) {
     const now = Date.now();
-    return store.update(userId, (existing) => ({
+    const saved = store.update(userId, (existing) => ({
       id: existing?.id || `sub_${userId}`,
       userId,
       createdAt: existing?.createdAt || now,
@@ -47,6 +48,8 @@ module.exports = {
       ...fields,
       updatedAt: now,
     }));
+    dualwrite.subscription(userId, saved);
+    return saved;
   },
 
   /** True if this subscription currently grants paid access. */

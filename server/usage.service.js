@@ -13,6 +13,7 @@
 // }
 // ─────────────────────────────────────────────────────────────────────────────
 const { createKeyedStore } = require('./store');
+const dualwrite = require('./dualwrite');   // T-105 PostgreSQL mirror (flag-gated)
 
 const store = createKeyedStore('usage.json');
 
@@ -43,7 +44,7 @@ function get(userId) {
  * @param {{ bytes?: number, videos?: number, seconds?: number, upload?: boolean }} delta
  */
 function updateUsage(userId, delta = {}) {
-  return store.update(userId, (cur) => {
+  const updated = store.update(userId, (cur) => {
     const u = cur || blank(userId);
     // roll the monthly window
     const period = currentPeriod();
@@ -57,6 +58,10 @@ function updateUsage(userId, delta = {}) {
     if (delta.upload) u.monthlyUploads = (u.monthlyUploads || 0) + 1;
     return u;
   });
+  // Mirrored as a SNAPSHOT only — PostgreSQL usage is not an enforcement input
+  // during T-105 (quota enforcement is T-306).
+  dualwrite.usage(userId, updated);
+  return updated;
 }
 
 /**

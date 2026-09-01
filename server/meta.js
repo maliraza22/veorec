@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const dualwrite = require('./dualwrite');   // T-105 PostgreSQL mirror (flag-gated)
 
 // Stored on the persistent volume so engagement/sharing data survives redeploys.
 const DATA_DIR = process.env.DATA_DIR || __dirname;
@@ -91,6 +92,7 @@ const notifReads = {
     const all = loadJSON(NOTIF_READ_FILE, {});
     all[userId] = at;
     saveJSON(NOTIF_READ_FILE, all);
+    dualwrite.notificationRead(userId, at);
     return at;
   },
 };
@@ -104,6 +106,7 @@ const folders = {
     const all = loadJSON(FOLDER_FILE, []);
     all.push(folder);
     saveJSON(FOLDER_FILE, all);
+    dualwrite.folder(folder);
     return folder;
   },
   get(id) {
@@ -115,12 +118,14 @@ const folders = {
     if (i === -1) return null;
     all[i] = { ...all[i], ...fields };
     saveJSON(FOLDER_FILE, all);
+    dualwrite.folder(all[i]);
     return all[i];
   },
   remove(id, userId) {
     let all = loadJSON(FOLDER_FILE, []);
     all = all.filter(f => !(f.id === id && f.userId === userId));
     saveJSON(FOLDER_FILE, all);
+    dualwrite.folderDeleted(id, userId);
   },
 };
 

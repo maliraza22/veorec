@@ -42,8 +42,11 @@ const derivedId = (prefix, ...parts) =>
 
 const toDate = (ms) => (Number.isFinite(Number(ms)) && Number(ms) > 0 ? new Date(Number(ms)) : null);
 const str = (v, max) => (v == null ? null : String(v).slice(0, max));
-const numOrNull = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
-const numStr = (v) => (Number.isFinite(Number(v)) ? String(Number(v)) : null);
+// Null-safe: Number(null) === 0, so a naive isFinite check would turn "no
+// value" into a real 0 (corrupting trim points and timestamps).
+const nullish = (v) => v === null || v === undefined || v === '';
+const numOrNull = (v) => (nullish(v) || !Number.isFinite(Number(v)) ? null : Number(v));
+const numStr = (v) => (numOrNull(v) === null ? null : String(numOrNull(v)));
 
 /** Cloudinary public ids look like `screenrec/<userId>/<recordingId>`. */
 function parseLegacyPublicId(publicId) {

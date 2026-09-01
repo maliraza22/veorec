@@ -59,6 +59,13 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
     watch404Retry: 0,
     watchRecovered: 0,
     unhandledError: 0,
+    // T-105 PostgreSQL dual-write mirror. `dualWriteFailure` doubles as the
+    // "records needing reconciliation" signal for this process (each failure
+    // also appends a durable line to dual-write-failures.jsonl).
+    dualWriteAttempt: 0,
+    dualWriteSuccess: 0,
+    dualWriteFailure: 0,
+    dualWriteRetryable: 0,
   };
   const durations = [];       // successful-upload handler durations (ms)
   const misses = new Map();   // recordingId -> { count, firstAt, lastAt }
@@ -150,6 +157,14 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
       kpi: 'kpi_snapshot',
       uptimeSec: Math.round((Date.now() - startedAt) / 1000),
       counters: { ...counters },
+      dualWrite: {
+        attempts: counters.dualWriteAttempt,
+        successRatePct: counters.dualWriteAttempt
+          ? +((counters.dualWriteSuccess / counters.dualWriteAttempt) * 100).toFixed(2) : null,
+        failures: counters.dualWriteFailure,
+        retryableFailures: counters.dualWriteRetryable,
+        reconciliationPending: counters.dualWriteFailure,   // journaled for repair
+      },
       upload: {
         successRatePct: decided ? +((counters.uploadSuccess / decided) * 100).toFixed(2) : null,          // reliability (policy rejections excluded)
         acceptRatePct: withPolicy ? +((counters.uploadSuccess / withPolicy) * 100).toFixed(2) : null,     // funnel incl. plan rejections
@@ -170,6 +185,7 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
 
   return {
     uploadStarted, uploadFinished, watchMiss, watchHit, requestError, snapshot,
+    counters,                                  // mutated by the dual-write mirror
     _counters: counters,                       // test introspection only
     _stop() { if (interval) clearInterval(interval); },
   };

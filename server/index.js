@@ -4,6 +4,9 @@ const { logger, httpLogger, initSentry, captureException } = require('./log');
 initSentry();
 // Baseline KPI capture (T-003) — counters + structured events, no behavior change.
 const kpi = require('./kpi').initKpi(logger);
+// T-105: PostgreSQL dual-write mirror. Disabled unless PG_DUAL_WRITE=true;
+// the legacy JSON/Cloudinary path stays authoritative either way.
+const dualwrite = require('./dualwrite').configure({ logger, counters: kpi.counters });
 
 const express = require('express');
 const cors = require('cors');
@@ -308,6 +311,11 @@ if (!USE_CLOUDINARY) {
       filename: req.file.filename, size: sizeBytes,
       duration: durationSec, created_at: Date.now() });
     usageService.updateUsage(req.userId, { bytes: sizeBytes, videos: 1, seconds: durationSec, upload: true });
+    dualwrite.recording({
+      legacyId: id, legacyUserId: req.userId, title: title || 'Untitled Recording',
+      duration: durationSec, sizeBytes, createdAt: new Date(),
+      media: { provider: 'local_disk', publicId: req.file.filename },
+    }, {}, { requestId: req.id });
     const base = process.env.PUBLIC_URL || `http://localhost:${PORT}`;
     kpi.uploadFinished(req, 'success', { sizeBytes });
     res.json({ id, url: `${base}/watch/${id}` });
@@ -452,6 +460,16 @@ if (!USE_CLOUDINARY) {
         upload: true,
       });
 
+      dualwrite.recording({
+        legacyId: id, legacyUserId: req.userId, title: recTitle,
+        duration: Math.round(result.duration || durationSec) || null,
+        sizeBytes: result.bytes || sizeBytes,
+        width: result.width || null, height: result.height || null, createdAt: new Date(),
+        // Legacy media location for the future R2 backfill (T-204). Cloudinary
+        // remains legacy-only: nothing new is built on it here.
+        media: { provider: 'cloudinary', publicId: result.public_id, url: result.secure_url,
+          bytes: result.bytes || null, duration: result.duration || null, format: result.format || null },
+      }, {}, { requestId: req.id });
       const base = process.env.PUBLIC_URL || `https://${req.get('host')}`;
       const clientBase = process.env.CLIENT_URL || base;
       kpi.uploadFinished(req, 'success', { sizeBytes: result.bytes || sizeBytes });
@@ -608,7 +626,8 @@ if (!USE_CLOUDINARY) {
       // Source of truth for reads = meta.json (instant). Cloudinary context is
       // updated too as a durable mirror, but its search index lags, so we never
       // rely on it for display (that was the "rename reverts on refresh" bug).
-      meta.set(req.params.id, { title });
+      const metaAfterRename = meta.set(req.params.id, { title });
+      dualwrite.recordingMeta(req.params.id, req.userId, metaAfterRename, {}, { requestId: req.id });
       await cloudinary.uploader.add_context(
         buildContext({ title }),
         [`screenrec/${req.userId}/${req.params.id}`],
@@ -732,6 +751,8 @@ app.post('/api/watch/:id/view', async (req, res) => {
     }
     return m;
   });
+  dualwrite.view(req.params.id, key, { viewerUserId: viewer ? `usr_${viewer.id}` : null, isOwner: false },
+    { requestId: req.id });
   res.json({ views: updated.views });
 });
 
@@ -745,6 +766,7 @@ app.post('/api/watch/:id/lead', (req, res) => {
     if (!m.leads.some(l => l.email === email)) m.leads = [{ email, name, at: Date.now() }, ...m.leads].slice(0, 1000);
     return m;
   });
+  dualwrite.lead(req.params.id, { email, name, at: Date.now() }, { requestId: req.id });
   res.json({ ok: true });
 });
 
@@ -803,6 +825,7 @@ app.post('/api/watch/:id/react', (req, res) => {
     m.reactions.push({ emoji, name, t: Number.isFinite(t) ? Math.floor(t) : null, at: Date.now() });
     return m;
   });
+  dualwrite.reaction(req.params.id, updated.reactions[updated.reactions.length - 1], { requestId: req.id });
   res.json({ reactions: updated.reactions });
 });
 
@@ -815,6 +838,7 @@ app.post('/api/watch/:id/comment', (req, res) => {
   if (viewer) name = viewer.name;
   const comment = { id: uuidv4(), name, text, t: Number(req.body.t) || null, at: Date.now() };
   meta.update(req.params.id, m => { m.comments.push(comment); return m; });
+  dualwrite.comment(req.params.id, comment, { requestId: req.id });
   res.json(comment);
 });
 
@@ -1031,6 +1055,7 @@ app.patch('/api/recordings/:id/meta', requireAuth, async (req, res) => {
   }
 
   const updated = meta.set(req.params.id, fields);
+  dualwrite.recordingMeta(req.params.id, req.userId, updated, {}, { requestId: req.id });
   res.json({
     title: typeof title === 'string' ? title.trim() : undefined,
     description: updated.description, cta: updated.cta, privacy: updated.privacy,
