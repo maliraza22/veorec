@@ -298,6 +298,53 @@ Practical notes discovered while implementing:
 - `NULL` variants would defeat a plain unique index, so "one READY asset per (recording, kind, variant)" is enforced with `coalesce(variant,'')` in a partial unique index.
 - The `users` email uniqueness is partial (`WHERE deleted_at IS NULL`) so a soft-deleted account frees its address for re-registration — verified by test.
 
+## 18. Reconciliation safety net (delivered by T-106)
+
+> This is the mechanism that **proves** PostgreSQL stays convergent with the authoritative legacy system during the migration — and the gate that must be clean before authority ever moves. It is not merely a status report.
+
+**Detection first.** `--report` is the default and performs **zero database writes**; it is what the nightly job runs. Repair is explicit (`--repair`), additive and idempotent — it re-applies the same `mirrors.js` mappers the importer and dual-write use. **No run ever hard-deletes PostgreSQL data.**
+
+### What it detects
+
+| Check | Meaning | Severity | Auto-repairable |
+|---|---|---|---|
+| `legacy_missing_in_pg` | a legacy record has no mirrored row | warning | ✅ upsert |
+| `field_drift` | both sides exist but important columns differ (title, privacy, folder, duration, size, archived, email, name, plan, usage counters) | warning (**critical** for subscriptions — entitlement drift) | ✅ upsert |
+| `stale_in_pg` | a PostgreSQL row whose legacy record is gone — i.e. an **unmirrored delete** | critical | ❌ never |
+| `failed_dual_write` | journalled mirror failures still missing from PostgreSQL | warning | ✅ via import |
+| `orphaned_child` | comment/reaction/view/lead/asset whose parent recording is missing | critical | ❌ reported |
+| `mapping_inconsistency` | id not derivable from a legacy id, or ownership that disagrees with the legacy owner | critical | ❌ never |
+| `unsafe` | needs human judgement (duplicate emails, unresolvable ownership, PG-soft-deleted-but-legacy-live) | critical/warning | ❌ never |
+
+### Safety properties
+
+- **Deletes are never automatic.** A `stale_in_pg` finding is reported for a human decision. The single opt-in that acts on them, `--repair --allow-stale-soft-delete`, only **soft-deletes** (sets `deleted_at`, fully reversible) and is refused outside repair mode. A hard delete is not implemented at all.
+- **Ownership is never rewritten.** A recording whose PostgreSQL owner disagrees with the legacy owner is flagged critical and left untouched — the data may belong to a different user.
+- **Delete detection is skipped, not guessed.** Recognising a deleted recording requires enumerating the legacy side, which needs the media listing. Without it the check is **skipped with a loud note** rather than run on incomplete input — otherwise every live production recording would be reported as stale, inviting an operator to destroy real data.
+- **Ambiguity is surfaced, never merged.** Duplicate legacy emails and unresolvable owners are reported as `unsafe`; nothing is auto-merged.
+
+### Usage
+
+```bash
+cd db
+# nightly (read-only; exit 0 clean, 2 findings, 1 error)
+npm run db:reconcile -- --data-dir=/path --media-listing=media.json --json
+
+# repair the safe classes (missing rows, drift) — additive, idempotent
+npm run db:reconcile -- --data-dir=/path --media-listing=media.json --repair
+
+# only after a human has reviewed the stale list:
+npm run db:reconcile -- --data-dir=/path --media-listing=media.json --repair --allow-stale-soft-delete
+```
+
+Schedule the report-only form from cron on the API host (**not** an in-process timer — the legacy server gains no new runtime behaviour), export the media listing first so delete detection is active, and alert on exit code 2. Once BullMQ exists (T-601) this becomes a repeatable job; the CLI contract stays the same.
+
+### Migration gate
+
+Before any read cutover, the report must be **clean on consecutive nightly runs**: no missing rows, no drift, no stale rows, no orphans, no mapping inconsistencies, and an empty dual-write journal. Until then PostgreSQL is a mirror and the legacy system remains authoritative.
+
+**Known limitations at T-106.** Comparison loads both sides fully — fine at current scale (thousands of rows), but a future dataset will need keyset batching. Comment/reaction/view/lead rows are checked for orphaning and count parity but not field-by-field (they are append-only and immutable in the legacy system). The stale-user check reports any PostgreSQL user absent from `users.json`, which includes accounts created directly in PostgreSQL — expected to be none during the migration.
+
 ## 17. Dual-write mirror (delivered by T-105)
 
 > **T-105 does NOT make PostgreSQL authoritative.** The legacy JSON/Cloudinary application remains the source of truth for every read and every decision. PostgreSQL is a *secondary mirror* that is written after a legacy write already succeeded, and nothing in the application reads from it.
@@ -372,7 +419,14 @@ KPI counters `dualWriteAttempt / dualWriteSuccess / dualWriteFailure / dualWrite
 
 **Rollback is immediate and total: set `PG_DUAL_WRITE=false` (or remove it) and restart.** The legacy path is untouched by the flag, so the application continues exactly as before; PostgreSQL simply stops receiving updates, and the importer can catch it up later. No data is lost by disabling it.
 
-**Known limitations at T-105.** Mirrors are single-process: a multi-instance deployment mirrors from each instance independently (safe — all writes are idempotent — but ordering is only guaranteed within an instance). Recording **deletions** are not mirrored yet (the legacy delete path also removes Cloudinary assets; mirroring deletes belongs with the read cutover so a mirrored-but-not-deleted row cannot cause a false "missing" signal) — the importer reconciles this. `is_admin` still comes from `ADMIN_EMAILS`. Transcripts and AI output are not mirrored (they are rewritten wholesale by the pipeline in a later phase).
+**Known limitations at T-105.** Mirrors are single-process: a multi-instance deployment mirrors from each instance independently (safe — all writes are idempotent — but ordering is only guaranteed within an instance).
+
+> **⚠ Forward requirement — the FIFO lane is a migration bridge, not the end state.** With several API instances behind the VPS, each process keeps its own lane, so a child mutation handled by instance B can reach PostgreSQL before its parent handled by instance A:
+> ```
+> API instance A ──► FIFO A ─┐
+> API instance B ──► FIFO B ─┴─► PostgreSQL   (no cross-instance ordering)
+> ```
+> This is tolerable *only* while PostgreSQL is a mirror and the T-106 reconciliation safety net is running, because reconciliation converges any out-of-order or dropped write. **Before PostgreSQL becomes authoritative, the per-process lane must be replaced by a durable distributed outbox** — the transactional-outbox rows already specified in `10` §2, drained by Redis/BullMQ workers (T-601), which gives cross-instance ordering and at-least-once delivery that survives process death. Treat this as a blocking prerequisite of the read cutover, not an optimisation. Recording **deletions** are not mirrored yet (the legacy delete path also removes Cloudinary assets; mirroring deletes belongs with the read cutover so a mirrored-but-not-deleted row cannot cause a false "missing" signal) — the importer reconciles this. `is_admin` still comes from `ADMIN_EMAILS`. Transcripts and AI output are not mirrored (they are rewritten wholesale by the pipeline in a later phase).
 
 ## 16. Legacy importer (delivered by T-104)
 

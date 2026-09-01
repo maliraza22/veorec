@@ -1,141 +1,99 @@
 #!/usr/bin/env node
 // ─────────────────────────────────────────────────────────────────────────────
-// db:reconcile — find and repair PostgreSQL mirrors that failed (T-105)
+// db:reconcile — the migration safety net (T-106)
 //
 //   cd db
-//   npm run db:reconcile -- --data-dir=/path/to/volume            # report only
-//   npm run db:reconcile -- --data-dir=/path --prune               # drop healed entries
+//   npm run db:reconcile -- --data-dir=/path --media-listing=media.json
+//   npm run db:reconcile -- --data-dir=/path --media-listing=media.json --repair
 //
-// The dual-write mirror appends every failed/skipped mirror to
-// dual-write-failures.jsonl (a durable file that works even when PostgreSQL is
-// the thing that is down). This tool answers "which legacy writes are missing
-// from PostgreSQL, and are they still missing?".
+// DEFAULT IS REPORT-ONLY: it performs zero database writes. This is what the
+// nightly job runs. Repair is opt-in, additive, and idempotent; it can never
+// delete PostgreSQL data. Records that appear deleted in the legacy system are
+// reported for a human decision, and the one opt-in that touches them
+// (--allow-stale-soft-delete) only SOFT-deletes, which is reversible.
 //
-// REPAIR is deliberately NOT a second import path: the T-104 importer is
-// idempotent and converges, so repairing is `npm run db:import -- --apply`.
-// This tool verifies which journal entries are now satisfied and can prune
-// them, so the journal shrinks to only genuinely-outstanding work.
-//
-// Safe to re-run: it only reads PostgreSQL and rewrites its own journal.
+// Exit codes: 0 clean · 2 findings (nightly alert) · 1 error.
 // ─────────────────────────────────────────────────────────────────────────────
 'use strict';
 
 const fs = require('fs');
 const path = require('path');
-const { sql } = require('drizzle-orm');
 const { loadEnv } = require('../env');
 const { createPool } = require('../pool');
 const { createClient } = require('../client');
-const { idFor } = require('../legacy-ids');
+const { reconcile } = require('../migration/reconciler');
 
-// entity → how to check whether the mirrored row now exists.
-const CHECKS = {
-  users: (id) => ({ table: 'users', column: 'id', value: idFor('usr', id) }),
-  folders: (id) => ({ table: 'folders', column: 'id', value: idFor('fld', id) }),
-  recordings: (id) => ({ table: 'recordings', column: 'id', value: idFor('rec', id) }),
-  comments: (id) => ({ table: 'comments', column: 'id', value: idFor('cmt', id) }),
-  usage: (id) => ({ table: 'usage', column: 'user_id', value: idFor('usr', id) }),
-  subscriptions: (id) => ({ table: 'subscriptions', column: 'user_id', value: idFor('usr', id) }),
-  contacts: (id) => ({ table: 'contacts', column: 'id', value: idFor('ctc', id) }),
-  notification_reads: (id) => ({ table: 'notification_reads', column: 'user_id', value: idFor('usr', id) }),
-  // Reactions / views / leads use content-derived ids that the journal does not
-  // carry, so they are reported as "verify via import" rather than guessed.
-};
+const USAGE = `
+db:reconcile — prove PostgreSQL is convergent with the legacy system (T-106)
+
+  --data-dir=<dir>            legacy JSON directory (required)
+  --media-listing=<file>      media listing export; REQUIRED to detect deletes
+  --report                    detect only, zero writes (DEFAULT)
+  --repair                    additionally apply additive, idempotent repairs
+  --allow-stale-soft-delete   with --repair: SOFT-delete PostgreSQL rows whose
+                              legacy record is gone (reversible; never a hard
+                              delete, never in a nightly run)
+  --json                      machine-readable report
+  --quiet                     print only the summary line
+
+Nothing is ever hard-deleted from PostgreSQL by this tool.
+`;
 
 function parseArgs(argv) {
-  const args = { dataDir: null, prune: false, json: false };
-  for (const a of argv.slice(2)) {
-    if (a === '--prune') args.prune = true;
-    else if (a === '--json') args.json = true;
-    else if (a.startsWith('--data-dir=')) args.dataDir = a.slice('--data-dir='.length);
-    else if (a === '--help' || a === '-h') args.help = true;
-    else throw new Error(`unknown argument: ${a}`);
+  const a = { dataDir: null, mediaListing: null, mode: 'report', allowStaleSoftDelete: false, json: false, quiet: false };
+  for (const arg of argv.slice(2)) {
+    if (arg === '--report') a.mode = 'report';
+    else if (arg === '--repair') a.mode = 'repair';
+    else if (arg === '--allow-stale-soft-delete') a.allowStaleSoftDelete = true;
+    else if (arg === '--json') a.json = true;
+    else if (arg === '--quiet') a.quiet = true;
+    else if (arg.startsWith('--data-dir=')) a.dataDir = arg.slice('--data-dir='.length);
+    else if (arg.startsWith('--media-listing=')) a.mediaListing = arg.slice('--media-listing='.length);
+    else if (arg === '--help' || arg === '-h') a.help = true;
+    else throw new Error(`unknown argument: ${arg}`);
   }
-  return args;
+  return a;
 }
 
 async function main() {
   const args = parseArgs(process.argv);
-  if (args.help || !args.dataDir) {
-    console.log('\ndb:reconcile — inspect the dual-write failure journal\n\n' +
-      '  --data-dir=<dir>   directory holding dual-write-failures.jsonl (required)\n' +
-      '  --prune            rewrite the journal without entries already satisfied\n' +
-      '  --json             machine-readable output\n');
-    process.exit(args.help ? 0 : 1);
+  if (args.help || !args.dataDir) { console.log(USAGE); process.exit(args.help ? 0 : 1); }
+  if (!fs.existsSync(args.dataDir)) throw new Error(`--data-dir does not exist: ${args.dataDir}`);
+  if (args.mediaListing && !fs.existsSync(args.mediaListing)) {
+    throw new Error(`--media-listing does not exist: ${args.mediaListing}`);
   }
-
-  const journalPath = path.join(args.dataDir, 'dual-write-failures.jsonl');
-  if (!fs.existsSync(journalPath)) {
-    console.log(`[reconcile] no journal at ${journalPath} — nothing to reconcile`);
-    return;
-  }
-
-  const lines = fs.readFileSync(journalPath, 'utf8').split('\n').filter((l) => l.trim());
-  const entries = [];
-  let malformed = 0;
-  for (const l of lines) {
-    try { entries.push(JSON.parse(l)); } catch { malformed++; }
+  if (args.allowStaleSoftDelete && args.mode !== 'repair') {
+    throw new Error('--allow-stale-soft-delete requires --repair');
   }
 
   const env = loadEnv();
-  const pool = createPool({ env, max: 2, applicationName: 'veorec-reconcile' });
+  const pool = createPool({ env, max: 3, statementTimeoutMs: 0, applicationName: 'veorec-reconcile' });
   const db = createClient(pool);
-  console.log(`[reconcile] env=${env.appEnv} target=${env.databaseUrlRedacted}`);
-  console.log(`[reconcile] journal: ${entries.length} entr${entries.length === 1 ? 'y' : 'ies'}` +
-    (malformed ? ` (+${malformed} malformed line(s))` : ''));
 
-  const resolved = [];
-  const outstanding = [];
-  const unverifiable = [];
+  console.log(`[reconcile] env=${env.appEnv} target=${env.databaseUrlRedacted}`);
+  console.log(`[reconcile] source=${args.dataDir}${args.mediaListing ? ` media=${path.basename(args.mediaListing)}` : ''}`);
+  console.log(args.mode === 'report'
+    ? '[reconcile] REPORT mode — no database writes will be performed'
+    : `[reconcile] REPAIR mode — additive repairs only${args.allowStaleSoftDelete ? ' (+ soft-delete of stale rows)' : ''}`);
+  if (!args.mediaListing) {
+    console.log('[reconcile] NOTE: without --media-listing, deleted-recording detection is skipped (see report)');
+  }
 
   try {
-    for (const e of entries) {
-      const check = CHECKS[e.entity];
-      if (!check || !e.legacyId) { unverifiable.push(e); continue; }
-      const { table, column, value } = check(e.legacyId);
-      const res = await db.execute(sql.raw(
-        `SELECT 1 FROM ${table} WHERE ${column} = '${String(value).replace(/'/g, "''")}' LIMIT 1`));
-      ((res.rows || res).length ? resolved : outstanding).push(e);
-    }
+    const report = await reconcile({
+      db, dataDir: args.dataDir, mediaListingFile: args.mediaListing,
+      mode: args.mode, allowStaleSoftDelete: args.allowStaleSoftDelete,
+    });
 
-    const byEntity = {};
-    for (const e of outstanding) byEntity[e.entity] = (byEntity[e.entity] || 0) + 1;
+    if (args.json) console.log(JSON.stringify(report.toJSON(), null, 2));
+    else if (!args.quiet) console.log(report.format());
 
-    const report = {
-      journal: journalPath,
-      total: entries.length,
-      resolved: resolved.length,
-      outstanding: outstanding.length,
-      unverifiable: unverifiable.length,
-      outstandingByEntity: byEntity,
-      malformedLines: malformed,
-    };
+    const n = report.findings.length;
+    const manual = report.findings.filter((f) => !f.repairable).length;
+    console.log(`[reconcile] ${report.clean ? 'CONVERGENT' : `${n} finding(s), ${manual} needing a human decision`}` +
+      (report.repairs.length ? ` · ${report.repairs.length} repair(s) applied` : ''));
 
-    if (args.json) {
-      console.log(JSON.stringify({ ...report, outstandingEntries: outstanding.slice(0, 200) }, null, 2));
-    } else {
-      console.log('');
-      console.log(`  already repaired : ${resolved.length}`);
-      console.log(`  still missing    : ${outstanding.length}`);
-      console.log(`  unverifiable     : ${unverifiable.length}  (content-derived ids — confirm via db:import)`);
-      for (const [entity, n] of Object.entries(byEntity)) console.log(`      ${entity}: ${n}`);
-      console.log('');
-      if (outstanding.length || unverifiable.length) {
-        console.log('  To repair, re-run the idempotent importer against the same data directory:');
-        console.log(`      npm run db:import -- --data-dir=${args.dataDir} --apply`);
-        console.log('  Then re-run this command with --prune.');
-      } else {
-        console.log('  Nothing outstanding — every journaled mirror is now present in PostgreSQL.');
-      }
-    }
-
-    if (args.prune && resolved.length) {
-      const keep = entries.filter((e) => !resolved.includes(e));
-      fs.writeFileSync(journalPath, keep.map((e) => JSON.stringify(e)).join('\n') + (keep.length ? '\n' : ''));
-      console.log(`[reconcile] pruned ${resolved.length} repaired entr${resolved.length === 1 ? 'y' : 'ies'} from the journal`);
-    }
-
-    if (outstanding.length) process.exitCode = 2;
+    if (!report.clean) process.exitCode = 2;
   } finally {
     await pool.end().catch(() => {});
   }

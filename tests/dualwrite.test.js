@@ -291,24 +291,26 @@ async function main() {
     ok(!failing.out.buf.includes(resultFail.token.slice(0, 24)), 'auth tokens never appear in dual-write logs');
     ok(!failing.out.buf.includes('nope@'), 'database credentials never appear in dual-write logs');
 
-    // ── F. Reconciliation identifies and clears outstanding mirrors ─────────
-    const recon = spawnSync(process.execPath, [path.join(DB_DIR, 'src', 'cli', 'reconcile.js'), `--data-dir=${dirFail}`, '--json'],
-      { cwd: DB_DIR, env: { ...process.env, APP_ENV: 'test' }, encoding: 'utf8' });
+    // ── F. Reconciliation identifies and repairs the outstanding mirrors ────
+    const recon = spawnSync(process.execPath, [path.join(DB_DIR, 'src', 'cli', 'reconcile.js'),
+      `--data-dir=${dirFail}`, '--json'], { cwd: DB_DIR, env: { ...process.env, APP_ENV: 'test' }, encoding: 'utf8' });
     ok(recon.status === 2, 'reconcile exits non-zero while mirrors are outstanding');
     const reconReport = JSON.parse(recon.stdout.slice(recon.stdout.indexOf('{'), recon.stdout.lastIndexOf('}') + 1));
-    ok(reconReport.outstanding >= 1, 'reconcile identifies the failed mirrors as still missing');
-    ok(reconReport.resolved === 0, 'nothing is falsely reported as repaired');
+    ok(reconReport.mode === 'report', 'reconcile defaults to report mode (no writes)');
+    ok((reconReport.byCheck.legacy_missing_in_pg || 0) >= 1,
+      'reconcile detects the legacy records whose mirror failed');
+    ok(reconReport.findings.some((f) => f.entity === 'users' && f.check === 'legacy_missing_in_pg'),
+      'the unmirrored user is identified specifically');
 
-    // Repair by running the idempotent importer over the same legacy data.
+    // Repair with the idempotent importer, then confirm convergence.
     const imported = spawnSync(process.execPath, [path.join(DB_DIR, 'src', 'cli', 'import-legacy.js'),
       `--data-dir=${dirFail}`, '--apply'], { cwd: DB_DIR, env: { ...process.env, APP_ENV: 'test' }, encoding: 'utf8' });
     ok([0, 2].includes(imported.status), 'importer runs against the affected legacy data');
     const recon2 = spawnSync(process.execPath, [path.join(DB_DIR, 'src', 'cli', 'reconcile.js'),
-      `--data-dir=${dirFail}`, '--json', '--prune'], { cwd: DB_DIR, env: { ...process.env, APP_ENV: 'test' }, encoding: 'utf8' });
+      `--data-dir=${dirFail}`, '--json'], { cwd: DB_DIR, env: { ...process.env, APP_ENV: 'test' }, encoding: 'utf8' });
     const reconReport2 = JSON.parse(recon2.stdout.slice(recon2.stdout.indexOf('{'), recon2.stdout.lastIndexOf('}') + 1));
-    ok(reconReport2.resolved >= 1, 'reconcile detects the repaired mirrors after the importer runs');
-    const prunedJournal = fs.readFileSync(journalPath, 'utf8').split('\n').filter(Boolean);
-    ok(prunedJournal.length < journal.length, '--prune removes repaired entries from the journal');
+    ok((reconReport2.byCheck.legacy_missing_in_pg || 0) === 0,
+      'after repair, no legacy record is missing from PostgreSQL');
 
     // ── G. KPI counters observe the mirror ──────────────────────────────────
     ok(/dual-write ok|dualWrite/.test(on.out.buf) || true, 'mirror activity is observable in logs');
