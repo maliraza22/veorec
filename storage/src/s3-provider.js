@@ -292,6 +292,9 @@ class S3StorageProvider {
         throw new InvalidRequestError('contentLength must be a non-negative integer');
       }
     }
+    const signableHeaders = new Set(['host']);
+    if (options.contentLength !== undefined) signableHeaders.add('content-length');
+    if (options.contentType) signableHeaders.add('content-type');
     try {
       return await getSignedUrl(this.client, new PutObjectCommand({
         Bucket: this.bucket,
@@ -303,9 +306,13 @@ class S3StorageProvider {
         expiresIn,
         // Sign Content-Length/Content-Type when present so the client cannot
         // drop or alter them; unsignable headers would make the limit advisory.
-        ...(options.contentLength !== undefined || options.contentType
-          ? { signableHeaders: new Set(['host', 'content-length', 'content-type']) }
-          : {}),
+        //
+        // The set must contain EXACTLY the headers being signed. Signing a
+        // header the caller was never given (e.g. content-type when only a
+        // byte ceiling was requested) makes the provider reject any client
+        // that omits it — "headers present in the request which were not
+        // signed" — which breaks the ceiling instead of enforcing it.
+        ...(signableHeaders.size > 1 ? { signableHeaders } : {}),
       });
     } catch (err) {
       throw mapStorageError(err, { operation: 'getSignedUploadUrl', key });

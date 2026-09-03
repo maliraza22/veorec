@@ -257,8 +257,14 @@ async function multipartLifecycle(provider, track) {
   ok(await provider.objectExists(abortKey) === false, 'an aborted multipart upload leaves no object');
 
   // Abort must be safely repeatable — cleanup runs more than once.
-  const second = await provider.abortMultipartUpload(abortKey, aborted.uploadId);
-  ok(second.alreadyGone === true, 'aborting an already-aborted upload succeeds (repeatable)');
+  // The CONTRACT is "resolves without throwing", not any particular response
+  // shape: AWS reports NoSuchUpload for an unknown upload while MinIO returns
+  // 204, so asserting `alreadyGone` would pin a provider-specific detail and
+  // make this suite non-portable between the two stores it must both verify.
+  const second = await arejects(() => provider.abortMultipartUpload(abortKey, aborted.uploadId));
+  ok(second === null, 'aborting an already-aborted upload succeeds (repeatable)');
+  const bogus = await arejects(() => provider.abortMultipartUpload(abortKey, 'no-such-upload-id'));
+  ok(bogus === null, 'aborting an unknown upload id succeeds (repeatable)');
 
   // Parts of an aborted upload are gone.
   const goneParts = await arejects(() => provider.listParts(abortKey, aborted.uploadId));
