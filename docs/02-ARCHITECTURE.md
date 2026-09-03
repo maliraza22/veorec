@@ -241,6 +241,94 @@ browser-facing upload-session API (T-301) · quota reservation (T-306) ·
 processing (Phase 5) · **no application code calls this package yet**, and no
 legacy behaviour changed.
 
+### 2.7.2 Bucket policy — private, lifecycle, CORS (delivered by T-202)
+
+Bucket administration is the **control plane**. It is deliberately separate from
+`StorageProvider`, which owns object bytes: `PutBucketCors` and
+`PutBucketLifecycleConfiguration` have no application-level meaning, and giving
+the provider a `putBucketCors()` would let any caller holding a provider
+reconfigure the bucket. So the SDK appears in exactly two files —
+`s3-provider.js` (data plane, used by application code) and `provisioner.js`
+(control plane, operator tooling) — and provisioning is **not exported from the
+application-facing surface**. A test asserts both halves.
+
+Policy is declared provider-neutrally in `storage/src/bucket-config.js` and
+applied by `storage/src/cli/provision-storage.js`:
+
+```bash
+cd storage
+npm run storage:provision              # CHECK — read-only (default)
+npm run storage:provision -- --apply   # write CORS + lifecycle
+```
+
+Check is the default, for the same reason `db:reconcile` reports by default:
+one of these rules deletes objects on a timer, so it is never applied as a side
+effect of inspecting a bucket. The tool **never creates a bucket** — creating
+production storage implicitly, with defaults nobody reviewed, is not a tool's
+decision — and never deletes an object.
+
+**Private bucket.** Verified via `GetBucketPolicyStatus`; a publicly-readable
+bucket is a hard failure, since every recording would be world-readable. All
+reads go through signed URLs (§2.7.1).
+
+**Lifecycle — two rules, and the split is the safety property.**
+
+| Rule | Scope | Effect |
+|---|---|---|
+| `veorec-abort-incomplete-multipart` | bucket-wide | abort incomplete multipart uploads after **48h** (2 days) |
+| `veorec-expire-uploads-tmp` | `uploads-tmp/` only | delete objects after 48h |
+
+The abort rule is bucket-wide **deliberately**: `AbortIncompleteMultipartUpload`
+acts only on uploads that were never completed and cannot touch a finished
+object, so it needs no prefix guard — and scoping it to `uploads-tmp/` would
+miss the uploads that matter, because §11 of `06` writes sources via multipart
+directly to `sources/`.
+
+Object **expiration** is confined to `uploads-tmp/`. `assertNoDurableExpiry()`
+refuses any configuration — generated or already on the bucket — whose expiring
+rule is bucket-wide or touches `sources/`, `derived/`, `audio/` or `renders/`.
+This matters because a lifecycle rule deletes user data on a timer with no
+application involvement and no undo; a misplaced prefix would destroy recordings
+weeks later with nothing reporting it.
+
+Lifecycle is a **backstop, not the mechanism**. The authoritative cleanup is the
+hourly expiry job (`06` §8), which also releases the quota reservation —
+something a lifecycle rule cannot do. Lifecycle is never a substitute for
+application-level deletion or quota accounting.
+
+**CORS.** The browser PUTs parts straight to R2 and GETs media straight from it,
+so the bucket carries its own policy. This is distinct from the API's CORS
+allowlist (`17` §4) — that governs calls to our endpoints, which is why `17` can
+call presigned PUTs "outside CORS concerns" without contradicting this section.
+
+| Field | Value | Why |
+|---|---|---|
+| `AllowedOrigins` | `STORAGE_CORS_ORIGINS`, explicit | **wildcards are refused** — a `*` origin on a private media bucket would let any page drive a presigned URL that leaked into it |
+| `AllowedMethods` | `GET`, `HEAD`, `PUT` | no `DELETE`/`POST` from a browser origin |
+| `AllowedHeaders` | `content-type`, `x-amz-checksum-crc32c` | `06` §9 integrity check |
+| `ExposeHeaders` | `ETag`, `x-amz-checksum-crc32c` | **not optional** — script reads each part's ETag to build the complete manifest (`06` §7); without it every browser-direct multipart upload fails at completion |
+| `MaxAgeSeconds` | `STORAGE_CORS_MAX_AGE` (3600) | preflight cache |
+
+`Content-Length` is deliberately **absent** from `AllowedHeaders`: it is a
+forbidden header name the browser sets itself, so listing it would mislead. The
+byte ceiling is enforced by the **signature** (§2.7.1), not by CORS. Deployed
+origins must be `https://` (or `chrome-extension://`), and staging/production
+have **no default origins** — `veorec.com` is never invented as a fallback.
+
+**Verification status.** The local MinIO (RELEASE.2025-09-07) implements neither
+`PutBucketCors` (`NotImplemented`) nor `AbortIncompleteMultipartUpload`
+(`InvalidArgument` on every payload shape). The provisioner therefore reports
+three-valued results — ok / mismatch / **unsupported** / failed — so a backend
+that cannot answer is never recorded as a pass. Consequently:
+
+- **Verified locally:** private-bucket check, unauthorized GET refused, the
+  `uploads-tmp/` expiry rule accepted and read back by a real S3 backend, and
+  the durable-prefix guard.
+- **Pending R2 (staging):** the 48h incomplete-multipart abort rule and the
+  whole CORS policy. Neither can be confirmed here, and a browser preflight is
+  needed to confirm CORS end-to-end. Run `storage:provision --apply` against a
+  staging bucket before T-203 mirrors real uploads.
+
 ### 2.8 CDN
 
 Cloudflare in front of R2 for derived media. Cache key includes the asset path, not the signature (use signed cookies or edge-verified tokens for public assets; for MVP, R2 presigned GETs with `Cache-Control` on public assets are acceptable — documented tradeoff in `12` §6).

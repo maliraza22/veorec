@@ -416,11 +416,24 @@ function boundaryTests() {
   ok(!JSON.stringify(require(path.join(STORAGE_DIR, 'package.json')).dependencies).match(/cloudinary/i),
     'the storage package declares no Cloudinary dependency');
 
-  // The SDK is confined to the implementation file — that is what makes the
-  // provider swappable without touching business logic.
-  const sdkUsers = sources.filter((f) => /@aws-sdk\//.test(text[f]));
-  ok(sdkUsers.length === 1 && sdkUsers[0] === 's3-provider.js',
-    `the AWS SDK is imported only by s3-provider.js (found: ${sdkUsers.join(', ') || 'none'})`);
+  // The SDK is confined to two files, and the split is deliberate:
+  //   s3-provider.js  DATA plane    - object bytes, used by application code
+  //   provisioner.js  CONTROL plane - bucket administration, operator tooling
+  // Bucket administration (PutBucketCors, PutBucketLifecycleConfiguration) has
+  // no application-level abstraction, and giving StorageProvider a
+  // putBucketCors() would let anyone holding a provider reconfigure the bucket.
+  // So the control plane keeps its own SDK import and is deliberately NOT part
+  // of the application-facing surface - asserted below.
+  const sdkUsers = sources.filter((f) => text[f].includes('@aws-sdk/')).sort();
+  ok(JSON.stringify(sdkUsers) === JSON.stringify(['provisioner.js', 's3-provider.js']),
+    `the AWS SDK is imported only by the provider and provisioner (found: ${sdkUsers.join(', ') || 'none'})`);
+  for (const pure of ['index.js', 'config.js', 'keys.js', 'errors.js', 'bucket-config.js']) {
+    ok(!text[pure].includes('@aws-sdk/'), `${pure} is SDK-free`);
+  }
+  // Application code must not provision a bucket through the public surface:
+  // the CLI imports provisioner.js directly, and nothing else may.
+  ok(!Object.keys(S).some((n) => /provision/i.test(n)),
+    'bucket provisioning is NOT exported from the application-facing surface');
 
   // One code path: construction may differ, behaviour may not.
   const behaviourBranch = /(if|\?)\s*\(?[^\n]*\bflavour\s*===/.test(text['s3-provider.js']);

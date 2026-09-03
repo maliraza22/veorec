@@ -25,7 +25,8 @@ R2 is **not** an application database. There is deliberately no
 ## Rules
 
 1. **Import from `@veorec/storage`, never `@aws-sdk/*`.** The SDK is confined to
-   `src/s3-provider.js`; a test asserts this. That confinement is what makes R2
+   `src/s3-provider.js` (data plane) and `src/provisioner.js` (control plane,
+   operator tooling only); a test asserts this. That confinement is what makes R2
    replaceable by B2/Wasabi/S3 without touching business logic.
 2. **Never build a key by hand** — use `keys.*`. Identifiers are validated before
    interpolation, and a client filename is never trusted as a path.
@@ -82,8 +83,9 @@ attached — the transport layer maps codes to responses (docs/18 §2).
 
 ```bash
 cd storage
-npm run test:unit       # 110 assertions, no infrastructure needed
+npm run test:unit       # 119 assertions, no infrastructure needed
 npm run test:contract   # needs MinIO or R2; skips loudly otherwise
+npm run test:buckets    # bucket policy; live section skips without an endpoint
 ```
 
 `test:contract` is the **abstract contract suite**: it imports no SDK and names
@@ -106,8 +108,45 @@ npm run test:contract
 `STORAGE_TESTS_REQUIRED=1` turns an unreachable endpoint into a failure (CI).
 The suite refuses to run when `APP_ENV=production`.
 
-## Not implemented by T-201
+## Bucket policy (T-202)
 
-Bucket provisioning/lifecycle/CORS (T-202) · upload mirroring (T-203) · backfill
-(T-204) · the browser upload-session API (T-301) · quota reservation (T-306) ·
-processing (Phase 5) · any application code calling this package.
+Bucket administration is the **control plane** and is deliberately not part of
+`StorageProvider`: giving the provider a `putBucketCors()` would let any caller
+holding one reconfigure the bucket. It is operator tooling.
+
+```bash
+cd storage
+npm run storage:provision              # CHECK - read-only (default)
+npm run storage:provision -- --apply   # write CORS + lifecycle
+```
+
+Check is the default because one of these rules deletes objects on a timer. The
+tool never creates a bucket and never deletes an object.
+
+| Rule | Scope | Effect |
+|---|---|---|
+| `veorec-abort-incomplete-multipart` | bucket-wide | abort incomplete multiparts after 48h |
+| `veorec-expire-uploads-tmp` | `uploads-tmp/` only | delete objects after 48h |
+
+Bucket-wide abort is safe: it only affects uploads that were never completed.
+Object **expiration** never leaves `uploads-tmp/` - `assertNoDurableExpiry()`
+refuses any rule that would expire `sources/`, `derived/`, `audio/` or
+`renders/`, or expire bucket-wide. Lifecycle is a backstop; the hourly expiry
+job (docs/06 8) is authoritative because it also releases the quota reservation.
+
+CORS allows `GET`/`HEAD`/`PUT` from `STORAGE_CORS_ORIGINS` only - wildcards are
+refused - and exposes `ETag`, without which browser-direct multipart uploads
+cannot complete. `Content-Length` is not listed: the byte ceiling is enforced by
+the signature, not by CORS.
+
+**MinIO cannot verify this.** It implements neither `PutBucketCors`
+(`NotImplemented`) nor `AbortIncompleteMultipartUpload` (`InvalidArgument`), so
+the provisioner reports those `unsupported` rather than passing. The CORS policy
+and the 48h abort rule are **PENDING R2 staging verification**.
+
+## Not implemented by T-201/T-202
+
+Upload mirroring (T-203) · backfill (T-204) · the browser upload-session API
+(T-301) · quota reservation (T-306) · processing (Phase 5) · any application
+code calling this package. No bucket is provisioned in production by T-202 —
+only the configuration and the tooling to apply it.

@@ -9,9 +9,11 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node ../tests/storage.test.js && node ../tests/storage-contract.test.js",
+    "test": "node ../tests/storage.test.js && node ../tests/storage-buckets.test.js && node ../tests/storage-contract.test.js",
     "test:unit": "node ../tests/storage.test.js",
-    "test:contract": "node ../tests/storage-contract.test.js"
+    "test:contract": "node ../tests/storage-contract.test.js",
+    "storage:provision": "node src/cli/provision-storage.js",
+    "test:buckets": "node ../tests/storage-buckets.test.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.899.0",

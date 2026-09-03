@@ -144,6 +144,17 @@ function loadStorageConfig(overrides = {}) {
     throw new StorageConfigError('STORAGE_BUCKET is not a valid bucket name');
   }
 
+  // CORS origins (T-202). Comma-separated. Local/test default to the dev
+  // server origins only; deployed environments must be explicit — we will not
+  // guess veorec.com, and an unset value must fail loudly at provisioning
+  // rather than silently produce a bucket no browser can upload to.
+  const corsRaw = overrides.corsOrigins !== undefined
+    ? overrides.corsOrigins
+    : (process.env.STORAGE_CORS_ORIGINS
+      || (isDeployed ? '' : 'http://localhost:5173,http://127.0.0.1:5173'));
+  const corsOrigins = (Array.isArray(corsRaw) ? corsRaw : String(corsRaw).split(','))
+    .map((o) => String(o).trim()).filter(Boolean);
+
   // R2 requires path-style addressing; MinIO does too unless DNS is set up.
   const forcePathStyle = overrides.forcePathStyle !== undefined
     ? !!overrides.forcePathStyle
@@ -179,6 +190,13 @@ function loadStorageConfig(overrides = {}) {
     defaultPutTtlSeconds: num(overrides.defaultPutTtlSeconds, 'STORAGE_PUT_TTL', DEFAULT_PUT_TTL_SECONDS),
     requestTimeoutMs: num(overrides.requestTimeoutMs, 'STORAGE_REQUEST_TIMEOUT_MS', 30_000),
     maxAttempts: num(overrides.maxAttempts, 'STORAGE_MAX_ATTEMPTS', 3) || 1,
+
+    // Bucket CORS origins for browser-direct uploads (T-202). Explicit only —
+    // never a wildcard, and never an invented production domain: deployed
+    // environments must list their real origins, local/test get the dev server
+    // and nothing else. Validated by bucket-config.assertOrigin().
+    corsOrigins,
+    corsMaxAgeSeconds: num(overrides.corsMaxAgeSeconds, 'STORAGE_CORS_MAX_AGE', 3600),
   };
 
   // Safe-to-log projection. Credentials are absent by construction, not masked
