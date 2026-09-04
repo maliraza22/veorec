@@ -72,7 +72,56 @@ function corsTests() {
     === 'chrome-extension://abcdefghijklmnopabcdefghijklmnop', 'a chrome-extension origin is accepted');
   ok(threws(() => assertOrigin('chrome-extension://short')), 'a malformed extension id is refused');
 
-  // Deployed environments must not ship a plaintext origin.
+  // ── Plaintext origin policy (T-202 R2 verification).
+  // Loopback is the ONE plaintext exception: browsers treat http://localhost as
+  // a secure context because the traffic never leaves the machine, and it is
+  // what makes a real browser preflight against staging testable. Production
+  // stays strict regardless.
+  ok(!threws(() => buildCorsConfiguration({
+    ...BASE, appEnv: 'local', corsOrigins: ['http://localhost:5173'],
+  })), 'loopback http is allowed in local when explicitly configured');
+  ok(!threws(() => buildCorsConfiguration({
+    ...BASE, appEnv: 'staging', isDeployed: true, corsOrigins: ['http://localhost:5173'],
+  })), 'loopback http is allowed in staging when explicitly configured');
+  ok(!threws(() => buildCorsConfiguration({
+    ...BASE, appEnv: 'staging', isDeployed: true, corsOrigins: ['http://127.0.0.1:5173'],
+  })), 'loopback http by IP is allowed in staging');
+
+  // Arbitrary (non-loopback) plaintext origins are refused EVERYWHERE.
+  for (const env of ['local', 'test', 'staging', 'production']) {
+    ok(threws(() => buildCorsConfiguration({
+      ...BASE, appEnv: env, isDeployed: env === 'staging' || env === 'production',
+      corsOrigins: ['http://veorec.com'],
+    })), `an arbitrary http:// origin is refused in ${env}`);
+  }
+  ok(threws(() => buildCorsConfiguration({
+    ...BASE, appEnv: 'staging', isDeployed: true, corsOrigins: ['http://evil.example.com:5173'],
+  })), 'a non-loopback host on the dev port is still refused');
+  ok(threws(() => buildCorsConfiguration({
+    ...BASE, appEnv: 'staging', isDeployed: true, corsOrigins: ['http://localhost.evil.com'],
+  })), 'a hostname merely PREFIXED with localhost is refused');
+
+  // Production refuses every plaintext origin, loopback included.
+  ok(threws(() => buildCorsConfiguration({
+    ...BASE, appEnv: 'production', isDeployed: true, corsOrigins: ['http://localhost:5173'],
+  })), 'production refuses even a loopback http origin');
+  ok(threws(() => buildCorsConfiguration({
+    ...BASE, appEnv: 'production', isDeployed: true, corsOrigins: ['http://veorec.com'],
+  })), 'production refuses a plaintext production origin');
+  ok(!threws(() => buildCorsConfiguration({
+    ...BASE, appEnv: 'production', isDeployed: true, corsOrigins: ['https://veorec.com'],
+  })), 'production accepts an https origin');
+
+  // Wildcards remain refused in every environment.
+  for (const env of ['local', 'staging', 'production']) {
+    ok(threws(() => buildCorsConfiguration({
+      ...BASE, appEnv: env, corsOrigins: ['*'],
+    })), `a wildcard origin is refused in ${env}`);
+  }
+  ok(threws(() => buildCorsConfiguration({
+    ...BASE, appEnv: 'staging', corsOrigins: ['http://*.localhost'],
+  })), 'a wildcard loopback pattern is refused');
+
   ok(threws(() => buildCorsConfiguration({
     ...BASE, isDeployed: true, corsOrigins: ['http://veorec.com'],
   })), 'a deployed http:// origin is refused');

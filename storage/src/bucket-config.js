@@ -95,9 +95,33 @@ function assertOrigin(origin) {
   return url.origin;
 }
 
+// Hosts a browser treats as a secure context despite plaintext, because the
+// traffic never leaves the machine.
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
+
+function isLoopbackOrigin(origin) {
+  if (!origin.startsWith('http://')) return false;
+  try { return LOOPBACK_HOSTS.has(new URL(origin).hostname); } catch { return false; }
+}
+
 /**
  * Build the bucket CORS configuration from resolved storage config.
- * @param {{corsOrigins: string[], corsMaxAgeSeconds?: number, isDeployed?: boolean}} config
+ *
+ * PLAINTEXT ORIGIN POLICY
+ *   https://…               always allowed
+ *   chrome-extension://…    always allowed
+ *   http:// on loopback     allowed in local/test/staging, REFUSED in production
+ *   http:// anywhere else   always refused, in every environment
+ *
+ * Loopback is the single plaintext exception because browsers classify
+ * `http://localhost` as a secure context — the traffic never crosses the
+ * network, so the MITM risk that motivates the https rule does not apply. It is
+ * also what makes a real browser preflight against a staging bucket testable at
+ * all. Production stays strict regardless: no wildcard, no http, not even
+ * loopback, so a developer's local page can never be an allowed origin there.
+ *
+ * @param {{corsOrigins: string[], corsMaxAgeSeconds?: number,
+ *          appEnv?: string, isDeployed?: boolean}} config
  */
 function buildCorsConfiguration(config) {
   const origins = (config.corsOrigins || []).map(assertOrigin);
@@ -105,8 +129,19 @@ function buildCorsConfiguration(config) {
     throw new StorageConfigError(
       'STORAGE_CORS_ORIGINS is empty — browser-direct uploads need at least one explicit origin');
   }
-  if (config.isDeployed && origins.some((o) => o.startsWith('http://'))) {
-    throw new StorageConfigError('deployed CORS origins must use https:// (or chrome-extension://)');
+  const isProduction = String(config.appEnv || '').toLowerCase() === 'production';
+  for (const origin of origins) {
+    if (!origin.startsWith('http://')) continue;
+    if (!isLoopbackOrigin(origin)) {
+      throw new StorageConfigError(
+        `CORS origin "${origin}" uses plaintext http:// on a non-loopback host; ` +
+        'use https:// (loopback is the only plaintext exception)');
+    }
+    if (isProduction) {
+      throw new StorageConfigError(
+        `CORS origin "${origin}" is a loopback http:// origin, which is permitted for ` +
+        'local/staging browser testing but never in production');
+    }
   }
   return {
     CORSRules: [{

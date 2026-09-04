@@ -331,24 +331,24 @@ recorded as a pass. Two backends answer differently:
   lifecycle, isolation, error mapping — contract suite 59/59.
 - **Verified locally (MinIO):** the same 59, plus the `uploads-tmp/` expiry rule
   accepted and read back, and the durable-prefix guard.
-- **Blocked on token scope:** the 48h abort rule and the CORS policy. An
-  R2 **Object Read & Write** token returns `AccessDenied` for both
-  `PutBucketCors` and `PutBucketLifecycleConfiguration`; applying them requires
-  an **Admin Read & Write** token. The browser preflight sits behind this, since
-  CORS must exist before it can be tested.
+- **Verified against real R2 staging (2026-09-04):** the 48h incomplete-multipart
+  abort rule and the CORS policy, both applied and read back. Browser CORS was
+  verified with an actual browser — a cross-origin `PUT` from
+  `http://localhost:5173` preflighted and succeeded with the `ETag` readable
+  from script, while the same page on `http://localhost:5174` was blocked at the
+  preflight. Applying bucket configuration needs an R2 **Admin Read & Write**
+  token; an Object Read & Write token returns `AccessDenied` for
+  `PutBucketCors` and `PutBucketLifecycleConfiguration`.
 
-R2 does not implement `GetBucketPolicyStatus`, so the policy-based privacy check
-reports `unsupported` there. Privacy is instead established empirically by the
-unsigned-GET refusal — the stronger check, and it passes on R2.
-
-**Open decision.** `buildCorsConfiguration` refuses any `http://` origin when
-deployed, which blocks `http://localhost:5173` and therefore the browser
-preflight against staging. `config.js` already permits `http` for a loopback
-*endpoint*, so the two rules are inconsistent. Browsers treat `localhost` as a
-secure context precisely because it never crosses the network, so permitting
-loopback origins on a staging bucket is defensible — but it does widen the
-policy, so it is left as a deliberate choice rather than changed to make a test
-pass.
+**Plaintext origin policy.** `https://` and `chrome-extension://` are always
+allowed. `http://` is allowed **only on a loopback host** and **only outside
+production** — browsers treat `http://localhost` as a secure context because the
+traffic never crosses the network, and it is what makes a real browser preflight
+against staging testable. Production refuses every plaintext origin, loopback
+included, so a developer's local page can never be an allowed origin there;
+non-loopback http is refused in every environment. This resolves the
+inconsistency with `config.js`, which already permitted `http` for a loopback
+endpoint.
 
 ### 2.8 CDN
 

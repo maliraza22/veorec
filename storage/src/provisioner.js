@@ -204,7 +204,17 @@ async function provisionBucket({ client, config, mode = 'check' }) {
   }
 
   // ── 3. CORS for browser-direct uploads.
-  const intendedCors = buildCorsConfiguration(config);
+  // A rejected CORS configuration must be a REPORTED step, not an exception:
+  // throwing here would discard the lifecycle results already gathered (and,
+  // in apply mode, already written), leaving the operator with no report at
+  // all for work that did happen.
+  let intendedCors = null;
+  try {
+    intendedCors = buildCorsConfiguration(config);
+  } catch (cfgErr) {
+    report.add('CORS configuration valid', STATUS.failed, cfgErr.message);
+    return report;
+  }
   if (mode === 'apply') {
     try {
       await client.send(new PutBucketCorsCommand({ Bucket: bucket, CORSConfiguration: intendedCors }));
