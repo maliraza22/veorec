@@ -315,19 +315,40 @@ byte ceiling is enforced by the **signature** (§2.7.1), not by CORS. Deployed
 origins must be `https://` (or `chrome-extension://`), and staging/production
 have **no default origins** — `veorec.com` is never invented as a fallback.
 
-**Verification status.** The local MinIO (RELEASE.2025-09-07) implements neither
-`PutBucketCors` (`NotImplemented`) nor `AbortIncompleteMultipartUpload`
-(`InvalidArgument` on every payload shape). The provisioner therefore reports
-three-valued results — ok / mismatch / **unsupported** / failed — so a backend
-that cannot answer is never recorded as a pass. Consequently:
+**Verification status.** The provisioner reports three-valued results — ok /
+mismatch / **unsupported** / failed — so a backend that cannot answer is never
+recorded as a pass. Two backends answer differently:
 
-- **Verified locally:** private-bucket check, unauthorized GET refused, the
-  `uploads-tmp/` expiry rule accepted and read back by a real S3 backend, and
-  the durable-prefix guard.
-- **Pending R2 (staging):** the 48h incomplete-multipart abort rule and the
-  whole CORS policy. Neither can be confirmed here, and a browser preflight is
-  needed to confirm CORS end-to-end. Run `storage:provision --apply` against a
-  staging bucket before T-203 mirrors real uploads.
+| Capability | MinIO (RELEASE.2025-09-07) | Cloudflare R2 |
+|---|---|---|
+| `PutBucketCors` | `NotImplemented` | supported, but needs an **Admin** token |
+| `AbortIncompleteMultipartUpload` | `InvalidArgument` (any payload) | supported, but needs an **Admin** token |
+| Lifecycle `Expiration` | supported | needs an **Admin** token |
+| `GetBucketPolicyStatus` | supported | **`NotImplemented`** |
+
+- **Verified against real R2 staging (2026-09-04):** unauthorized GET refused,
+  presigned GET/PUT, signed Content-Length enforcement, the full multipart
+  lifecycle, isolation, error mapping — contract suite 59/59.
+- **Verified locally (MinIO):** the same 59, plus the `uploads-tmp/` expiry rule
+  accepted and read back, and the durable-prefix guard.
+- **Blocked on token scope:** the 48h abort rule and the CORS policy. An
+  R2 **Object Read & Write** token returns `AccessDenied` for both
+  `PutBucketCors` and `PutBucketLifecycleConfiguration`; applying them requires
+  an **Admin Read & Write** token. The browser preflight sits behind this, since
+  CORS must exist before it can be tested.
+
+R2 does not implement `GetBucketPolicyStatus`, so the policy-based privacy check
+reports `unsupported` there. Privacy is instead established empirically by the
+unsigned-GET refusal — the stronger check, and it passes on R2.
+
+**Open decision.** `buildCorsConfiguration` refuses any `http://` origin when
+deployed, which blocks `http://localhost:5173` and therefore the browser
+preflight against staging. `config.js` already permits `http` for a loopback
+*endpoint*, so the two rules are inconsistent. Browsers treat `localhost` as a
+secure context precisely because it never crosses the network, so permitting
+loopback origins on a staging bucket is defensible — but it does widen the
+policy, so it is left as a deliberate choice rather than changed to make a test
+pass.
 
 ### 2.8 CDN
 

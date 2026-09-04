@@ -154,7 +154,11 @@ async function securityChecks(provider, track) {
   // The bucket is private: the same path without a signature must fail.
   const unsigned = url.split('?')[0];
   const anon = await fetch(unsigned);
-  ok(!anon.ok && (anon.status === 401 || anon.status === 403 || anon.status === 404),
+  // The contract is REFUSAL, not a particular status: R2 answers 400
+  // InvalidArgument("Authorization") where S3/MinIO answer 403. Pinning the set
+  // would make this suite non-portable between the two stores it must verify.
+  // A public bucket would return 200, so >=400 still proves the property.
+  ok(!anon.ok && anon.status >= 400,
     `an unsigned request is refused (status ${anon.status}) — the bucket is not public`);
 
   // A tampered signature must not work.
@@ -299,9 +303,9 @@ async function errorBehaviour(provider) {
     accessKeyId: 'AKIAINVALIDINVALID00',
     secretAccessKey: 'definitely-not-the-right-secret-value-here',
   });
-  e = await arejects(() => badCreds.headObject(keys.source(recId('auth'))));
-  ok(e && ['permission_denied', 'object_not_found'].includes(e.code),
-    `invalid credentials map to a storage error (got ${e && e.code})`);
+  e = await arejects(() => badCreds.getObject(keys.source(recId('auth'))));
+  ok(e && e.code === 'permission_denied',
+    `invalid credentials map to permission_denied (got ${e && e.code})`);
   ok(e && e.name && e.name.endsWith('Error') && e.code, 'the failure is a StorageError, not a raw SDK error');
 
   // An unreachable endpoint must be retryable, so the future queue backs off.

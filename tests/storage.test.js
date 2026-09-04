@@ -223,6 +223,20 @@ function errorTests() {
   ok(e.cause, 'the original error is retained as cause for debugging');
   ok(!('status' in e) && !('statusCode' in e), 'no HTTP status is attached (transport-agnostic)');
 
+  // R2 signals AUTHORIZATION failures as 400 InvalidArgument with an
+  // "Authorization" message, unlike S3/MinIO's 403. Found against real R2:
+  // without this, wrong or rotated production credentials would be reported as
+  // "storage rejected the request" instead of a permission problem.
+  const r2authz = Object.assign(new Error('Authorization'),
+    { Code: 'InvalidArgument', name: 'InvalidArgument', $metadata: { httpStatusCode: 400 } });
+  ok(mapStorageError(r2authz).code === 'permission_denied',
+    "R2's 400 InvalidArgument('Authorization') maps to permission_denied");
+  // ...but a genuine bad argument must NOT be reclassified as a permission problem.
+  const realInvalid = Object.assign(new Error('Invalid part number specified'),
+    { Code: 'InvalidArgument', name: 'InvalidArgument', $metadata: { httpStatusCode: 400 } });
+  ok(mapStorageError(realInvalid).code === 'invalid_request',
+    'a genuine InvalidArgument stays invalid_request (the rule is narrow)');
+
   // Our own errors pass through unchanged (key validation must not be remapped).
   const own = new S.InvalidRequestError('bad key');
   ok(mapStorageError(own) === own, 'an existing StorageError passes through unchanged');

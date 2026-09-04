@@ -123,6 +123,8 @@ const TRANSIENT = new Set([
   'ConnectionError', 'NetworkingError', 'EconnResetError', '503 SlowDown',
 ]);
 const TIMEOUT = new Set(['TimeoutError', 'RequestTimeout', 'RequestAbortedError']);
+// Message shapes R2 uses when the real problem is credentials, not arguments.
+const AUTHZ_MESSAGE = /authoriz|credential|signature|access key|secret/i;
 // Node socket-level failures surface as these before any S3 code exists.
 const TRANSIENT_SYSCALL = new Set([
   'ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ETIMEDOUT', 'EHOSTUNREACH',
@@ -165,6 +167,16 @@ function mapStorageError(err, ctx = {}) {
   if (code && DENIED.has(code)) return new PermissionDeniedError(options);
   if (code && MULTIPART.has(code)) return new MultipartFailedError(`multipart rejected (${code})`, options);
   if (code && CONFLICT.has(code)) return new ConflictError(options);
+  // Cloudflare R2 reports AUTHORIZATION failures as 400 InvalidArgument with an
+  // "Authorization" message, where S3/MinIO use 403 InvalidAccessKeyId /
+  // SignatureDoesNotMatch. Found against real R2. Without this, wrong or rotated
+  // production credentials surface as "storage rejected the request" rather than
+  // a permission problem, sending an operator down the wrong path mid-outage.
+  // Narrow by design: a genuine bad-argument InvalidArgument must stay
+  // invalid_request, so only an authorization-shaped message is reclassified.
+  if (code === 'InvalidArgument' && AUTHZ_MESSAGE.test(String((err && err.message) || ''))) {
+    return new PermissionDeniedError(options);
+  }
   if (code && INVALID.has(code)) return new InvalidRequestError(`storage rejected the request (${code})`, options);
   if (code && TIMEOUT.has(code)) return new TimeoutError(options);
   if (code && TRANSIENT.has(code)) return new ProviderUnavailableError(options);
