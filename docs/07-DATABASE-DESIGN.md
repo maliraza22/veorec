@@ -298,6 +298,118 @@ Practical notes discovered while implementing:
 - `NULL` variants would defeat a plain unique index, so "one READY asset per (recording, kind, variant)" is enforced with `coalesce(variant,'')` in a partial unique index.
 - The `users` email uniqueness is partial (`WHERE deleted_at IS NULL`) so a soft-deleted account frees its address for re-registration — verified by test.
 
+## 19. Backfill copier (delivered by T-204)
+
+Copies **existing** legacy originals into R2, so historical media joins the new
+uploads T-203 already mirrors.
+
+> **COPYING IS NOT CUTTING OVER.** A verified object here is an *additional*
+> copy. Cloudinary keeps serving every read, and this tool contains **no delete
+> call of any kind** against either provider — asserted by a test over the
+> stripped source. The read cutover is a later, separately approved task.
+
+### The checklist
+
+`legacy.media_map` — the row T-104 already created per recording (§13) — carries
+the state. Migration `0003` adds:
+
+| Column | Meaning |
+|---|---|
+| `backfill_status` | `pending` · `claimed` · `verified` · `failed` · `skipped` · `unsafe` |
+| `backfill_attempts` | cross-run attempt count; a ceiling stops infinite retries |
+| `backfill_claimed_at` / `backfill_claim_id` | who holds it, and since when |
+| `backfill_retryable` | whether a later run may try again |
+| `backfill_bytes` | what was actually copied |
+
+A CHECK makes `status = 'verified'` and `backfilled_at IS NOT NULL`
+**equivalent**, so "the database says done" cannot drift away from "the object
+was actually checked". Document `23` once called this a `migration_assets`
+table; a second table tracking the same recording would have been a second
+source of truth about one fact, so the existing row was extended instead.
+
+### Order, and why it is this order
+
+```
+claim (one short statement, transaction ends)
+  → transfer bytes (NO database transaction open)
+  → verify: re-read the object, compare size
+  → asset row (upsert)
+  → checklist stamp
+```
+
+A transfer can take minutes; holding a transaction across it would pin a
+connection and block vacuum for the duration. A crash between transfer and stamp
+leaves an object with no stamp — deliberately the safe direction, since the key
+is deterministic and the row write is an upsert, so the next run converges. The
+opposite order could record completion for bytes that never landed.
+
+**Verified means verified.** A 200 from the upload is not evidence; nothing is
+marked `verified` until the object has been read back and its byte count
+compared with the bytes fetched.
+
+### Concurrency and crash recovery
+
+Claiming is one atomic `UPDATE … FOR UPDATE SKIP LOCKED`, so several workers
+take disjoint sets rather than blocking on the same rows — two workers never
+process one recording. A crashed worker leaves its row `claimed` forever, so a
+claim older than `staleClaimMs` (default 15 min) becomes re-claimable; that is
+what makes a crash self-healing. Transfers are bounded (default 3 concurrent),
+never a `Promise.all` over the dataset, because the copier shares bandwidth and
+database connections with the live application.
+
+**One attempt per run.** An item that fails transiently is left for a *later*
+run. An earlier draft re-claimed it within the same loop, burning its whole
+attempt budget in seconds and hammering a provider already returning 5xx — found
+by testing and fixed.
+
+### Failure taxonomy
+
+| Condition | Status | Retryable |
+|---|---|---|
+| legacy 5xx / 429 | `failed` | yes |
+| legacy 404 / 410 (source gone) | `failed` | **no** |
+| size mismatch after copy | `failed` | **no** — a repeatable mismatch is an integrity problem |
+| unsupported container, no url/public id | `unsafe` | **no** — human review |
+| existing object whose size disagrees | `unsafe` | **no** — never overwritten |
+| `local_disk` bytes not reachable from this host | `skipped` | **no** |
+| attempt ceiling reached | `failed` | **no** |
+
+Every failure reason is stored **in the row**, so triage never means grepping
+logs.
+
+### Ownership
+
+Ambiguity is never resolved by guessing. The asset upsert cannot re-point an
+object at a different recording — that would attribute one user's bytes to
+another — and an existing object of a different size is left alone.
+
+### Relationship to the other tasks
+
+- **T-203** mirrors *new* uploads. T-204 recognises those via `headObject` and
+  marks them verified **without re-reading the legacy source**, so the two never
+  duplicate work or race.
+- **T-106** reconciliation is untouched and still reports drift; T-204 adds no
+  destructive repair.
+- **Read cutover and Cloudinary removal** belong to later phases (Phase 3 reads,
+  T-1402/T-1403 removal). Until then both copies exist.
+
+### Rollback
+
+Nothing to undo in the legacy system, because nothing there was changed. To
+abandon the backfill, stop running it — the R2 objects are inert until a read
+cutover points at them. To redo an item, clear its `backfill_status` and
+`backfilled_at`; the copy is idempotent.
+
+### Operating it
+
+```bash
+cd db
+npm run db:backfill                                  # dry run, writes nothing
+npm run db:backfill -- --apply --limit=50 --concurrency=2
+```
+
+Exit 0 clean · 2 items need attention · 1 error.
+
 ## 18. Reconciliation safety net (delivered by T-106)
 
 > This is the mechanism that **proves** PostgreSQL stays convergent with the authoritative legacy system during the migration — and the gate that must be clean before authority ever moves. It is not merely a status report.

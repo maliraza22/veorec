@@ -21,7 +21,7 @@ Constraints that shape sequencing: the extension fleet updates slowly (Chrome re
 ## Phase 2 — Storage abstraction + R2
 - **Goal:** `StorageProvider` interface; R2 buckets provisioned; MinIO in dev; **new uploads mirrored to R2** while Cloudinary continues serving.
 - **Files:** `apps/api/src/storage/*`; upload handler additionally streams the temp file to `sources/{id}` in R2 (server-side copy — temporary, removed in Phase 3).
-- **Backfill:** background copier moves existing Cloudinary originals → R2 `sources/` (throttled; tracked in a `migration_assets` checklist table).
+- **Backfill:** background copier moves existing Cloudinary originals → R2 `sources/` (throttled; tracked per recording on `legacy.media_map`, which T-104 already created for exactly this — see `07` §13. An earlier draft of this line called it a `migration_assets` table; a second table tracking the same recording would have been a second source of truth about the same fact, so T-204 extended the existing row with the checklist columns instead).
 - **Acceptance:** every new recording has an R2 source object with matching size; backfill ≥ 95% then 100%.
 
 ## Phase 3 — New upload system (the big reliability win)
