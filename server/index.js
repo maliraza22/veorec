@@ -9,6 +9,7 @@ const kpi = require('./kpi').initKpi(logger);
 const dualwrite = require('./dualwrite').configure({ logger, counters: kpi.counters });
 const r2mirror = require('./r2mirror').configure({ logger, counters: kpi.counters, dualwrite });
 
+
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
@@ -272,6 +273,36 @@ app.post('/api/auth/reset', resetLimiter, async (req, res) => {
   const updated = users.update(user.id, { password: hash, resetToken: null, resetExpires: null });
   res.json({ token: signToken(updated.id), user: publicUser(updated) });
 });
+
+// ── /api/v1 upload sessions (T-301) ─────────────────────────────────────────
+// OFF unless V1_UPLOAD_API is exactly "true". When off, none of the new
+// packages are loaded and the legacy app is byte-identical to before, so
+// disabling and restarting is a complete rollback.
+//
+// Mounted on the legacy server as a transitional host: the target architecture
+// runs this as its own deployable (apps/api), and the router is written to be
+// moved without change — it receives its dependencies and knows nothing about
+// this process. The LEGACY POST /api/upload is untouched and remains the path
+// every current client uses.
+if (process.env.V1_UPLOAD_API === 'true') {
+  try {
+    const { createUploadRouter } = require('../api/src/index.js');
+    const { repositories, withTransaction } = require('../db/src/index.js');
+    const storagePkg = require('../storage/src/index.js');
+    app.use('/api/v1', createUploadRouter({
+      repositories, withTransaction,
+      storage: storagePkg.storageProvider(),
+      keys: storagePkg.keys,
+      requireAuth,
+      logger,
+    }));
+    logger.info({ v1UploadApi: true }, '/api/v1 upload session API ENABLED (legacy upload route unchanged)');
+  } catch (e) {
+    // A misconfigured new stack must never stop the legacy server booting.
+    logger.error({ err: { message: String(e && e.message).slice(0, 300) } },
+      '/api/v1 upload API failed to mount — the legacy application is unaffected');
+  }
+}
 
 // ── Upload / Recordings (protected) ──────────────────────────────────────────
 if (!USE_CLOUDINARY) {

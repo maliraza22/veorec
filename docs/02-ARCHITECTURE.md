@@ -406,6 +406,92 @@ and end-to-end against real Cloudflare R2 staging. **Not delivered here:**
 backfill of existing recordings (T-204), any read served from R2, the
 upload-session API (T-301), quota enforcement (T-306).
 
+### 2.7.4 `/api/v1/uploads` — upload session endpoints (delivered by T-301)
+
+The server side of the direct-to-storage protocol (`06`). **The application
+server never receives video bytes**: it creates the multipart upload, hands out
+presigned part URLs, records what the client reports, and finalises.
+
+Package `api/` (`@veorec/api`). Mounted on the legacy server behind
+`V1_UPLOAD_API` (default **OFF** — when off none of the new packages load and
+the legacy app is byte-identical, so disabling is a complete rollback). The
+router receives its dependencies and knows nothing about its host, so moving it
+to a standalone `apps/api` later is a deployment change, not a rewrite.
+
+| Method & path | Behaviour |
+|---|---|
+| `POST /uploads` | create session; `Idempotency-Key` required; replay returns the same session |
+| `GET /uploads/:id` | status + parts, merged with live `ListParts` — the resume source of truth |
+| `POST /uploads/:id/parts` | presign ≤ 20 parts; repeatable; enforces the byte ceiling |
+| `PUT /uploads/:id/parts/:n` | record a part; upsert, naturally idempotent |
+| `POST /uploads/:id/complete` | finalise; idempotent; writes the outbox probe row |
+| `DELETE /uploads/:id` | abort; idempotent |
+
+**Layering.** The router holds validation, authorization, orchestration and the
+wire shape. All PostgreSQL goes through T-103 repositories; all object
+operations through T-201 `StorageProvider`. Tests assert the router contains no
+SQL, no storage SDK and no Cloudinary reference — a handler needing any of them
+would mean the boundary had failed.
+
+**Ownership.** Every lookup is a *scoped* repository call, so knowing a valid
+session id is never enough. Another user's session returns **404, not 403**:
+distinguishing "not yours" from "not there" would confirm the id to an attacker.
+Presigned URLs are only minted after that scoped lookup succeeds.
+
+**State machine.** `pending → active → completed | aborted | expired`. The first
+presign moves `pending → active`. A completed session cannot be presigned
+against or aborted; an aborted or expired one cannot be completed.
+
+**Byte ceiling.** Enforced twice: the server refuses to *mint* URLs whose
+cumulative declared bytes would exceed the ceiling, and each URL is signed with
+its exact `Content-Length` so storage itself rejects a larger body. A hostile
+client holding valid URLs still cannot exceed its ceiling.
+
+**Completion, and why the transaction is where it is.** `06` §7 describes one
+transaction around steps 3–5. The implementation runs
+`CompleteMultipartUpload` + `HEAD` **outside** it and keeps a short transaction
+for the state change, because a transaction held across a network call pins a
+connection for its duration. This is safe precisely because the spec's own step
+3 makes a crash there recoverable: a retry finds the upload gone but the object
+present and treats that as success. That path is tested by injecting exactly
+that crash.
+
+Inside the one transaction: session `completed`, recording `uploaded` with the
+**real** stored size, the `video_assets` source row, and the
+`processing_jobs` outbox row. All four commit together, so the database can
+never claim a completed recording whose asset or probe job is missing — asserted
+by injecting a failure at the last step and checking that none of it survived.
+
+**Idempotency.** A repeated completion replays the canonical result and creates
+no second asset and no second probe job. Two *simultaneous* completions produce
+exactly one of each. Part recording is an upsert on `(session, partNumber)`.
+Session creation is keyed by `Idempotency-Key`, and a second session for the
+same recording returns the live one rather than opening a second multipart
+upload against the same key.
+
+**Resume.** `GET` merges our `upload_parts` rows with live `ListParts`, and
+**storage wins**: our row is a client's report, the object store is what
+actually holds the bytes.
+
+**Errors.** The nested `/api/v1` contract from `08` §2 —
+`{ error: { code, message, upgradeRequired?, requestId } }` — never the flat
+legacy shape. Repository and storage errors are mapped to codes; a raw
+PostgreSQL error (table, column, sometimes values) or storage error (bucket,
+endpoint, request id) is logged server-side and never sent.
+
+**Entitlement at completion.** Re-checked with the real stored size. On
+rejection the recording becomes `rejected_limit` and the response is 403 with
+`upgradeRequired` — and **the uploaded bytes are not deleted**, so an upgrade
+can still rescue them.
+
+**Deliberately not T-301:** no quota ledger and no atomic reservation. `06` §3
+and `08` §5 place a reservation in session creation, while `24` places the
+ledger in **T-306**; this task takes the endpoints and leaves the ledger, so
+`byteCeiling` comes from the plan rather than reserved quota and entitlement is
+a pluggable check T-306 replaces. Also not here: the client uploader, the
+expiry job, the probe relay and workers (T-601), any legacy route change, and
+any read cutover. The legacy `POST /api/upload` is untouched.
+
 ### 2.8 CDN
 
 Cloudflare in front of R2 for derived media. Cache key includes the asset path, not the signature (use signed cookies or edge-verified tokens for public assets; for MVP, R2 presigned GETs with `Cache-Control` on public assets are acceptable — documented tradeoff in `12` §6).

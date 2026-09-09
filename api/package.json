@@ -1,0 +1,16 @@
+{
+  "name": "@veorec/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "description": "VeoRec /api/v1 — upload session endpoints (T-301). PostgreSQL via @veorec/db repositories, object storage via @veorec/storage.",
+  "main": "src/index.js",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "node ../tests/uploads-api.test.js",
+    "test:uploads": "node ../tests/uploads-api.test.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
