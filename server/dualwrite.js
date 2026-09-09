@@ -239,6 +239,38 @@ const api = {
   },
 
   /** Owner metadata change (title / privacy / folder / audience / trims …). */
+  /**
+   * Record a mirrored SOURCE asset for a recording (T-203).
+   *
+   * Deliberately on THIS lane, not a separate path: video_assets has a foreign
+   * key to recordings, and the parent row is written by recording() above. The
+   * single FIFO lane is what guarantees the parent lands first — concurrent
+   * mirrors racing an FK is a defect this lane already had to fix once.
+   *
+   * Idempotent: the storage key is deterministic, so a replayed mirror
+   * converges on the existing row instead of violating the unique index.
+   */
+  recordingAsset(legacyRecordingId, asset, ctx = {}) {
+    const recordingId = idFor('rec', legacyRecordingId);
+    mirror('recording_asset.upsert',
+      { entity: 'video_asset', legacyId: legacyRecordingId, pgId: recordingId, ...ctx },
+      async (m, db) => {
+        const { createRepositories } = require('../db/src');
+        const repos = createRepositories(db);
+        await repos.assets.upsertSourceSystem({
+          recordingId,
+          kind: 'source',
+          storageKey: asset.storageKey,
+          status: 'ready',
+          sizeBytes: asset.sizeBytes ?? null,
+          width: asset.width ?? null,
+          height: asset.height ?? null,
+          duration: asset.duration ?? null,
+          container: asset.container ?? null,
+        }, 'T-203 upload mirror: records the R2 object copied after a successful legacy upload');
+      });
+  },
+
   recordingMeta(legacyRecordingId, legacyUserId, meta, extra = {}, ctx = {}) {
     mirror('recording.meta', { entity: 'recordings', legacyId: legacyRecordingId, pgId: idFor('rec', legacyRecordingId), ...ctx },
       (m, db) => m.upsertRecording(db, {

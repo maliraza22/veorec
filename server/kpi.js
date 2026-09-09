@@ -66,6 +66,12 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
     dualWriteSuccess: 0,
     dualWriteFailure: 0,
     dualWriteRetryable: 0,
+    // T-203 R2 upload mirror. `r2MirrorFailure` is the "uploads whose bytes are
+    // not yet in R2" signal for this process; each failure also appends a
+    // durable line to r2-mirror-failures.jsonl for reconciliation.
+    r2MirrorAttempt: 0,
+    r2MirrorSuccess: 0,
+    r2MirrorFailure: 0,
   };
   const durations = [];       // successful-upload handler durations (ms)
   const misses = new Map();   // recordingId -> { count, firstAt, lastAt }
@@ -164,6 +170,15 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
         failures: counters.dualWriteFailure,
         retryableFailures: counters.dualWriteRetryable,
         reconciliationPending: counters.dualWriteFailure,   // journaled for repair
+      },
+      r2Mirror: {
+        attempts: counters.r2MirrorAttempt,
+        // The acceptance criterion for T-203 is "100% of new uploads mirrored",
+        // so this ratio is the number that decides it.
+        mirroredRatePct: counters.r2MirrorAttempt
+          ? +((counters.r2MirrorSuccess / counters.r2MirrorAttempt) * 100).toFixed(2) : null,
+        failures: counters.r2MirrorFailure,
+        reconciliationPending: counters.r2MirrorFailure,
       },
       upload: {
         successRatePct: decided ? +((counters.uploadSuccess / decided) * 100).toFixed(2) : null,          // reliability (policy rejections excluded)

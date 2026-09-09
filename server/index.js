@@ -7,6 +7,7 @@ const kpi = require('./kpi').initKpi(logger);
 // T-105: PostgreSQL dual-write mirror. Disabled unless PG_DUAL_WRITE=true;
 // the legacy JSON/Cloudinary path stays authoritative either way.
 const dualwrite = require('./dualwrite').configure({ logger, counters: kpi.counters });
+const r2mirror = require('./r2mirror').configure({ logger, counters: kpi.counters, dualwrite });
 
 const express = require('express');
 const cors = require('cors');
@@ -319,6 +320,17 @@ if (!USE_CLOUDINARY) {
     const base = process.env.PUBLIC_URL || `http://localhost:${PORT}`;
     kpi.uploadFinished(req, 'success', { sizeBytes });
     res.json({ id, url: `${base}/watch/${id}` });
+
+    // T-203: mirror to R2 after the legacy write succeeded. deleteAfter is
+    // FALSE here — unlike the Cloudinary branch this file is the PERMANENT
+    // legacy store, not a temp file, and deleting it would destroy the
+    // recording the legacy app still serves.
+    r2mirror.mirrorSource(path.join(uploadDir, req.file.filename), {
+      legacyRecordingId: id, legacyUserId: req.userId,
+      sizeBytes, container: 'webm',
+      contentType: req.file.mimetype || 'video/webm',
+      duration: durationSec || null,
+    }, { deleteAfter: false }, { requestId: req.id });
   });
 
   app.get('/api/recordings', requireAuth, (req, res) => {
@@ -402,6 +414,12 @@ if (!USE_CLOUDINARY) {
 
   app.post('/api/upload', requireAuth, upload.single('video'), async (req, res) => {
     const tmpPath = req.file?.path;
+    // T-203: captured for the R2 mirror, which runs in `finally` and therefore
+    // outside the try scope. These stay null unless the legacy upload actually
+    // SUCCEEDED — a rejected or failed upload must never be mirrored, and the
+    // mirror is a no-op without a recording id.
+    let uploadedId = null, uploadedBytes = 0, uploadedContainer = 'webm';
+    let uploadedWidth = null, uploadedHeight = null, uploadedDuration = null;
     try {
       const { title, duration } = req.body;
       const id = uuidv4();
@@ -470,6 +488,15 @@ if (!USE_CLOUDINARY) {
         media: { provider: 'cloudinary', publicId: result.public_id, url: result.secure_url,
           bytes: result.bytes || null, duration: result.duration || null, format: result.format || null },
       }, {}, { requestId: req.id });
+      // Legacy upload is now durable in Cloudinary — only now is this
+      // recording eligible to be mirrored to R2 (T-203).
+      uploadedId = id;
+      uploadedBytes = result.bytes || sizeBytes;
+      uploadedContainer = result.format || 'webm';
+      uploadedWidth = result.width || null;
+      uploadedHeight = result.height || null;
+      uploadedDuration = Math.round(result.duration || durationSec) || null;
+
       const base = process.env.PUBLIC_URL || `https://${req.get('host')}`;
       const clientBase = process.env.CLIENT_URL || base;
       kpi.uploadFinished(req, 'success', { sizeBytes: result.bytes || sizeBytes });
@@ -496,7 +523,17 @@ if (!USE_CLOUDINARY) {
         saveLocally: tooBig,
       });
     } finally {
-      if (tmpPath) fs.unlink(tmpPath, () => {});
+      // T-203: the mirror takes OWNERSHIP of the temp file and always removes
+      // it, so the bytes survive long enough to be streamed to R2. When the
+      // mirror is disabled this is exactly the previous unlink.
+      if (tmpPath) {
+        r2mirror.mirrorSource(tmpPath, {
+          legacyRecordingId: uploadedId, legacyUserId: req.userId,
+          sizeBytes: uploadedBytes, container: uploadedContainer,
+          contentType: req.file?.mimetype || 'video/webm',
+          width: uploadedWidth, height: uploadedHeight, duration: uploadedDuration,
+        }, { deleteAfter: true }, { requestId: req.id });
+      }
     }
   });
 

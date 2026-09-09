@@ -63,6 +63,58 @@ module.exports = function assetsRepo(db) {
       return row;
     },
 
+    /**
+     * Idempotently record a mirrored SOURCE asset (T-203).
+     *
+     * The upload mirror can run more than once for the same recording — a
+     * retried request, a replayed journal entry — and every attempt writes the
+     * SAME deterministic storage key. A plain insert would hit
+     * `video_assets_storage_key_uniq` on the second attempt and be reported as
+     * a failure when nothing is wrong, so this converges on the existing row.
+     *
+     * The conflict target is the storage key, not the id: the key is what
+     * uniquely identifies the object in the bucket, so "two rows describing one
+     * object" is the state that must be impossible.
+     *
+     * System-scoped: the mirror runs outside any user request, and ownership
+     * was already established by the legacy handler that produced the
+     * recording. `reason` is mandatory so an unscoped write stays attributable.
+     */
+    async upsertSourceSystem(data, reason) {
+      requireSystemReason(reason);
+      const [row] = await exec('video_asset', () => db.insert(videoAssets).values({
+        id: data.id || newId('asset'),
+        recordingId: data.recordingId,
+        kind: data.kind || 'source',
+        storageKey: data.storageKey,
+        status: data.status || 'ready',
+        sizeBytes: data.sizeBytes ?? null,
+        width: data.width ?? null,
+        height: data.height ?? null,
+        duration: data.duration ?? null,
+        container: data.container ?? null,
+        checksum: data.checksum ?? null,
+        // The original upload is never rewritten, and it is the recording's
+        // primary media, so it is the asset that bills the user (docs/16 §4.1).
+        immutable: data.immutable ?? true,
+        countsTowardQuota: data.countsTowardQuota ?? true,
+      }).onConflictDoUpdate({
+        target: videoAssets.storageKey,
+        set: {
+          // Only facts about the SAME object may change on a re-run (a size we
+          // learned later, a probe result). Never the recording it belongs to —
+          // re-pointing an object at a different owner's recording is exactly
+          // the cross-tenant mistake this layer exists to prevent.
+          sizeBytes: data.sizeBytes ?? null,
+          status: data.status || 'ready',
+          container: data.container ?? null,
+          checksum: data.checksum ?? null,
+          updatedAt: new Date(),
+        },
+      }).returning());
+      return row;
+    },
+
     async updateSystem(id, patch, reason) {
       requireSystemReason(reason);
       const allowed = ['status', 'sizeBytes', 'width', 'height', 'duration',

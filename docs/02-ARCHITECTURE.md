@@ -350,6 +350,62 @@ non-loopback http is refused in every environment. This resolves the
 inconsistency with `config.js`, which already permitted `http` for a loopback
 endpoint.
 
+### 2.7.3 Upload mirror — new uploads copied to R2 (delivered by T-203)
+
+The first code path where application traffic reaches R2. Behind
+`R2_MIRROR_UPLOADS` (default **OFF**; only the literal `true` enables it —
+when off the storage package is never loaded and the upload handler behaves
+exactly as before, so disabling and restarting is a complete rollback).
+
+**Legacy remains authoritative.** Cloudinary (or the local disk store) still
+serves every read. The mirror runs *after* the response has been sent, never
+throws into the request, and is asserted to leave an upload succeeding even when
+object storage is unreachable. A mirror that can break an upload is worse than
+no mirror.
+
+**Order, and why it is not arbitrary.** Bytes go to storage first, the
+`video_assets` row second:
+
+- a failed upload writes **no row**, so a row never claims an object that does
+  not exist;
+- a failed row leaves an **orphan object** — wasteful and detectable, whereas a
+  dangling row would make the database lie about the bucket.
+
+Between the two, the object is `HEAD`ed and its size compared against the bytes
+received, so a truncated copy is never recorded as a good source.
+
+**The row goes on T-105's FIFO lane.** `video_assets` has a foreign key to
+`recordings`, and that parent is itself only a mirror. Writing the asset on any
+other path would race its parent and fail the FK — exactly the defect concurrent
+mirrors already caused once — so it is enqueued through
+`dualwrite.recordingAsset()` and therefore always follows its recording.
+With dual-write off there is no parent to attach to: the bytes still mirror and
+reconciliation reports the missing row.
+
+**Temp-file ownership.** In the Cloudinary branch the mirror takes ownership of
+multer's temp file so the bytes survive long enough to stream, and removes it on
+every path including failure. In the local-disk branch it does **not** delete —
+that file is the permanent legacy store, and removing it would destroy the
+recording the legacy app still serves.
+
+**Idempotent.** The storage key is deterministic, and
+`assets.upsertSourceSystem()` resolves `ON CONFLICT (storage_key)`, so a
+replayed mirror converges on the same row instead of violating the unique index.
+The conflict target is the key rather than the id because "two rows describing
+one object" is the state that must be impossible, and an upsert can never
+re-point an existing object at a different recording — that would attribute one
+user's bytes to another.
+
+Failures are contained by bounded concurrency, queue shedding, and a durable
+journal (`r2-mirror-failures.jsonl`, identifiers only — no credentials, tokens
+or bodies). `kpi_snapshot.r2Mirror.mirroredRatePct` is exactly the acceptance
+number for "100% of new uploads mirrored".
+
+**Verified** against real MinIO + PostgreSQL end-to-end through the real server,
+and end-to-end against real Cloudflare R2 staging. **Not delivered here:**
+backfill of existing recordings (T-204), any read served from R2, the
+upload-session API (T-301), quota enforcement (T-306).
+
 ### 2.8 CDN
 
 Cloudflare in front of R2 for derived media. Cache key includes the asset path, not the signature (use signed cookies or edge-verified tokens for public assets; for MVP, R2 presigned GETs with `Cache-Control` on public assets are acceptable — documented tradeoff in `12` §6).
