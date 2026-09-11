@@ -18,8 +18,8 @@ const countdownNum = document.getElementById('countdownNum');
 
 let mediaRecorder = null;
 let chunks = [];
-// T-303 streaming uploader. Runs ALONGSIDE the legacy path behind the
-// `newUpload` flag: chunks are still accumulated in `chunks`, so the
+// T-303 streaming uploader. Runs ALONGSIDE the legacy path, enabled per user
+// by the T-304 server rollout decision: chunks are still accumulated in `chunks`, so the
 // save-to-device fallback and the legacy POST stay available even if the
 // streaming upload fails. A take is never lost to the new path.
 let streamUploader = null;
@@ -289,8 +289,8 @@ async function beginRecording() {
   };
   mediaRecorder.onstop = handleStop;
 
-  // T-303: open an upload session so parts can stream while recording. Behind
-  // the `newUpload` flag and deliberately NOT awaited — the recording must
+  // T-303: open an upload session so parts can stream while recording. Gated by
+  // the server rollout decision (T-304) and deliberately NOT awaited — the recording must
   // start immediately, and a failure here simply leaves the legacy path in
   // charge.
   startStreamingUpload().catch(() => { streamUploadReady = false; });
@@ -476,14 +476,28 @@ function resetRecordingState() {
   try { chrome.runtime.sendMessage({ type: 'RECORDING_RESET' }); } catch (e) {}
 }
 
-// ── T-303 streaming upload (flag: newUpload) ─────────────────────────────────
+// ── T-303 streaming upload (gated by the T-304 server rollout decision) ─────────────────────────────────
 
 /** Open a v1 upload session. Any failure leaves the legacy path untouched. */
 async function startStreamingUpload() {
   streamUploader = null; streamUploadReady = false;
-  const { newUpload, sr_token } = await chrome.storage.local.get(["newUpload", "sr_token"]);
-  if (newUpload !== true || !sr_token) return;            // OFF unless explicitly true
+  const { sr_token } = await chrome.storage.local.get(["sr_token"]);
+  if (!sr_token) return;
   if (typeof VeoRecUploader === "undefined") return;
+
+  // T-304: the SERVER decides the path. Fetched fresh at the start of every
+  // recording and never cached across takes, so a rollback reaches this client
+  // on the next recording rather than waiting out a cached value. Any failure
+  // — offline, 5xx, malformed — leaves the legacy path in charge.
+  let cfg = null;
+  try {
+    const r = await fetch(`${SERVER}/api/client-config`, {
+      headers: { Authorization: `Bearer ${sr_token}` },
+    });
+    if (!r.ok) return;
+    cfg = await r.json();
+  } catch (e) { return; }
+  if (!cfg || !cfg.upload || cfg.upload.path !== "v1") return;
 
   // The recording row must exist before a session can bind to it.
   const res = await fetch(`${SERVER}/api/v1/recordings`, {
@@ -579,6 +593,9 @@ async function handleStop() {
     form.append('video', blob, 'recording.webm');
     form.append('title', title);
     form.append('duration', String(duration));
+    // T-304: tell the server this take began on v1 and fell back, so the v1
+    // success rate counts the failure the user never saw.
+    if (streamUploader) form.append('uploadFallbackFrom', 'v1');
 
     // Hard timeout so a stalled connection never hangs the UI forever.
     const ctrl = new AbortController();

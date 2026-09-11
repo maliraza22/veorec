@@ -375,8 +375,15 @@ const makeUploader = (world, extra = {}) => U.createUploader({
   ok(/chunks\.push\(e\.data\)/.test(recSrc),
     'the legacy chunk buffer is STILL filled — the save-to-device fallback survives');
   ok(/streamUploadReady && e\.data\.size > 0/.test(recSrc), 'the uploader is fed from dataavailable');
-  ok(/newUpload/.test(recSrc), 'the new path is behind the newUpload flag');
-  ok(/newUpload !== true/.test(recSrc), 'the flag is OFF unless explicitly true');
+  // T-304 REPLACED the client-side newUpload flag with the server decision. The
+  // safety property is unchanged and still asserted here — the new path is OFF
+  // unless something explicitly turns it on — but the switch now lives on the
+  // SERVER, so a client can no longer opt itself into the rollout.
+  ok(!/newUpload/.test(recSrc),
+    'the client-side newUpload flag is GONE — the client cannot self-select into the rollout');
+  ok(/api[/]client-config/.test(recSrc), 'the new path is gated by the server client-config decision');
+  ok(/cfg[.]upload[.]path !== "v1"/.test(recSrc),
+    'the path is OFF unless the server explicitly answers v1');
   ok(/finishStreamingUpload/.test(recSrc) && /const form = new FormData\(\)/.test(recSrc),
     'the legacy POST remains as the fallback when streaming did not finish');
   ok(/catch \(err\) \{ streamUploadReady = false; \}/.test(recSrc),

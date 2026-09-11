@@ -159,6 +159,29 @@ Clients poll `GET /recordings/:id/status` (or the transcript endpoint) — repla
 
 POST `/contact` (public, rate-limited 5/h·IP, honeypot field) → `{ok,id}`; admin email best-effort as today.
 
+## 14a. Client configuration (cutover control — T-304)
+
+`GET /client-config` (⚿, mounted on the legacy server as `/api/client-config`) — the
+**server-authoritative** answer to "which upload path should this client use?". The
+client obeys it and never computes eligibility for itself, so a modified or replayed
+client cannot opt into the rollout.
+
+```json
+{ "upload": { "path": "legacy" | "v1", "v1Enabled": false }, "refreshAfterSeconds": 300 }
+```
+
+- `path` — the only field the client acts on. `v1Enabled` is the same fact restated
+  for readability; they can never disagree.
+- `refreshAfterSeconds` is **advisory**. The extension ignores it upward: it re-fetches
+  at the start of **every recording** and caches nothing between takes, so a rollback
+  reaches a running client on its next recording rather than waiting out a TTL.
+- The body carries **no user id, no bucket and no rollout percentage**. It is a
+  decision, not the reasoning behind one — the reasoning is in the server logs
+  (`19` §8), where it is useful to an operator and not to an attacker.
+- Unauthenticated ⇒ `401`. Any server-side failure while deciding (database down,
+  configuration unreadable) resolves to `legacy`, never to `v1`: the endpoint fails
+  toward the path production already runs.
+
 ## 15. Admin (⚿A; every mutation writes `audit_logs`)
 
 | Method & path | Notes |

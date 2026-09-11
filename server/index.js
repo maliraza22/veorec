@@ -8,6 +8,7 @@ const kpi = require('./kpi').initKpi(logger);
 // the legacy JSON/Cloudinary path stays authoritative either way.
 const dualwrite = require('./dualwrite').configure({ logger, counters: kpi.counters });
 const r2mirror = require('./r2mirror').configure({ logger, counters: kpi.counters, dualwrite });
+const rollout = require('./rollout');
 
 
 const express = require('express');
@@ -274,6 +275,44 @@ app.post('/api/auth/reset', resetLimiter, async (req, res) => {
   res.json({ token: signToken(updated.id), user: publicUser(updated) });
 });
 
+// ── GET /api/client-config — cutover remote config (T-304) ──────────────────
+// The SERVER decides which upload path this user gets. A client claiming
+// membership in the rollout is never believed: the decision is recomputed here
+// from the user's stable identity on every call.
+//
+// Safe by default: with the rollout unset, malformed or at 0%, every user is
+// told "legacy" — the behaviour production already has.
+app.get('/api/client-config', requireAuth, async (req, res) => {
+  let decision;
+  try {
+    const selected = rollout.decide({ userId: req.userId });
+
+    // Only a bucket-selected user needs the mirror check, so an unselected user
+    // costs no database work. An account with no PostgreSQL row cannot be served
+    // by v1, so it goes to legacy — but under its OWN reason, so the population
+    // stays visible instead of being absorbed into the legacy count.
+    if (selected.path === 'v1') {
+      let hasMirror = null;
+      try {
+        const { repositories } = require('../db/src/index.js');
+        const { idFor } = require('../db/src/legacy-ids.js');
+        hasMirror = !!(await repositories().users.findById(idFor('usr', req.userId)));
+      } catch (e) {
+        hasMirror = false;          // cannot confirm ⇒ do not route to v1
+      }
+      decision = rollout.decide({ userId: req.userId, hasPostgresMirror: hasMirror });
+    } else {
+      decision = selected;
+    }
+  } catch (e) {
+    // Any failure resolves to legacy. A broken config must never be the thing
+    // that switches users onto the new path.
+    decision = { path: 'legacy', decision: rollout.DECISION.legacyDisabled, bucket: null, percent: 0 };
+  }
+  kpi.rolloutDecision(req, decision);
+  res.json(rollout.clientConfigBody(decision));
+});
+
 // ── /api/v1 upload sessions (T-301) ─────────────────────────────────────────
 // OFF unless V1_UPLOAD_API is exactly "true". When off, none of the new
 // packages are loaded and the legacy app is byte-identical to before, so
@@ -295,6 +334,11 @@ if (process.env.V1_UPLOAD_API === 'true') {
       keys: storagePkg.keys,
       requireAuth,
       logger,
+      // T-304: the v1 path reports its own result, tagged path='v1'.
+      telemetry: {
+        uploadStarted: (r, meta) => kpi.uploadStarted(r, { ...meta, path: 'v1', store: 'r2' }),
+        uploadFinished: (r, outcome, meta) => kpi.uploadFinished(r, outcome, { ...meta, path: 'v1', store: 'r2' }),
+      },
     }));
     // T-302: recordings CRUD, served from PostgreSQL. Same flag, same
     // rollback: the legacy /api/recordings routes are untouched and remain what
@@ -467,7 +511,12 @@ if (!USE_CLOUDINARY) {
       const user = users.findById(req.userId);
       const durationSec = parseInt(duration) || 0;
       const sizeBytes = req.file?.size || 0;
-      kpi.uploadStarted(req, { store: 'cloudinary', sizeBytes });
+      // T-304: the recorder marks a take it began on v1 and fell back from.
+      // ADVISORY telemetry only — it grants no eligibility and is never trusted
+      // for authorization, so a forged value can at worst mis-label a log line.
+      const fallbackFrom = req.body && req.body.uploadFallbackFrom === 'v1' ? 'v1' : null;
+      req._uploadFallbackFrom = fallbackFrom;
+      kpi.uploadStarted(req, { store: 'cloudinary', sizeBytes, path: 'legacy', fallbackFrom });
 
       // ── SERVER-SIDE ENFORCEMENT (never trust the client) ───────────────────
       // 1) Recording length limit.
@@ -539,7 +588,7 @@ if (!USE_CLOUDINARY) {
 
       const base = process.env.PUBLIC_URL || `https://${req.get('host')}`;
       const clientBase = process.env.CLIENT_URL || base;
-      kpi.uploadFinished(req, 'success', { sizeBytes: result.bytes || sizeBytes });
+      kpi.uploadFinished(req, 'success', { sizeBytes: result.bytes || sizeBytes, path: 'legacy', fallbackFrom });
       res.json({ id, url: `${clientBase}/watch/${id}` });
 
       // Fire-and-forget: transcribe + auto-name the video so it lands in the

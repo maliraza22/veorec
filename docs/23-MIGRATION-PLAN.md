@@ -34,6 +34,54 @@ Constraints that shape sequencing: the extension fleet updates slowly (Chrome re
 - **Risks:** the riskiest phase (client+server+storage). Mitigations: R13/R15 tests green pre-release; per-part telemetry; instant flag rollback to legacy path.
 - **Acceptance:** upload success ≥ 99% on new path over 2 weeks; server video-byte throughput → ~0 for flagged clients; resume verified in production (forced-kill canary).
 
+### Phase 3 cutover control (T-304)
+
+**Who decides.** The server, per user, at `GET /api/client-config` (`08` §14a). The
+client obeys the answer; a client claiming membership is never believed.
+
+**Bucketing.** `bucket = sha256("veorec-upload-cutover-v1:" + userId)` → first 4 bytes as
+uint32 → `% 100`. Selected iff `bucket < V1_UPLOAD_ROLLOUT_PERCENT`.
+
+- **Deterministic** — no randomness, no clock, no per-process counter. All three would
+  let a user flip path between requests, and a recorder that opened a v1 session and
+  then resumed onto legacy would lose the upload it had already started.
+- **Monotonic** — because selection is `<` against a *fixed* bucket, the 10% population
+  is a strict subset of 50%, which is a strict subset of 100%. Raising the percentage
+  only ever adds users; lowering it removes them in the exact reverse order. This is
+  what makes a partial rollback predictable rather than a fresh random draw.
+- The salt is a **fixed constant**. Changing it re-buckets everyone, so it must never be
+  made configurable or derived from anything that varies.
+
+**Fail-safe.** Absent, malformed, out-of-range or non-plain-integer configuration all
+resolve to 0% — legacy. `V1_UPLOAD_API` must be exactly `true` or the rollout is off
+regardless of the percentage. A configuration mistake must never be the thing that
+switches everyone onto the new path.
+
+**Staged rollout procedure.** `V1_UPLOAD_ROLLOUT_PERCENT`: `0 → 10 → 50 → 100`, one step
+at a time, restarting the API. Before each step, read `kpi_snapshot.cutover` (`19` §8)
+and require: `v1SuccessRatePct ≥ 99`, `v1Fallbacks` not trending up, and
+`accountNotMigrated` at zero (a non-zero value means the importer has not finished — fix
+that first rather than rolling forward over it). Hold each step long enough to cover a
+representative traffic day; the final step must hold for **two full weeks** before the
+acceptance criterion is met.
+
+**Rollback procedure.** Set `V1_UPLOAD_ROLLOUT_PERCENT=0` and restart. That is the whole
+procedure:
+
+- It is **configuration only** — no code change, no client release, no database
+  migration, nothing deleted. Clients pick it up on their next recording (the extension
+  re-fetches the config per take and caches nothing between takes).
+- In-flight v1 sessions are unaffected; new takes go to legacy. The legacy path was
+  never removed and needs no re-enabling.
+- Setting `V1_UPLOAD_API=false` is the harder rollback: the v1 routers are not mounted at
+  all and the process is byte-identical to the pre-T-301 server.
+- **Drilled deliberately** (T-304): a user selected for v1 at 100% resolved to `legacy`
+  after the percentage was set to 0, with `decision:"legacy_disabled"` recorded, and zero
+  rows or files changed by the rollback.
+
+**Acceptance.** ≥99% v1 upload success over two weeks of **production** traffic, read off
+`kpi_snapshot.cutover`. Local and staging verification does not satisfy this (`19` §8.2).
+
 ## Phase 4 — Local recovery (IndexedDB)
 - **Goal:** `05` fully: chunk persistence, sessions, recovery UI.
 - **Files:** extension `store/recorderStore.ts`, recovery card in recorder + popup badge.

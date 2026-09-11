@@ -66,6 +66,10 @@ function createUploadRouter(deps) {
   const {
     repositories, withTransaction, storage, keys, requireAuth,
     entitlements = defaultEntitlements(), logger = console,
+    // T-304: optional hook so a v1 upload reports through the SAME KPI module
+    // as the legacy path. A no-op by default, so the router stays usable
+    // without it and no parallel metrics store is created.
+    telemetry = { uploadStarted() {}, uploadFinished() {} },
   } = deps;
 
   const router = express.Router();
@@ -146,6 +150,7 @@ function createUploadRouter(deps) {
       throw err;
     }
 
+    telemetry.uploadStarted(req, { sizeBytes: null });
     return res.status(201).json(sessionCreatedBody(session));
   }));
 
@@ -299,6 +304,7 @@ function createUploadRouter(deps) {
       await repos.recordings.updateSystem(session.recordingId, { status: 'rejected_limit' },
         'T-301: entitlement rejected the upload at completion');
       await repos.uploads.setSessionStatus(scope, session.id, 'aborted');
+      telemetry.uploadFinished(req, 'rejected_limit', { code: verdict.code || 'storage_limit' });
       throw forbidden(verdict.code || 'storage_limit', verdict.message
         || 'This upload exceeds your plan.', { upgradeRequired: true, meta: verdict.meta });
     }
@@ -327,6 +333,7 @@ function createUploadRouter(deps) {
       return tx.uploads.getSession(scope, session.id);
     });
 
+    telemetry.uploadFinished(req, 'success', { sizeBytes: stored.contentLength });
     return res.json(completedBody(result || session));
   }));
 

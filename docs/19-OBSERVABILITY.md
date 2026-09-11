@@ -73,3 +73,56 @@ Sentry (or GlitchTip): API + workers (release-tagged), web app (source maps, use
 - STT success rate & median latency; AI auto-title coverage.
 - Webhook processing lag & failure count (0 tolerated).
 - Storage growth vs usage-table sum drift (< 1%).
+## 8. Cutover telemetry (T-304) — how the upload rollout is measured
+
+Every upload event carries the path it actually took, and every routing decision is
+logged. Without the path tag, a v1 failure and a legacy failure are the same line, and
+the acceptance criterion cannot be computed at all.
+
+**Log fields** (added to the existing `upload_started` / `upload_finished` lines):
+
+| Field | Values | Meaning |
+|---|---|---|
+| `upload_path` | `legacy` \| `v1` | the path this take used. Recorded on the attempt **and re-stated on the result**, because a take can change path mid-flight |
+| `fallback_from` | `v1` \| `null` | the take started toward v1 and finished on legacy |
+
+**`rollout_decision`** — one line per `/client-config` lookup:
+`{ kpi:"rollout_decision", upload_path, decision, bucket, percent }` where `decision` is
+exactly one of:
+
+| `decision` | Meaning |
+|---|---|
+| `legacy_disabled` | v1 is off, or the rollout is at 0% — includes every rollback |
+| `legacy_rollout` | rollout is live; this user's bucket is outside the percentage |
+| `v1_rollout` | selected for the new path |
+| `account_not_migrated` | selected by bucket, but the account has **no PostgreSQL mirror**, so v1 could not have served it |
+
+The decision line deliberately carries **no user identifier**. The bucket and the reason
+are what an operator needs; the identity is neither needed nor safe to retain here.
+
+### 8.1 The acceptance number and its denominator
+
+`kpi_snapshot.cutover.v1SuccessRatePct` **is** the number the ≥99% criterion is measured
+against:
+
+```
+v1SuccessRatePct = uploadV1Success / uploadV1Attempt × 100
+```
+
+The denominator is **attempts, not completions**, and a take that started on v1 and was
+rescued onto legacy counts in `uploadV1Failure` as well as `uploadV1Fallback`. This is
+the whole point: the fallback exists so users never see a failure, which means a naive
+rate would read 100% *precisely because* the failures were being hidden. A rising
+`v1Fallbacks` with a flat success rate is the signal that the new path is degrading.
+
+`accountNotMigrated` is reported as its own number and never folded into the ordinary
+legacy count — it is a known, fixable population (run the importer), and pooling it with
+users the rollout simply did not select would make it invisible.
+
+### 8.2 What "verified" means for this criterion
+
+The ≥99%-over-two-weeks criterion can only be satisfied by **production traffic**
+observed over two consecutive weeks at a non-zero rollout percentage. Local, staging and
+synthetic runs verify that the mechanism works; they do **not** and cannot satisfy it,
+however many assertions pass. Until that production window exists and has been read off
+real snapshots, the correct status is *production observation pending*.

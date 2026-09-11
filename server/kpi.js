@@ -72,6 +72,25 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
     r2MirrorAttempt: 0,
     r2MirrorSuccess: 0,
     r2MirrorFailure: 0,
+    // T-304 cutover telemetry. The v1 counters are the numerator and
+    // denominator of the acceptance criterion, so they are kept separate from
+    // the legacy ones rather than pooled.
+    uploadV1Attempt: 0,
+    uploadV1Success: 0,
+    uploadV1Failure: 0,
+    uploadLegacyAttempt: 0,
+    uploadLegacySuccess: 0,
+    uploadLegacyFailure: 0,
+    // A take that started toward v1 and finished on legacy. Counted in BOTH
+    // uploadV1Failure and uploadLegacyAttempt: it is a v1 failure that the user
+    // never saw, and hiding it would let the v1 success rate look perfect
+    // precisely because the failures were rescued.
+    uploadV1Fallback: 0,
+    // Users selected by bucket whose PostgreSQL mirror is missing. Its own
+    // counter so a known, fixable population is never invisible.
+    rolloutAccountNotMigrated: 0,
+    rolloutV1Selected: 0,
+    rolloutLegacySelected: 0,
   };
   const durations = [];       // successful-upload handler durations (ms)
   const misses = new Map();   // recordingId -> { count, firstAt, lastAt }
@@ -91,8 +110,15 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
   // ── Uploads ────────────────────────────────────────────────────────────────
   function uploadStarted(req, meta = {}) {
     counters.uploadStarted++;
-    if (req) req._kpiUpload = { t0: Date.now(), done: false, store: meta.store || null };
-    logOf(req).info({ kpi: 'upload_started', store: meta.store || null, sizeBytes: meta.sizeBytes ?? null }, 'kpi: upload started');
+    // 'legacy' | 'v1'. Recorded on the attempt AND re-stated on the result, so
+    // a take that changes path mid-flight is still attributed correctly.
+    const uploadPath = meta.path === 'v1' ? 'v1' : 'legacy';
+    if (uploadPath === 'v1') counters.uploadV1Attempt++; else counters.uploadLegacyAttempt++;
+    if (req) req._kpiUpload = { t0: Date.now(), done: false, store: meta.store || null, path: uploadPath };
+    logOf(req).info({
+      kpi: 'upload_started', store: meta.store || null, sizeBytes: meta.sizeBytes ?? null,
+      upload_path: uploadPath, fallback_from: meta.fallbackFrom || null,
+    }, 'kpi: upload started');
   }
 
   /** outcome: 'success' | 'rejected_limit' | 'error' */
@@ -112,6 +138,23 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
       durations.push(durationMs);
       if (durations.length > DURATION_SAMPLE_CAP) durations.shift();
     }
+    // The path is re-stated HERE, where the result is actually known — a take
+    // that began toward v1 and finished on legacy must not be recorded as a v1
+    // success just because that is how it started.
+    const uploadPath = meta.path || (mark && mark.path) || 'legacy';
+    const fallbackFrom = meta.fallbackFrom || null;
+    if (uploadPath === 'v1') {
+      if (outcome === 'success') counters.uploadV1Success++; else counters.uploadV1Failure++;
+    } else {
+      if (outcome === 'success') counters.uploadLegacySuccess++; else counters.uploadLegacyFailure++;
+      // Landing on legacy after starting on v1 is a v1 FAILURE the user was
+      // rescued from. Counting it keeps the v1 success rate honest.
+      if (fallbackFrom === 'v1') {
+        counters.uploadV1Fallback++;
+        counters.uploadV1Failure++;
+      }
+    }
+
     logOf(req).info({
       kpi: 'upload_finished',
       outcome,
@@ -119,7 +162,27 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
       sizeBytes: meta.sizeBytes ?? null,
       durationMs,
       store: (mark && mark.store) || meta.store || null,
+      upload_path: uploadPath,
+      fallback_from: fallbackFrom,
     }, `kpi: upload ${outcome}`);
+  }
+
+  /**
+   * One rollout decision, recorded where it is made. Deliberately carries NO
+   * user identifier: the bucket and the reason are what an operator needs, and
+   * the identity is neither needed nor safe to keep here.
+   */
+  function rolloutDecision(req, decision) {
+    if (decision.decision === 'v1_rollout') counters.rolloutV1Selected++;
+    else counters.rolloutLegacySelected++;
+    if (decision.decision === 'account_not_migrated') counters.rolloutAccountNotMigrated++;
+    logOf(req).info({
+      kpi: 'rollout_decision',
+      upload_path: decision.path,
+      decision: decision.decision,
+      bucket: decision.bucket,
+      percent: decision.percent,
+    }, `kpi: rollout ${decision.decision}`);
   }
 
   // ── Watch page (Cloudinary index-lag detector) ─────────────────────────────
@@ -171,6 +234,22 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
         retryableFailures: counters.dualWriteRetryable,
         reconciliationPending: counters.dualWriteFailure,   // journaled for repair
       },
+      // T-304 acceptance. successRatePct is exactly the number the ≥99%
+      // criterion is measured against, and its denominator INCLUDES fallbacks,
+      // so rescuing a failure onto legacy cannot inflate it.
+      cutover: {
+        rolloutPercent: Number(process.env.V1_UPLOAD_ROLLOUT_PERCENT || 0) || 0,
+        v1Attempts: counters.uploadV1Attempt,
+        v1Successes: counters.uploadV1Success,
+        v1Failures: counters.uploadV1Failure,
+        v1Fallbacks: counters.uploadV1Fallback,
+        v1SuccessRatePct: counters.uploadV1Attempt
+          ? +((counters.uploadV1Success / counters.uploadV1Attempt) * 100).toFixed(2) : null,
+        legacyAttempts: counters.uploadLegacyAttempt,
+        legacySuccesses: counters.uploadLegacySuccess,
+        legacyFailures: counters.uploadLegacyFailure,
+        accountNotMigrated: counters.rolloutAccountNotMigrated,
+      },
       r2Mirror: {
         attempts: counters.r2MirrorAttempt,
         // The acceptance criterion for T-203 is "100% of new uploads mirrored",
@@ -199,7 +278,7 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
   }
 
   return {
-    uploadStarted, uploadFinished, watchMiss, watchHit, requestError, snapshot,
+    uploadStarted, uploadFinished, rolloutDecision, watchMiss, watchHit, requestError, snapshot,
     counters,                                  // mutated by the dual-write mirror
     _counters: counters,                       // test introspection only
     _stop() { if (interval) clearInterval(interval); },

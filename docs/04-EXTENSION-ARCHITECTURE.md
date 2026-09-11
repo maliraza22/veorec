@@ -163,8 +163,15 @@ connection can lose completely — and the user only finds out at the end.
 JavaScript with no TypeScript toolchain and no build step; introducing one would
 change how every other extension file ships. Same module, JSDoc types.
 
-**Wiring — alongside, never instead of.** Behind the `newUpload` flag
-(`chrome.storage.local`, default OFF — only the literal `true` enables it):
+**Wiring — alongside, never instead of.** Gated by the **server's** rollout
+decision (`GET /api/client-config`, `08` §14a), fetched fresh at the start of
+every recording and cached nothing between takes, so a rollback reaches a client
+on its next take. Any failure — offline, 5xx, malformed body, anything but an
+explicit `path:"v1"` — leaves the legacy path in charge. T-303 originally gated
+this on a `newUpload` flag in `chrome.storage.local`; **T-304 removed it**, because
+a client-side flag would let a client opt itself into the rollout, and keeping
+both gates would have made a staged rollout either impossible (AND) or
+unenforceable (OR):
 
 - `ondataavailable` still pushes every chunk into the legacy `chunks` array, so
   the save-to-device fallback and the legacy POST remain fully available;
