@@ -25,6 +25,15 @@ let chunks = [];
 let streamUploader = null;
 let streamUploadReady = false;
 let lastBlob = null;       // last recorded blob — kept so a failed upload can be saved locally
+// T-402 local persistence (docs/05). Every dataavailable chunk is written to
+// IndexedDB BEFORE the uploader sees it, so a crash loses at most ~1 s. The
+// session row is deleted only after the server confirmed completion.
+let recStore = null;        // opened once per window
+let localSession = null;    // the IndexedDB session for the current take
+let localSeq = 0;           // next chunk seq (the store assigns in arrival order)
+let fedChunks = [];         // { seq, size } of chunks fed to the uploader, not yet sealed
+let persistFailed = false;  // PERSIST_FAILED shown once; recording continues
+let heartbeatTimer = null;
 let startTime = null;
 let pausedAccum = 0;       // total paused ms
 let pauseStartedAt = null;
@@ -249,6 +258,21 @@ async function beginRecording() {
   limitReached = false;
   timerEl.classList.remove('limitWarn');
 
+  // T-402: local recovery protection. docs/05 §4 — refuse to start with under
+  // 500 MB of free storage (better than dying mid-recording); warn under 2 GB.
+  // A store that cannot be opened at all leaves the take unprotected but never
+  // prevents recording: better un-protected than not recorded (03 §7).
+  const store = await openLocalStore();
+  if (store) {
+    const space = await store.checkSpace().catch(() => ({ level: 'unknown', ok: true }));
+    if (!space.ok) {
+      cleanupStreams();
+      showStartButton('Not enough free disk space to protect this recording (under 500 MB). Free up space and try again.');
+      return;
+    }
+    if (space.level === 'warn') overlayMsg({ type: 'SR_OVERLAY_WARN', text: 'Low disk space — recovery protection may run out during a long recording.' });
+  }
+
   // A suspended AudioContext records pure SILENCE (no error) — this auto-opened
   // window often has no user gesture, so force it running BEFORE recording starts,
   // and re-resume if the OS interrupts audio mid-recording.
@@ -270,7 +294,12 @@ async function beginRecording() {
   const bitsPerSecond = opts.quality === 'high' ? 4_000_000 : opts.quality === 'medium' ? 2_500_000 : 1_000_000;
 
   mediaRecorder = new MediaRecorder(finalStream, { mimeType, videoBitsPerSecond: bitsPerSecond });
+  // T-402: the local session row exists before the first chunk (docs/05 §3).
+  await startLocalSession(mediaRecorder.mimeType || mimeType, opts);
   mediaRecorder.ondataavailable = e => {
+    // T-402: IndexedDB FIRST (docs/03 §7) — fire-and-ordered, never awaited,
+    // never allowed to interrupt the recording.
+    if (e.data.size > 0) persistChunk(e.data);
     if (e.data.size > 0) chunks.push(e.data);
     // T-303: stream the same chunk to storage while recording continues.
     // Wrapped so an uploader fault can never interrupt the recording itself —
@@ -295,6 +324,7 @@ async function beginRecording() {
   // charge.
   startStreamingUpload().catch(() => { streamUploadReady = false; });
   mediaRecorder.start(1000);
+  startHeartbeat();   // T-402: docs/05 §3 — bumped every 5 s while recording
 
   // Wall-clock backstop. A single setTimeout still fires when an occluded window
   // freezes setInterval; it re-arms if the recording was paused so it never stops
@@ -441,6 +471,7 @@ function cancelRecording() {
   }
   clearInterval(timerInterval);
   chunks = [];
+  discardLocalSession();                         // T-402: docs/03 §3.11 — an explicit discard
   cleanupStreams();
   closeBubble();
   chrome.storage.local.set({ recording: false, recState: { recording: false } });
@@ -472,11 +503,114 @@ function showDownloadFallback() {
 
 // Clear the "recording" flags so the popup never stays stuck on a failed upload.
 function resetRecordingState() {
+  // T-402: an upload that did not complete leaves the local session marked
+  // failed and KEPT (docs/05 §3) — T-403's recovery flow offers resume /
+  // download / discard. Deleted only on server-confirmed completion or an
+  // explicit discard.
+  stopHeartbeat();
+  if (recStore && localSession) {
+    if (localSeq === 0) { const id = localSession.id; recStore.deleteSession(id).catch(() => {}); }   // nothing captured: no phantom recovery
+    else markLocalSession({ status: 'failed' });
+    localSession = null;
+  }
   try { chrome.storage.local.set({ recording: false, recState: { recording: false } }); } catch (e) {}
   try { chrome.runtime.sendMessage({ type: 'RECORDING_RESET' }); } catch (e) {}
 }
 
 // ── T-303 streaming upload (gated by the T-304 server rollout decision) ─────────────────────────────────
+
+// ── T-402 local persistence (docs/05) ───────────────────────────────────────
+// Nothing here may throw into the recorder: every call is best-effort and the
+// worst outcome is a take that is not protected — never a take that is lost.
+
+async function openLocalStore() {
+  if (recStore) return recStore;
+  if (typeof VeoRecRecorderStore === 'undefined') return null;
+  try {
+    recStore = await VeoRecRecorderStore.openStore({
+      log: (level, msg, meta) => { try { (level === 'warn' ? console.warn : console.log)('[recorder-store]', msg, meta || ''); } catch (e) {} },
+    });
+  } catch (e) { recStore = null; }
+  return recStore;
+}
+
+async function startLocalSession(mimeType, config) {
+  localSession = null; localSeq = 0; fedChunks = []; persistFailed = false;
+  const store = await openLocalStore();
+  if (!store) return null;
+  try {
+    let userId = null;
+    try { const { sr_user } = await chrome.storage.local.get('sr_user'); userId = (sr_user && sr_user.id) || null; } catch (e) {}
+    localSession = await store.createSession({ mimeType, config: config || {}, title: 'Screen recording', userId });
+  } catch (e) { localSession = null; }
+  return localSession;
+}
+
+/** IndexedDB first, fire-and-ordered. PERSIST_FAILED once; recording continues. */
+function persistChunk(blob) {
+  if (!recStore || !localSession) return;
+  const seq = localSeq;
+  localSeq += 1;
+  fedChunks.push({ seq, size: blob.size });
+  recStore.appendChunk(localSession.id, blob).catch((err) => {
+    if (!persistFailed) {
+      persistFailed = true;
+      overlayMsg({ type: 'SR_OVERLAY_WARN', text: 'Recovery protection unavailable — recording continues.' });
+      try { console.warn('[recorder-store] PERSIST_FAILED', err && err.code); } catch (e) {}
+    }
+    // docs/05 §4: under quota pressure, reclaim space covered by verified parts.
+    if (err && err.code === 'quota_exceeded' && streamUploadReady) {
+      recStore.pruneChunks(localSession.id, { force: true }).catch(() => {});
+    }
+  });
+}
+
+function startHeartbeat() {
+  stopHeartbeat();
+  if (!recStore || !localSession) return;
+  heartbeatTimer = setInterval(() => { recStore.heartbeat(localSession.id).catch(() => {}); }, 5000);
+}
+function stopHeartbeat() { if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; } }
+
+function linkLocalSession(fields) {
+  if (!recStore || !localSession) return;
+  recStore.updateSession(localSession.id, fields).then((s) => { localSession = s; }).catch(() => {});
+}
+function markLocalSession(fields) {
+  if (!recStore || !localSession) return Promise.resolve();
+  return recStore.updateSession(localSession.id, fields).then((s) => { localSession = s; }).catch(() => {});
+}
+
+/** docs/05 §5: the sealed part's chunk range, recorded pending BEFORE its PUT. */
+function recordSealedPart(partNumber, size) {
+  if (!recStore || !localSession) return;
+  let taken = 0; const seqs = [];
+  while (fedChunks.length && taken < size) { const c = fedChunks.shift(); taken += c.size; seqs.push(c.seq); }
+  if (!seqs.length) return;
+  recStore.upsertPart(localSession.id, { partNumber, size, firstSeq: seqs[0], lastSeq: seqs[seqs.length - 1], status: 'pending' }).catch(() => {});
+}
+function recordUploadedPart(uploader, partNumber) {
+  if (!recStore || !localSession) return;
+  const p = uploader && uploader.state && uploader.state.parts.get(partNumber);
+  if (!p || p.status !== 'uploaded' || !p.etag) return;
+  recStore.upsertPart(localSession.id, { partNumber, status: 'uploaded', etag: p.etag, size: p.size }).catch(() => {});
+}
+
+/** Only after the server confirmed completion (docs/03 §3.10). */
+async function deleteLocalSession() {
+  stopHeartbeat();
+  if (!recStore || !localSession) return;
+  const id = localSession.id; localSession = null;
+  try { await recStore.deleteSession(id); } catch (e) {}
+}
+/** An explicit discard: local data gone, server session aborted best-effort (docs/03 §3.11). */
+function discardLocalSession() {
+  stopHeartbeat();
+  if (streamUploader && streamUploadReady) { try { streamUploader.abort().catch(() => {}); } catch (e) {} }
+  if (!recStore || !localSession) return;
+  const id = localSession.id; localSession = null;
+  recStore.deleteSession(id).catch(() => {});
+}
 
 /** Open a v1 upload session. Any failure leaves the legacy path untouched. */
 async function startStreamingUpload() {
@@ -513,12 +647,19 @@ async function startStreamingUpload() {
     onEvent: (e) => {
       if (e.type === "ceiling-warning") setStatus("Approaching your size limit — wrapping up soon…", "uploading");
       if (e.type === "ceiling-reached") { try { stopRecording(); } catch (err) {} }
+      // T-402: upload bookkeeping in IndexedDB (docs/05 §5) — a sealed part is
+      // recorded `pending` BEFORE its PUT; an uploaded part gets its etag.
+      if (e.type === "part-sealed") recordSealedPart(e.partNumber, e.size);
+      if (e.type === "progress" && e.partNumber) recordUploadedPart(up, e.partNumber);
     },
   });
   const session = await up.begin({ recordingId: rec.id, mimeType: "video/webm" });
   if (!session) return;
   streamUploader = up;
   streamUploadReady = true;
+  // T-402: server linkage on the local session as soon as it is known
+  // (docs/05 §3), so recovery can resume this exact upload session.
+  linkLocalSession({ recordingId: rec.id, uploadSessionId: session.uploadSessionId, partSize: session.partSize });
 }
 
 /**
@@ -546,6 +687,10 @@ async function handleStop() {
   if (limitReached && recordingLimitSec > 0) duration = Math.min(duration, recordingLimitSec);
   const rawBlob = new Blob(chunks, { type: 'video/webm' });
   chunks = [];
+  // T-402: the take is captured; the heartbeat stops and the local session
+  // records that it is stopped (docs/05 §3) with the client duration hint.
+  stopHeartbeat();
+  markLocalSession({ status: 'stopped', clientDuration: duration });
   // MediaRecorder omits the Duration header (live stream), so the file shows no
   // length and can't be scrubbed. Inject the real duration before BOTH the upload
   // and the local-save fallback. Fail-safe: returns the original blob on any error.
@@ -577,8 +722,12 @@ async function handleStop() {
     // storage — skip the legacy POST entirely. Otherwise fall through to it
     // with the blob we still hold, so a failed streaming upload costs the user
     // nothing.
+    markLocalSession({ status: 'uploading' });
     const streamedUrl = await finishStreamingUpload(duration);
     if (streamedUrl) {
+      // T-402: the server confirmed completion — ONLY now is the local copy
+      // deleted (docs/03 §3.10: local data outlives every failure mode).
+      await deleteLocalSession();
       await chrome.storage.local.set({
         shareLink: streamedUrl, recording: false, recState: { recording: false },
         lastRecording: { url: streamedUrl, title, at: Date.now() },
@@ -633,6 +782,8 @@ async function handleStop() {
       shareLink: shareUrl, recording: false, recState: { recording: false },
       lastRecording: { url: shareUrl, title, at: Date.now() },
     });
+    // T-402: the legacy server has the recording — the local copy may go.
+    await deleteLocalSession();
     chrome.runtime.sendMessage({ type: 'UPLOAD_DONE', url: shareUrl, title });
 
     // Open the saved video's preview page in a new tab, then close this window.
@@ -675,6 +826,7 @@ function restartRecording() {
   }
   clearInterval(timerInterval);
   chunks = [];
+  discardLocalSession();                         // T-402: the discarded take is not kept
   cleanupStreams();
   // Bring the window forward so the screen-share picker is usable, then re-record.
   try { chrome.windows.getCurrent((w) => { if (w && w.id != null) chrome.windows.update(w.id, { state: 'normal', focused: true }); }); } catch (e) {}

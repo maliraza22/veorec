@@ -231,7 +231,19 @@ recovery database of `05` §2–§5, §7: sessions with the 15 s heartbeat, chun
 written in arrival order on a per-session queue, part bookkeeping with the
 etag as the durable proof, prune-only-under-pressure, atomic session deletion
 and 7-day GC. It stores what it is told and returns it in order — no network,
-no `chrome.*`, nothing of the uploader. The recorder does not use it yet: T-402
-wires `dataavailable` → store → uploader and delete-after-complete; T-403 adds
-the launch scan and recovery card. Loaded by `recorder.html` alongside
-`uploader.js` when T-402 lands.
+no `chrome.*`, nothing of the uploader. **Wired by T-402:** `recorder.html` loads it before `uploader.js`; the local
+session is created with the actual `MediaRecorder.mimeType` before the first
+chunk; every `dataavailable` chunk is persisted FIRST (fire-and-ordered, never
+awaited), then pushed to the legacy array, then fed to the uploader; a 5 s
+heartbeat runs while recording; server linkage (`recordingId`,
+`uploadSessionId`, `partSize`) is written as soon as `begin()` returns; sealed
+parts are recorded `pending` before their PUT and get their etag on upload;
+`PERSIST_FAILED` is shown once as a banner and recording continues (quota
+pressure prunes chunks covered by verified parts while the uploader is alive);
+the session is marked `stopped` → `uploading` at finalize and **deleted only
+after the server confirmed completion** (both the v1 and the legacy path); a
+failed upload marks it `failed` and keeps it; cancel/restart discard it and
+abort the server session best-effort; a take with no chunks is deleted rather
+than kept as a phantom. Below 500 MB of free storage the recorder refuses to
+start with a plain message; below 2 GB it warns. T-403 adds the launch scan
+and recovery card.
