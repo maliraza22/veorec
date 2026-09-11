@@ -236,7 +236,7 @@ function fakeUploaderFactory(plan) {
   const scripts = html.match(/<script src="([^"]+)"><\/script>/g).map((x) => x.match(/"([^"]+)"/)[1]);
   ok(scripts.indexOf('recovery.js') > scripts.indexOf('uploader.js') && scripts.indexOf('recovery.js') < scripts.indexOf('recorder.js'), 'recovery.js loads after uploader.js and before recorder.js');
   ok(/id="recoveryCard"/.test(html), 'the recovery card container exists');
-  ok(/const verdict = await runRecoveryScan\(\)[\s\S]*?if \(!verdict\.proceed\) return;[\s\S]*?beginRecording\(\)\.catch\(onStartError\)/.test(code), 'the launch scan runs BEFORE auto-start and gates it (T-307 adds the quota pre-flight between them)');
+  ok(/const verdict = await runRecoveryScan\(\)[\s\S]*?if \(!verdict\.proceed\) return;[\s\S]*?startRecording\(\);\s*\}\)\(\);/.test(code), 'the launch scan runs BEFORE auto-start and gates it (T-307 adds the quota pre-flight between them; T-503 starts through the machine)');
   ok(/if \(result\.live\)[\s\S]*?already running in another VeoRec window/.test(rec), 'a live session elsewhere refuses to start with a plain message');
   ok(/mk\('⬆ Resume upload'/.test(rec) && /mk\('⬇ Download'/.test(rec) && /mk\('🗑 Discard'/.test(rec), 'Resume / Download / Discard actions');
   ok(/if \(d\.ownedByCurrentUser\) mk\('⬆ Resume upload'/.test(code), 'Resume is offered only for the current user\'s sessions');

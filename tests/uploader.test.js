@@ -374,7 +374,7 @@ const makeUploader = (world, extra = {}) => U.createUploader({
   const recSrc = fs.readFileSync(path.join(__dirname, '..', 'extension', 'recorder.js'), 'utf8');
   ok(/chunks\.push\(e\.data\)/.test(recSrc),
     'the legacy chunk buffer is STILL filled — the save-to-device fallback survives');
-  ok(/streamUploadReady && e\.data\.size > 0/.test(recSrc), 'the uploader is fed from dataavailable');
+  ok(/if \(streamUploadReady\) \{ try \{ streamUploader\.addChunk\(e\.data\)/.test(recSrc), 'the uploader is fed from dataavailable (T-503: inside the startRecorder effect)');
   // T-304 REPLACED the client-side newUpload flag with the server decision. The
   // safety property is unchanged and still asserted here — the new path is OFF
   // unless something explicitly turns it on — but the switch now lives on the

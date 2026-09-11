@@ -286,7 +286,8 @@ function manager(script, audio = {}, extra = {}) {
   ok(/mandatory: \{ chromeMediaSource: 'tab'/.test(src), 'the required legacy mandatory shape is kept');
   ok(src.includes(C.WARNING_TEXT.no_audio_at_all) && src.includes(C.WARNING_TEXT.tab_audio_missing) && src.includes(C.WARNING_TEXT.no_system_audio), 'the audience-facing warning strings are kept verbatim');
   const rec = fs.readFileSync(path.join(__dirname, '..', 'extension', 'recorder.js'), 'utf8');
-  for (const k of ['no_audio_at_all', 'tab_audio_missing', 'no_system_audio']) ok(rec.includes(C.WARNING_TEXT[k]), `recorder.js still carries the ${k} text (T-503 will render from the manager)`);
+  ok(/VeoRecCapture\.WARNING_TEXT\[code\]/.test(rec), 'T-503: recorder.js renders warnings from the manager\'s texts');
+  for (const k of ['no_audio_at_all', 'tab_audio_missing', 'no_system_audio']) ok(!rec.includes(C.WARNING_TEXT[k]), `the ${k} text lives ONLY in capture.js now (no duplicated copy in recorder.js)`);
 
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exitCode = fail ? 1 : 0;

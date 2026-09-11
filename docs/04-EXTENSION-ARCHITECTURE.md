@@ -56,7 +56,7 @@ Changes vs. current (`extension/manifest.json`):
 
 ## 5. Recorder window UX states
 
-Direct render of the machine (`03` §2): options recap → permission picker → countdown (also mirrored by overlay) → recording (window stays open, un-minimized — Chrome freezes minimized windows and that stalls uploads; keep this deliberate behavior and its comment from `recorder.js:324-327`) → upload progress (% from uploader) → done (auto-open watch page) / failed (Retry / Save locally / Discard) / **recovery card** on launch when an orphaned session exists.
+Direct render of the machine (`03` §2): options recap → permission picker → countdown (also mirrored by overlay) → recording (window stays open, un-minimized — Chrome freezes minimized windows and that stalls uploads; keep this deliberate behavior and its comment from `recorder.js:324-327`) → upload progress (% from uploader) → done (auto-open watch page) / failed (Retry / Save locally / Discard) / **recovery card** on launch when an orphaned session exists. Delivered by T-503 (§5.6).
 
 ## 6. Typed message protocol
 
@@ -113,7 +113,7 @@ interface RecOptions {
 |---|---|---|---|
 | `sr_token`, `sr_user` | SW (auth sync), popup | all | cleared together on sign-out |
 | `recOptions` | popup / SW (web start) | recorder, overlay (camera mode) | per-recording input |
-| `recSession` | recorder machine only | overlay, popup, SW | projection, `03` §11 |
+| `recSession` | recorder machine only (T-503 `publish` effect) | overlay, popup, SW | projection, `03` §11; overlays still read the mirrored legacy keys until Phase 14 |
 | `lastRecording` | recorder | popup | latest-share card |
 | *(legacy)* `recording`, `recState`, `startTime`, `shareLink` | recorder (dual-write) | old code | delete in migration Phase 14 |
 
@@ -274,3 +274,16 @@ warnings and interruption-watcher module of `03` §4–§6, §9 — the effect s
 of the machine. Every browser dependency is injectable. Not wired yet: T-503
 supplies it as the machine's `acquire` effect and renders its warnings.
 Details: `03` §4.1.
+
+### 5.6 Recorder window as machine renderer (delivered by T-503)
+
+`extension/recorder.js` is a renderer of `VeoRecMachine` projections: the
+CaptureManager is the `acquire` effect, the streaming uploader / RecorderStore /
+recovery / quota pre-flight blocks are unchanged effects behind it, every button
+and `SR_*` message is a `machine.send`, and `publish` writes `recSession` with
+the legacy keys of §7 mirrored in the same write. Mic-denied is a three-way
+choice (record without mic / fix permission / cancel); upload failure is
+Retry / Save locally / Discard with the local session kept for recovery.
+Details: `03` §2.2 and §11. Script order in `recorder.html`:
+`fix-webm-duration, machine, capture, recorderStore, uploader, recovery,
+quotaPreflight, recorder`.

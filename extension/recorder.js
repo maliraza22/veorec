@@ -1,4 +1,19 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Recorder window — a RENDERER of RecorderMachine projections (T-503, docs/03)
+//
+// One machine, one owner (docs/03 §1): `machine` (T-501) is the only writer of
+// recording lifecycle state. This file supplies its EFFECTS — CaptureManager
+// (T-502) for acquisition, MediaRecorder, the IndexedDB store (T-401/T-402),
+// the streaming uploader (T-303) and the legacy upload fallback — turns user
+// clicks and overlay/popup messages into EVENTS, and renders the projection.
+// No `isRecording` boolean lives here any more.
+//
+// Launch order (docs/03 §3.1, §3.0): options → plan limit → recovery scan
+// (T-403) → quota pre-flight (T-307) → START.
+// ─────────────────────────────────────────────────────────────────────────────
 const SERVER = 'https://screenrec-api-production.up.railway.app';
+const DASHBOARD_URL = 'https://veorec.com/';
+const PRICING_URL = 'https://veorec.com/pricing';
 
 const mainBtn   = document.getElementById('mainBtn');
 const controls  = document.getElementById('controls');
@@ -15,381 +30,62 @@ const previewWrap = document.getElementById('previewWrap');
 const canvas    = document.getElementById('previewCanvas');
 const countdownEl  = document.getElementById('countdown');
 const countdownNum = document.getElementById('countdownNum');
+const recoveryCard = document.getElementById('recoveryCard');
 
+// ── Per-take resources (owned by machine states, disposed by their exits) ───
+let capture = null;         // T-502 acquire() result: tracks, streams, mixer, dispose()
+let captureWatchOff = null; // T-502 watch() disposer
 let mediaRecorder = null;
-let chunks = [];
-// T-303 streaming uploader. Runs ALONGSIDE the legacy path, enabled per user
-// by the T-304 server rollout decision: chunks are still accumulated in `chunks`, so the
-// save-to-device fallback and the legacy POST stay available even if the
-// streaming upload fails. A take is never lost to the new path.
-let streamUploader = null;
+let chunks = [];            // legacy in-memory chunks — the save-to-device fallback (memory rule is Phase 5 follow-up)
+let streamUploader = null;  // T-303
 let streamUploadReady = false;
-let lastBlob = null;       // last recorded blob — kept so a failed upload can be saved locally
-// T-402 local persistence (docs/05). Every dataavailable chunk is written to
-// IndexedDB BEFORE the uploader sees it, so a crash loses at most ~1 s. The
-// session row is deleted only after the server confirmed completion.
-let recStore = null;        // opened once per window
-let localSession = null;    // the IndexedDB session for the current take
-let localSeq = 0;           // next chunk seq (the store assigns in arrival order)
-let fedChunks = [];         // { seq, size } of chunks fed to the uploader, not yet sealed
-let persistFailed = false;  // PERSIST_FAILED shown once; recording continues
-let heartbeatTimer = null;
-let startTime = null;
-let pausedAccum = 0;       // total paused ms
-let pauseStartedAt = null;
-let timerInterval = null;
+let lastBlob = null;        // the captured blob, kept so a failed upload can be saved locally
 let rafId = null;
-let audioCtx = null;
-let activeStreams = [];    // all source streams to stop at the end
-let hardStopTimer = null;  // wall-clock cap that survives background timer throttling
+let uiTick = null;
+let lastWatchUrl = null;
+let lastUploadMessage = null;   // the server's own text for an upload refusal (rendered in upload_failed)
+
+// T-402 local persistence (docs/05).
+let recStore = null;
+let localSession = null;
+let localSeq = 0;
+let fedChunks = [];
+let persistFailed = false;
+let heartbeatTimer = null;
 
 // Options carried over from the popup
 let opts = { quality: 'medium', audio: true, camera: 'off', countdown: true };
 
-// Recording-length limit (seconds). Driven by the user's plan — fetched on load.
-// Defaults to the Free limit (10 min) as a safe fallback until entitlements load.
+// Recording-length limit (seconds) — driven by the plan; the Free limit is the safe fallback.
 let recordingLimitSec = 10 * 60;
-let limitWarned = false;          // 30s-remaining warning shown once
-let limitReached = false;         // auto-stopped at the cap
 
-// Fetch the signed-in user's plan recording limit so the countdown matches it.
+// ── Small helpers ────────────────────────────────────────────────────────────
+const openTab = (url) => { try { chrome.tabs.create({ url }); } catch (e) { try { window.open(url, '_blank'); } catch (e2) {} } };
+function setStatus(msg, cls = '') { statusEl.textContent = msg; statusEl.className = 'status ' + cls; }
+function overlayMsg(msg) {
+  const tabId = opts.bubbleTabId;
+  if (tabId != null && chrome.tabs && chrome.tabs.sendMessage) { try { chrome.tabs.sendMessage(tabId, msg); } catch (e) {} }
+}
+function closeBubble() { overlayMsg({ type: 'SR_STOP_BUBBLE' }); }
+function closeWindow() {
+  try { window.close(); } catch (e) {}
+  try { chrome.windows.getCurrent((w) => { if (w && w.id != null) chrome.windows.remove(w.id); }); } catch (e) {}
+}
+function focusWindow() {
+  try { chrome.windows.getCurrent((w) => { if (w && w.id != null) chrome.windows.update(w.id, { state: 'normal', focused: true }); }); } catch (e) {}
+}
+const fmtClock = (s) => `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+
 async function loadPlanLimit() {
   try {
     const { sr_token } = await chrome.storage.local.get('sr_token');
     if (!sr_token) return;
-    const res = await fetch(`${SERVER}/api/me/entitlements`, {
-      headers: { Authorization: `Bearer ${sr_token}` },
-    });
+    const res = await fetch(`${SERVER}/api/me/entitlements`, { headers: { Authorization: `Bearer ${sr_token}` } });
     if (!res.ok) return;
     const data = await res.json();
     const mins = data?.plan?.recordingLimitMinutes;
     if (Number.isFinite(mins) && mins > 0) recordingLimitSec = mins * 60;
   } catch { /* keep the safe default */ }
-}
-
-function setStatus(msg, cls = '') {
-  statusEl.textContent = msg;
-  statusEl.className = 'status ' + cls;
-}
-
-function elapsedSeconds() {
-  const paused = pausedAccum + (pauseStartedAt ? Date.now() - pauseStartedAt : 0);
-  return Math.floor((Date.now() - startTime - paused) / 1000);
-}
-
-// Send a message to the on-screen overlay (toolbar + camera bubble) on the tab.
-function overlayMsg(msg) {
-  const tabId = opts.bubbleTabId;
-  if (tabId != null && chrome.tabs && chrome.tabs.sendMessage) {
-    try { chrome.tabs.sendMessage(tabId, msg); } catch (e) {}
-  }
-}
-
-function updateTimer() {
-  const s = elapsedSeconds();
-  const m = String(Math.floor(s / 60)).padStart(2, '0');
-  const text = `${m}:${String(s % 60).padStart(2, '0')}`;
-  timerEl.textContent = text;
-  overlayMsg({ type: 'SR_OVERLAY_TICK', text });
-
-  // ── Plan recording-length limit (live countdown) ─────────────────────────
-  const remaining = recordingLimitSec - s;
-  if (!limitReached && remaining <= 0) {
-    // Hard cap reached — auto-stop so the upload always passes server validation.
-    limitReached = true;
-    setStatus(`⏱ Recording limit reached (${Math.round(recordingLimitSec / 60)} min) — saving…`, 'uploading');
-    stopRecording();
-    return;
-  }
-  if (!limitWarned && remaining <= 30 && remaining > 0) {
-    limitWarned = true;
-    timerEl.classList.add('limitWarn');
-    setStatus(`⚠ 30 seconds remaining on your plan limit`, 'recording');
-  }
-}
-
-function videoSize(quality) {
-  return quality === 'high' ? { w: 1920, h: 1080 }
-       : quality === 'medium' ? { w: 1280, h: 720 }
-       : { w: 854, h: 480 };
-}
-
-async function playStreamInVideo(stream) {
-  const v = document.createElement('video');
-  v.srcObject = stream;
-  v.muted = true;
-  v.playsInline = true;
-  await v.play();
-  // wait for dimensions
-  if (!v.videoWidth) await new Promise(r => v.addEventListener('loadedmetadata', r, { once: true }));
-  return v;
-}
-
-function countdown() {
-  if (!opts.countdown) return Promise.resolve();
-  // opts.countdown may be a number of seconds (3/5) or `true` (legacy = 3).
-  return new Promise(resolve => {
-    let n = typeof opts.countdown === 'number' ? opts.countdown : 3;
-    countdownNum.textContent = n;
-    countdownEl.classList.add('show');
-    const iv = setInterval(() => {
-      n -= 1;
-      if (n <= 0) {
-        clearInterval(iv);
-        countdownEl.classList.remove('show');
-        resolve();
-      } else {
-        countdownNum.textContent = n;
-        // restart pop animation
-        countdownNum.style.animation = 'none';
-        void countdownNum.offsetWidth;
-        countdownNum.style.animation = '';
-      }
-    }, 1000);
-  });
-}
-
-async function beginRecording() {
-  mainBtn.style.display = 'none';
-  linkBox.classList.remove('show');
-  controls.style.display = 'none';
-  setStatus(opts.camera === 'only' ? 'Starting camera…' : 'Select a screen or window to share…');
-
-  const { w: maxW, h: maxH } = videoSize(opts.quality);
-  const wantMic = opts.audio !== false;
-  const cam = opts.camera || 'off';
-
-  let screenStream = null, camStream = null, micStream = null;
-
-  // ── Acquire sources ──────────────────────────────────────────────────────
-  // For 'off' and 'bubble' we capture the SCREEN. (In 'bubble' the camera is a
-  // floating DOM overlay already injected onto the page, so it's captured as
-  // part of the screen — no canvas, which means recording survives minimize.)
-  if (cam !== 'only') {
-    if (opts.mode === 'tab' && opts.tabStreamId) {
-      // No-picker capture of the CURRENT tab via chrome.tabCapture. The tab's
-      // audio (everyone in a web meeting) ALWAYS comes through — no "share audio"
-      // checkbox to forget. The legacy `mandatory` constraint shape is REQUIRED
-      // for chromeMediaSource:'tab' (the modern { video:true } form is ignored).
-      screenStream = await navigator.mediaDevices.getUserMedia({
-        video: { mandatory: { chromeMediaSource: 'tab', chromeMediaSourceId: opts.tabStreamId, maxWidth: maxW, maxHeight: maxH, maxFrameRate: 30 } },
-        audio: { mandatory: { chromeMediaSource: 'tab', chromeMediaSourceId: opts.tabStreamId } },
-      });
-    } else {
-      const videoConstraints = { width: { ideal: maxW }, height: { ideal: maxH }, frameRate: { ideal: 30 } };
-      // Hint the picker toward the surface the user chose (monitor/browser/window)
-      if (['monitor', 'browser', 'window'].includes(opts.surface)) videoConstraints.displaySurface = opts.surface;
-      // `systemAudio: 'include'` asks Chrome to offer the "share audio" option so we
-      // can capture other meeting participants (only works for a TAB or whole SCREEN).
-      screenStream = await navigator.mediaDevices.getDisplayMedia({ video: videoConstraints, audio: true, systemAudio: 'include' });
-    }
-    activeStreams.push(screenStream);
-  }
-  if (cam === 'only') {
-    camStream = await navigator.mediaDevices.getUserMedia({
-      video: { width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false,
-    });
-    activeStreams.push(camStream);
-  }
-  if (wantMic) {
-    try {
-      micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-      activeStreams.push(micStream);
-    } catch (e) { console.warn('VeoRec: microphone unavailable —', e && e.name, e && e.message); }
-  }
-
-  // If the user ends screen share via the browser bar, stop.
-  if (screenStream) {
-    screenStream.getVideoTracks()[0].addEventListener('ended', () => {
-      if (mediaRecorder && mediaRecorder.state !== 'inactive') stopRecording();
-    });
-  }
-
-  // ── Build the video track — always a DIRECT track (no canvas) ─────────────
-  let videoTrack;
-  if (cam === 'only') {
-    videoTrack = camStream.getVideoTracks()[0];
-    // optional live preview (not recorded — throttling here is harmless)
-    const camVideo = await playStreamInVideo(camStream);
-    canvas.width = camVideo.videoWidth || 1280;
-    canvas.height = camVideo.videoHeight || 720;
-    const ctx = canvas.getContext('2d');
-    previewWrap.classList.add('show');
-    const draw = () => { ctx.drawImage(camVideo, 0, 0, canvas.width, canvas.height); rafId = requestAnimationFrame(draw); };
-    draw();
-  } else {
-    videoTrack = screenStream.getVideoTracks()[0];
-    previewWrap.classList.remove('show');
-  }
-
-  // ── Mix audio (tab/screen audio + mic) into ONE track ─────────────────────
-  // Everyone else (tab/screen audio) AND the user (mic) feed a single mixed
-  // track, so the recording always carries both sides of a meeting.
-  const audioTracks = [];
-  const screenAudio = screenStream ? screenStream.getAudioTracks() : [];
-  if (screenAudio.length > 0 || micStream) {
-    audioCtx = new AudioContext();
-    const dest = audioCtx.createMediaStreamDestination();
-    if (screenAudio.length > 0) {
-      const screenSrc = audioCtx.createMediaStreamSource(screenStream);
-      screenSrc.connect(dest);
-      // chrome.tabCapture MUTES the captured tab for the user — route the tab
-      // audio back to the speakers so the host still hears the call live.
-      if (opts.mode === 'tab') screenSrc.connect(audioCtx.destination);
-    }
-    if (micStream) audioCtx.createMediaStreamSource(micStream).connect(dest);
-    audioTracks.push(...dest.stream.getAudioTracks());
-  }
-  // Wanted audio but got none (mic denied + no system/tab audio) — we'll warn
-  // loudly below instead of silently recording a muted video.
-  const noAudioAtAll = wantMic && audioTracks.length === 0;
-
-  const finalStream = new MediaStream([videoTrack, ...audioTracks]);
-
-  // ── Countdown, then record ───────────────────────────────────────────────
-  setStatus('Get ready…');
-  await countdown();
-
-  chunks = [];
-  startTime = Date.now();
-  pausedAccum = 0;
-  pauseStartedAt = null;
-  limitWarned = false;
-  limitReached = false;
-  timerEl.classList.remove('limitWarn');
-
-  // T-402: local recovery protection. docs/05 §4 — refuse to start with under
-  // 500 MB of free storage (better than dying mid-recording); warn under 2 GB.
-  // A store that cannot be opened at all leaves the take unprotected but never
-  // prevents recording: better un-protected than not recorded (03 §7).
-  const store = await openLocalStore();
-  if (store) {
-    const space = await store.checkSpace().catch(() => ({ level: 'unknown', ok: true }));
-    if (!space.ok) {
-      cleanupStreams();
-      showStartButton('Not enough free disk space to protect this recording (under 500 MB). Free up space and try again.');
-      return;
-    }
-    if (space.level === 'warn') overlayMsg({ type: 'SR_OVERLAY_WARN', text: 'Low disk space — recovery protection may run out during a long recording.' });
-  }
-
-  // A suspended AudioContext records pure SILENCE (no error) — this auto-opened
-  // window often has no user gesture, so force it running BEFORE recording starts,
-  // and re-resume if the OS interrupts audio mid-recording.
-  if (audioCtx) {
-    try { if (audioCtx.state !== 'running') await audioCtx.resume(); } catch (e) {}
-    if (audioCtx.state !== 'running') {
-      await new Promise((res) => {
-        const t = setTimeout(res, 1500);
-        audioCtx.addEventListener('statechange', function h() {
-          if (audioCtx.state === 'running') { clearTimeout(t); audioCtx.removeEventListener('statechange', h); res(); }
-        });
-      });
-    }
-    audioCtx.onstatechange = () => { if (audioCtx && audioCtx.state !== 'running') audioCtx.resume().catch(() => {}); };
-  }
-
-  const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
-    ? 'video/webm;codecs=vp9' : 'video/webm';
-  const bitsPerSecond = opts.quality === 'high' ? 4_000_000 : opts.quality === 'medium' ? 2_500_000 : 1_000_000;
-
-  mediaRecorder = new MediaRecorder(finalStream, { mimeType, videoBitsPerSecond: bitsPerSecond });
-  // T-402: the local session row exists before the first chunk (docs/05 §3).
-  await startLocalSession(mediaRecorder.mimeType || mimeType, opts);
-  mediaRecorder.ondataavailable = e => {
-    // T-402: IndexedDB FIRST (docs/03 §7) — fire-and-ordered, never awaited,
-    // never allowed to interrupt the recording.
-    if (e.data.size > 0) persistChunk(e.data);
-    if (e.data.size > 0) chunks.push(e.data);
-    // T-303: stream the same chunk to storage while recording continues.
-    // Wrapped so an uploader fault can never interrupt the recording itself —
-    // the legacy path still holds every chunk.
-    if (streamUploadReady && e.data.size > 0) {
-      try { streamUploader.addChunk(e.data); } catch (err) { streamUploadReady = false; }
-    }
-    // PRIMARY limit enforcement — driven by the ENCODER clock (fires ~1/s via the
-    // timeslice), so the cap trips even when the window's timers are throttled
-    // because the recorder window sits behind a focused meeting.
-    if (!limitReached && recordingLimitSec > 0 && elapsedSeconds() >= recordingLimitSec) {
-      limitReached = true;
-      setStatus(`⏱ Recording limit reached (${Math.round(recordingLimitSec / 60)} min) — saving…`, 'uploading');
-      stopRecording();
-    }
-  };
-  mediaRecorder.onstop = handleStop;
-
-  // T-303: open an upload session so parts can stream while recording. Gated by
-  // the server rollout decision (T-304) and deliberately NOT awaited — the recording must
-  // start immediately, and a failure here simply leaves the legacy path in
-  // charge.
-  startStreamingUpload().catch(() => { streamUploadReady = false; });
-  mediaRecorder.start(1000);
-  startHeartbeat();   // T-402: docs/05 §3 — bumped every 5 s while recording
-
-  // Wall-clock backstop. A single setTimeout still fires when an occluded window
-  // freezes setInterval; it re-arms if the recording was paused so it never stops
-  // a take early.
-  clearTimeout(hardStopTimer);
-  if (recordingLimitSec > 0) {
-    hardStopTimer = setTimeout(function hardStop() {
-      if (!mediaRecorder || mediaRecorder.state === 'inactive' || limitReached) return;
-      if (elapsedSeconds() >= recordingLimitSec) {
-        limitReached = true;
-        setStatus(`⏱ Recording limit reached (${Math.round(recordingLimitSec / 60)} min) — saving…`, 'uploading');
-        stopRecording();
-      } else {
-        hardStopTimer = setTimeout(hardStop, (recordingLimitSec - elapsedSeconds()) * 1000 + 500);
-      }
-    }, recordingLimitSec * 1000 + 500);
-  }
-
-  // UI: recording
-  controls.style.display = 'flex';
-  pauseBtn.textContent = '⏸ Pause';
-  timerEl.classList.add('show');
-  updateTimer();
-  timerInterval = setInterval(updateTimer, 500);
-  // Audio warnings, most-severe first.
-  const tabAudioMissing = opts.mode === 'tab' && screenStream && screenStream.getAudioTracks().length === 0;
-  const noSystemAudio = cam !== 'only' && opts.mode !== 'tab' && screenStream && screenStream.getAudioTracks().length === 0;
-  const recMsg = cam === 'bubble' ? '● Recording… (camera bubble is on your tab)' : '● Recording…';
-  let warnText = '';
-  if (noAudioAtAll) {
-    warnText = 'No audio is being captured. Allow microphone access (or share a tab/screen WITH audio), then re-record.';
-  } else if (tabAudioMissing) {
-    warnText = 'This tab’s audio didn’t come through — Stop and try again, or use “Entire Screen” with system audio.';
-  } else if (noSystemAudio && wantMic) {
-    warnText = 'Only YOUR mic is captured — others’ audio isn’t. To record everyone, Stop and use “This Tab” mode, or re-share a TAB/whole SCREEN with audio.';
-  }
-  setStatus(warnText ? '● Recording… ⚠ ' + warnText : recMsg, 'recording');
-  if (warnText) overlayMsg({ type: 'SR_OVERLAY_WARN', text: warnText });
-
-  chrome.storage.local.set({ recording: true, startTime });
-  // Shared state the on-screen overlay (on any tab) reads to render the timer.
-  chrome.storage.local.set({ recState: { recording: true, startTime, paused: false, pausedAccum: 0, pauseStartedAt: null } });
-  chrome.runtime.sendMessage({ type: 'RECORDER_STARTED', startTime });
-
-  // Let the on-screen overlay take over as the visible UI. We intentionally do
-  // NOT minimize this recorder window: a minimized (hidden) window gets frozen
-  // by Chrome, which can stall the upload after you stop. It just sits behind.
-  overlayMsg({ type: 'SR_OVERLAY_STATE', state: 'recording' });
-}
-
-function togglePause() {
-  if (!mediaRecorder) return;
-  if (mediaRecorder.state === 'recording') {
-    mediaRecorder.pause();
-    pauseStartedAt = Date.now();
-    pauseBtn.textContent = '▶ Resume';
-    setStatus('⏸ Paused', 'uploading');
-    chrome.storage.local.set({ recState: { recording: true, startTime, paused: true, pausedAccum, pauseStartedAt } });
-  } else if (mediaRecorder.state === 'paused') {
-    mediaRecorder.resume();
-    if (pauseStartedAt) { pausedAccum += Date.now() - pauseStartedAt; pauseStartedAt = null; }
-    pauseBtn.textContent = '⏸ Pause';
-    setStatus('● Recording…', 'recording');
-    chrome.storage.local.set({ recState: { recording: true, startTime, paused: false, pausedAccum, pauseStartedAt: null } });
-  }
 }
 
 function showStartButton(message) {
@@ -401,85 +97,13 @@ function showStartButton(message) {
   mainBtn.textContent = '▶ Start Recording';
 }
 
-// Server rejected the upload because of a plan limit. Show the upsell and open
-// the pricing page so the user can upgrade without hunting for it.
+// Server rejected the upload because of a plan limit: show the upsell and open pricing.
 function showUpgradePrompt(reason) {
-  // Reuse the start button (its existing listener restarts a recording) and open
-  // the pricing page in a new tab so the user can upgrade right away.
   showStartButton((reason || 'This recording exceeds your plan limit.') + ' Upgrade to Pro for longer recordings & more storage.');
-  try { chrome.tabs.create({ url: 'https://veorec.com/pricing' }); }
-  catch { try { window.open('https://veorec.com/pricing'); } catch {} }
+  openTab(PRICING_URL);
 }
 
-function onStartError(e) {
-  cleanupStreams();
-  closeBubble();
-  if (e && (e.name === 'NotAllowedError' || (e.message && e.message.includes('cancel')))) {
-    showStartButton('Click “Start Recording”, then choose what to share.');
-  } else {
-    showStartButton('Error: ' + (e?.message || 'could not start recording'));
-  }
-}
-
-function cleanupStreams() {
-  if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
-  clearTimeout(hardStopTimer); hardStopTimer = null;
-  activeStreams.forEach(s => s.getTracks().forEach(t => t.stop()));
-  activeStreams = [];
-  if (audioCtx) { try { audioCtx.close(); } catch {} audioCtx = null; }
-}
-
-// Remove the floating camera bubble from the recorded tab.
-function closeBubble() {
-  const tabId = opts.bubbleTabId;
-  if (tabId != null && chrome.tabs && chrome.tabs.sendMessage) {
-    try { chrome.tabs.sendMessage(tabId, { type: 'SR_STOP_BUBBLE' }); } catch (e) {}
-  }
-}
-
-// Close this recorder popup window (used after upload, or on cancel).
-function closeWindow() {
-  try { window.close(); } catch (e) {}
-  try { chrome.windows.getCurrent(w => { if (w && w.id != null) chrome.windows.remove(w.id); }); } catch (e) {}
-}
-
-mainBtn.addEventListener('click', () => beginRecording().catch(onStartError));
-pauseBtn.addEventListener('click', togglePause);
-stopBtn.addEventListener('click', stopRecording);
-cancelBtn.addEventListener('click', cancelRecording);
-
-function stopRecording() {
-  clearInterval(timerInterval);
-  if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
-  cleanupStreams();
-  closeBubble();
-  chrome.storage.local.set({ recState: { recording: false } }); // overlays on all tabs self-remove
-  controls.style.display = 'none';
-  previewWrap.classList.remove('show');
-  setStatus('Uploading…', 'uploading');
-  timerEl.classList.remove('show');
-  // Bring the recorder window back so upload progress is visible (it was
-  // minimized while the on-screen overlay drove the recording).
-  try { chrome.windows.getCurrent((w) => { if (w && w.id != null) chrome.windows.update(w.id, { state: 'normal', focused: true }); }); } catch (e) {}
-}
-
-// Discard the recording entirely — nothing is saved or uploaded — and close.
-function cancelRecording() {
-  if (mediaRecorder) {
-    mediaRecorder.onstop = null;                 // prevent upload
-    if (mediaRecorder.state !== 'inactive') { try { mediaRecorder.stop(); } catch (e) {} }
-  }
-  clearInterval(timerInterval);
-  chunks = [];
-  discardLocalSession();                         // T-402: docs/03 §3.11 — an explicit discard
-  cleanupStreams();
-  closeBubble();
-  chrome.storage.local.set({ recording: false, recState: { recording: false } });
-  closeWindow();
-}
-
-// Safety net: if an upload ever fails, the recording is NOT lost — offer a
-// one-click local save of the exact webm we captured.
+// Safety net: if an upload ever fails, the recording is NOT lost — one-click local save.
 function showDownloadFallback() {
   if (!lastBlob || !lastBlob.size) return;
   let btn = document.getElementById('dlFallback');
@@ -489,35 +113,19 @@ function showDownloadFallback() {
     btn.className = 'btn';
     btn.style.marginTop = '10px';
     btn.textContent = '⤓ Save recording to your device';
-    btn.addEventListener('click', () => {
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(lastBlob);
-      a.download = `veorec-recording-${Date.now()}.webm`;
-      document.body.appendChild(a); a.click();
-      setTimeout(() => { try { URL.revokeObjectURL(a.href); a.remove(); } catch {} }, 4000);
-    });
+    btn.addEventListener('click', () => machine.send({ type: 'DOWNLOAD_FALLBACK' }));
     (mainBtn.parentNode || document.body).insertBefore(btn, mainBtn.nextSibling);
   }
   btn.style.display = '';
 }
-
-// Clear the "recording" flags so the popup never stays stuck on a failed upload.
-function resetRecordingState() {
-  // T-402: an upload that did not complete leaves the local session marked
-  // failed and KEPT (docs/05 §3) — T-403's recovery flow offers resume /
-  // download / discard. Deleted only on server-confirmed completion or an
-  // explicit discard.
-  stopHeartbeat();
-  if (recStore && localSession) {
-    if (localSeq === 0) { const id = localSession.id; recStore.deleteSession(id).catch(() => {}); }   // nothing captured: no phantom recovery
-    else markLocalSession({ status: 'failed' });
-    localSession = null;
-  }
-  try { chrome.storage.local.set({ recording: false, recState: { recording: false } }); } catch (e) {}
-  try { chrome.runtime.sendMessage({ type: 'RECORDING_RESET' }); } catch (e) {}
+function saveBlobLocally() {
+  if (!lastBlob || !lastBlob.size) return;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(lastBlob);
+  a.download = `veorec-recording-${Date.now()}.webm`;
+  document.body.appendChild(a); a.click();
+  setTimeout(() => { try { URL.revokeObjectURL(a.href); a.remove(); } catch {} }, 4000);
 }
-
-// ── T-303 streaming upload (gated by the T-304 server rollout decision) ─────────────────────────────────
 
 // ── T-402 local persistence (docs/05) ───────────────────────────────────────
 // Nothing here may throw into the recorder: every call is best-effort and the
@@ -611,14 +219,19 @@ function discardLocalSession() {
   const id = localSession.id; localSession = null;
   recStore.deleteSession(id).catch(() => {});
 }
+/** A take that never uploaded: kept as failed for recovery; a zero-chunk take is deleted. */
+function keepLocalSessionForRecovery() {
+  stopHeartbeat();
+  if (recStore && localSession) {
+    if (localSeq === 0) { const id = localSession.id; recStore.deleteSession(id).catch(() => {}); }   // nothing captured: no phantom recovery
+    else markLocalSession({ status: 'failed' });
+    localSession = null;
+  }
+}
 
 // ── T-307 quota pre-flight (docs/03 §3.0, docs/16 §4.6) ─────────────────────
 // UX only: the authoritative gate is the server's atomic reservation at
 // upload-session creation (T-306). A fetch failure never blocks recording.
-
-const DASHBOARD_URL = 'https://veorec.com/';
-const PRICING_URL = 'https://veorec.com/pricing';
-const openTab = (url) => { try { chrome.tabs.create({ url }); } catch (e) { try { window.open(url, '_blank'); } catch (e2) {} } };
 
 async function loadQuotaPreflight() {
   if (typeof VeoRecQuotaPreflight === 'undefined') return { state: 'unknown' };
@@ -679,8 +292,6 @@ function showQuotaOptions() {
 // window refuses this one; nothing is deleted except on server-confirmed
 // completion or an explicit Discard.
 
-const recoveryCard = document.getElementById('recoveryCard');
-
 async function currentUserId() {
   try { const { sr_user } = await chrome.storage.local.get('sr_user'); return (sr_user && sr_user.id) || null; } catch (e) { return null; }
 }
@@ -703,11 +314,12 @@ async function runRecoveryScan() {
     // docs/05 §3: a live heartbeat means another recorder window is recording.
     showStartButton('A recording is already running in another VeoRec window. Finish it there, or wait 15 seconds if that window was closed.');
     mainBtn.textContent = '↻ Check again';
-    mainBtn.onclick = null;
+    mainBtn.dataset.custom = '1';                 // the default Start handler stands down
     mainBtn.addEventListener('click', function again() {
       mainBtn.removeEventListener('click', again);
+      delete mainBtn.dataset.custom;
       mainBtn.textContent = '▶ Start Recording';
-      runRecoveryScan().then((v) => { if (v.proceed) beginRecording().catch(onStartError); });
+      runRecoveryScan().then((v) => { if (v.proceed) startRecording(); });
     }, { once: true });
     return { proceed: false };
   }
@@ -775,7 +387,7 @@ async function recoveryResume(store, s, row, msg) {
     msg.textContent = out.kind === 'saved' ? 'Saved ✓' : 'This recording was already saved ✓';
     try { await chrome.storage.local.set({ lastRecording: { url: out.watchUrl, title: s.title || 'Screen recording', at: Date.now() } }); } catch (e) {}
     try { chrome.runtime.sendMessage({ type: 'UPLOAD_DONE', url: out.watchUrl, title: s.title || 'Screen recording' }); } catch (e) {}
-    try { chrome.tabs.create({ url: out.watchUrl }); } catch (e) { try { window.open(out.watchUrl, '_blank'); } catch (e2) {} }
+    openTab(out.watchUrl);
     row.remove();
     publishRecoverable(recoveryCard.querySelectorAll('.recovery-row').length);
     if (!recoveryCard.querySelectorAll('.recovery-row').length) hideRecoveryCard();
@@ -822,6 +434,8 @@ async function recoveryDiscard(store, s, row) {
   if (!left) hideRecoveryCard();
 }
 
+// ── T-303 streaming upload (gated by the T-304 server rollout decision) ─────
+
 /** Open a v1 upload session. Any failure leaves the legacy path untouched. */
 async function startStreamingUpload() {
   streamUploader = null; streamUploadReady = false;
@@ -835,9 +449,7 @@ async function startStreamingUpload() {
   // — offline, 5xx, malformed — leaves the legacy path in charge.
   let cfg = null;
   try {
-    const r = await fetch(`${SERVER}/api/client-config`, {
-      headers: { Authorization: `Bearer ${sr_token}` },
-    });
+    const r = await fetch(`${SERVER}/api/client-config`, { headers: { Authorization: `Bearer ${sr_token}` } });
     if (!r.ok) return;
     cfg = await r.json();
   } catch (e) { return; }
@@ -855,8 +467,10 @@ async function startStreamingUpload() {
   const up = VeoRecUploader.createUploader({
     server: SERVER, token: sr_token,
     onEvent: (e) => {
-      if (e.type === "ceiling-warning") setStatus("Approaching your size limit — wrapping up soon…", "uploading");
-      if (e.type === "ceiling-reached") { try { stopRecording(); } catch (err) {} }
+      if (e.type === "ceiling-warning") machine.send({ type: 'WARNING', code: 'byte_limit_near' });
+      // docs/03 §8 layer 1: the byte ceiling (the reservation) stops the take — preserved, never rejected.
+      if (e.type === "ceiling-reached") machine.send({ type: 'STOP', source: 'byte_limit' });
+      if (e.type === "progress" && e.recordedBytes) machine.send({ type: 'UPLOAD_PROGRESS', pct: Math.round((e.uploadedBytes / e.recordedBytes) * 100) });
       // T-402: upload bookkeeping in IndexedDB (docs/05 §5) — a sealed part is
       // recorded `pending` BEFORE its PUT; an uploaded part gets its etag.
       if (e.type === "part-sealed") recordSealedPart(e.partNumber, e.size);
@@ -889,180 +503,387 @@ async function finishStreamingUpload(duration) {
   }
 }
 
-async function handleStop() {
-  let duration = elapsedSeconds();
-  // The plan cap is enforced by auto-stop; clamp the reported duration to the
-  // limit so a sub-second timing overrun can't get the upload rejected (which
-  // used to lose the whole recording on free accounts at the 5-min mark).
-  if (limitReached && recordingLimitSec > 0) duration = Math.min(duration, recordingLimitSec);
-  const rawBlob = new Blob(chunks, { type: 'video/webm' });
-  chunks = [];
-  // T-402: the take is captured; the heartbeat stops and the local session
-  // records that it is stopped (docs/05 §3) with the client duration hint.
-  stopHeartbeat();
-  markLocalSession({ status: 'stopped', clientDuration: duration });
-  // MediaRecorder omits the Duration header (live stream), so the file shows no
-  // length and can't be scrubbed. Inject the real duration before BOTH the upload
-  // and the local-save fallback. Fail-safe: returns the original blob on any error.
-  let blob = rawBlob;
-  if (typeof fixWebmDuration === 'function' && duration > 0) {
-    try { blob = await fixWebmDuration(rawBlob, duration * 1000); } catch (e) { blob = rawBlob; }
-  }
-  lastBlob = blob;          // preserve so the user can always recover it
+// ── The upload drain (docs/03 §3.8) — v1 first, legacy POST as the fallback ──
+async function runUpload(ctx) {
+  const duration = ctx.clientDuration || 0;
+  const blob = lastBlob;
+  if (!blob || !blob.size) return machine.send({ type: 'UPLOAD_FAILED', code: 'empty', retryable: false });
+  const { sr_token } = await chrome.storage.local.get('sr_token');
+  if (!sr_token) return machine.send({ type: 'UPLOAD_FAILED', code: 'unauthorized', retryable: true });
+  const title = 'Screen recording';
 
-  // Make sure this window is visible+focused (never frozen) during the upload.
-  try { chrome.windows.getCurrent((w) => { if (w && w.id != null) chrome.windows.update(w.id, { state: 'normal', focused: true }); }); } catch (e) {}
+  // T-303: if the streaming upload finished, the bytes are already in storage —
+  // skip the legacy POST entirely. Otherwise fall through to it with the blob we
+  // still hold, so a failed streaming upload costs the user nothing.
+  const streamedUrl = await finishStreamingUpload(duration);
+  if (streamedUrl) return machine.send({ type: 'UPLOAD_COMPLETE', recordingId: ctx.recordingId, watchUrl: streamedUrl, title });
 
-  if (!blob.size) {
-    resetRecordingState();
-    showStartButton('Nothing was recorded — please try again.');
-    return;
-  }
+  const form = new FormData();
+  form.append('video', blob, 'recording.webm');
+  form.append('title', title);
+  form.append('duration', String(duration));
+  // T-304: tell the server this take began on v1 and fell back, so the v1
+  // success rate counts the failure the user never saw.
+  if (streamUploader) form.append('uploadFallbackFrom', 'v1');
 
+  // Hard timeout so a stalled connection never hangs the UI forever.
+  const ctrl = new AbortController();
+  const timeoutMs = Math.max(120000, blob.size / 1024);
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  let res;
   try {
-    const { sr_token } = await chrome.storage.local.get('sr_token');
-    if (!sr_token) { resetRecordingState(); showStartButton('Not logged in — please sign in via the extension popup.'); return; }
-
-    const sizeMB = (blob.size / 1048576).toFixed(1);
-    setStatus(`Uploading… (${sizeMB} MB)`, 'uploading');
-
-    const title = 'Screen recording';
-
-    // T-303: if the streaming upload finished, the bytes are already in
-    // storage — skip the legacy POST entirely. Otherwise fall through to it
-    // with the blob we still hold, so a failed streaming upload costs the user
-    // nothing.
-    markLocalSession({ status: 'uploading' });
-    const streamedUrl = await finishStreamingUpload(duration);
-    if (streamedUrl) {
-      // T-402: the server confirmed completion — ONLY now is the local copy
-      // deleted (docs/03 §3.10: local data outlives every failure mode).
-      await deleteLocalSession();
-      await chrome.storage.local.set({
-        shareLink: streamedUrl, recording: false, recState: { recording: false },
-        lastRecording: { url: streamedUrl, title, at: Date.now() },
-      });
-      chrome.runtime.sendMessage({ type: 'UPLOAD_DONE', url: streamedUrl, title });
-      setStatus('Saved ✓  Opening your video…', 'done');
-      try { chrome.tabs.create({ url: streamedUrl }); } catch (e) { try { window.open(streamedUrl, '_blank'); } catch (e2) {} }
-      return;
-    }
-
-    const form = new FormData();
-    form.append('video', blob, 'recording.webm');
-    form.append('title', title);
-    form.append('duration', String(duration));
-    // T-304: tell the server this take began on v1 and fell back, so the v1
-    // success rate counts the failure the user never saw.
-    if (streamUploader) form.append('uploadFallbackFrom', 'v1');
-
-    // Hard timeout so a stalled connection never hangs the UI forever.
-    const ctrl = new AbortController();
-    const timeoutMs = Math.max(120000, blob.size / 1024); // ≥2 min, scales with size
-    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-
-    let res;
-    try {
-      res = await fetch(`${SERVER}/api/upload`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${sr_token}` },
-        body: form,
-        signal: ctrl.signal,
-      });
-    } finally { clearTimeout(timer); }
-
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      resetRecordingState();
-      if (res.status === 403 && data.upgradeRequired) {
-        setStatus((data.error || 'Upgrade required to save this recording.') + ' ', 'uploading');
-        showUpgradePrompt(data.error);
-        // T-307 (docs/03 §3.0): a take in progress is never discarded by a quota
-        // verdict — Save to device / Delete a video & retry / Upgrade.
-        showQuotaOptions();
-        return;
-      }
-      showStartButton(res.status === 401
-        ? 'Session expired — please sign in again via the extension popup.'
-        : 'Upload failed: ' + (data.error || res.status));
-      showDownloadFallback();
-      return;
-    }
-    const shareUrl = `https://veorec.com/watch/${data.id}`;
-
-    await chrome.storage.local.set({
-      shareLink: shareUrl, recording: false, recState: { recording: false },
-      lastRecording: { url: shareUrl, title, at: Date.now() },
-    });
-    // T-402: the legacy server has the recording — the local copy may go.
-    await deleteLocalSession();
-    chrome.runtime.sendMessage({ type: 'UPLOAD_DONE', url: shareUrl, title });
-
-    // Open the saved video's preview page in a new tab, then close this window.
-    setStatus('Saved ✓  Opening your video…', 'done');
-    try { chrome.tabs.create({ url: shareUrl }); } catch (e) { try { window.open(shareUrl, '_blank'); } catch (e2) {} }
-    setTimeout(closeWindow, 1200);
+    res = await fetch(`${SERVER}/api/upload`, { method: 'POST', headers: { Authorization: `Bearer ${sr_token}` }, body: form, signal: ctrl.signal });
   } catch (e) {
-    resetRecordingState();
-    showStartButton(e.name === 'AbortError'
-      ? 'Upload timed out — check your connection and try again.'
-      : 'Upload failed: ' + e.message);
-    showDownloadFallback();
+    return machine.send({ type: 'UPLOAD_FAILED', code: e && e.name === 'AbortError' ? 'timeout' : 'network', retryable: true, message: e && e.message });
+  } finally { clearTimeout(timer); }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    lastUploadMessage = data.error || null;
+    if (res.status === 403 && data.upgradeRequired) return machine.send({ type: 'UPLOAD_FAILED', code: 'plan_limit', retryable: false });
+    if (res.status === 401) return machine.send({ type: 'UPLOAD_FAILED', code: 'unauthorized', retryable: true });
+    return machine.send({ type: 'UPLOAD_FAILED', code: `http_${res.status}`, retryable: res.status >= 500 });
   }
+  return machine.send({ type: 'UPLOAD_COMPLETE', recordingId: data.id, watchUrl: `https://veorec.com/watch/${data.id}`, title });
 }
 
+// ── Effects: what each machine state asks this window to do ─────────────────
+const captureManager = (typeof VeoRecCapture !== 'undefined') ? VeoRecCapture.createCaptureManager({}) : null;
+
+const effects = {
+  // docs/03 §3.2 — all getUserMedia/getDisplayMedia calls happen here and only here.
+  acquire(config) {
+    setStatus(config.camera === 'only' ? 'Starting camera…' : 'Select a screen or window to share…');
+    mainBtn.style.display = 'none'; linkBox.classList.remove('show'); controls.style.display = 'none';
+    if (!captureManager) return machine.send({ type: 'ACQUIRE_FAILED', code: 'capture_failed' });
+    captureManager.acquire(config).then(async (result) => {
+      capture = result;
+      if (config.camera === 'only') await showCameraPreview(result.streams.camera);
+      machine.send({ type: 'ACQUIRED', tracks: result.tracks, warnings: result.warnings });
+    }).catch((err) => {
+      machine.send({ type: 'ACQUIRE_FAILED', code: (err && err.code) || 'capture_failed', message: err && err.message });
+    });
+  },
+  // docs/03 §3.3 — countdown; returns its disposer.
+  startCountdown(seconds) {
+    let n = seconds;
+    countdownNum.textContent = n;
+    countdownEl.classList.add('show');
+    const iv = setInterval(() => {
+      n -= 1;
+      if (n <= 0) { clearInterval(iv); countdownEl.classList.remove('show'); machine.send({ type: 'COUNTDOWN_DONE' }); }
+      else { countdownNum.textContent = n; countdownNum.style.animation = 'none'; void countdownNum.offsetWidth; countdownNum.style.animation = ''; }
+    }, 1000);
+    return () => { clearInterval(iv); countdownEl.classList.remove('show'); };
+  },
+  // docs/03 §3.4 step 1 — the IndexedDB session row exists BEFORE the recorder starts.
+  createSession() {
+    const mime = (captureManager ? captureManager.recorderOptions(opts).mimeType : 'video/webm');
+    startLocalSession(mime, opts);
+    return null;   // the id arrives asynchronously; linkLocalSession carries the server linkage later
+  },
+  // docs/03 §3.4 step 2 — the upload session (quota reservation); "record first, network later".
+  createUploadSession() { startStreamingUpload().catch(() => { streamUploadReady = false; }); },
+  // docs/03 §3.4 step 3 — MediaRecorder; every callback becomes an event.
+  startRecorder(ctx) {
+    const tracks = [ctx.tracks.video].concat(ctx.tracks.audio ? [ctx.tracks.audio] : []);
+    const stream = new MediaStream(tracks);
+    const options = captureManager ? captureManager.recorderOptions(opts) : { mimeType: 'video/webm' };
+    chunks = [];
+    mediaRecorder = new MediaRecorder(stream, options);
+    // docs/05 §3: the session records the ACTUAL MediaRecorder mimeType.
+    if (mediaRecorder.mimeType) linkLocalSession({ mimeType: mediaRecorder.mimeType });
+    mediaRecorder.ondataavailable = (e) => {
+      if (!e.data || !e.data.size) return;
+      // docs/03 §7: IndexedDB FIRST, then the uploader, then the machine's limit clock.
+      persistChunk(e.data);
+      chunks.push(e.data);
+      if (streamUploadReady) { try { streamUploader.addChunk(e.data); } catch (err) { streamUploadReady = false; } }
+      machine.send({ type: 'CHUNK', size: e.data.size });
+    };
+    mediaRecorder.onstop = () => machine.send({ type: 'RECORDER_STOPPED' });
+    mediaRecorder.onerror = () => machine.send({ type: 'STOP', source: 'recorder_error' });   // salvage what exists
+    mediaRecorder.start(1000);
+    captureWatchOff = capture && captureManager ? captureManager.watch({ streams: capture.streams, mixer: capture.mixer, onEvent: (e) => machine.send(e) }) : null;
+    startHeartbeat();
+    chrome.runtime.sendMessage({ type: 'RECORDER_STARTED', startTime: Date.now() });
+    overlayMsg({ type: 'SR_OVERLAY_STATE', state: 'recording' });
+  },
+  pauseRecorder() { try { if (mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.pause(); } catch (e) {} },
+  resumeRecorder() { try { if (mediaRecorder && mediaRecorder.state === 'paused') mediaRecorder.resume(); } catch (e) {} },
+  // docs/03 §3.6 — stop the recorder and NOTHING else.
+  stopRecorder() {
+    try { if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop(); else machine.send({ type: 'RECORDER_STOPPED' }); }
+    catch (e) { machine.send({ type: 'RECORDER_STOPPED' }); }
+  },
+  // docs/03 §3.7 — only now do the tracks go.
+  stopTracks() {
+    if (captureWatchOff) { try { captureWatchOff(); } catch (e) {} captureWatchOff = null; }
+    if (capture) { try { capture.dispose(); } catch (e) {} capture = null; }
+    if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+    closeBubble();
+    focusWindow();
+  },
+  // docs/03 §3.7 — assemble the take, fix the duration header, mark the local session stopped.
+  finalize(ctx) {
+    stopHeartbeat();
+    const duration = ctx.clientDuration || 0;
+    const rawBlob = new Blob(chunks, { type: 'video/webm' });
+    chunks = [];
+    markLocalSession({ status: 'stopped', clientDuration: duration });
+    (async () => {
+      let blob = rawBlob;
+      if (typeof fixWebmDuration === 'function' && duration > 0) { try { blob = await fixWebmDuration(rawBlob, duration * 1000); } catch (e) { blob = rawBlob; } }
+      lastBlob = blob;
+      if (!blob.size) { keepLocalSessionForRecovery(); return machine.send({ type: 'UPLOAD_FAILED', code: 'empty', retryable: false }); }
+      machine.send({ type: 'FINALIZED' });
+    })();
+  },
+  // docs/03 §3.8
+  startUpload(ctx) {
+    markLocalSession({ status: 'uploading' });
+    runUpload(ctx).catch((e) => machine.send({ type: 'UPLOAD_FAILED', code: 'unexpected', retryable: true, message: e && e.message }));
+  },
+  // docs/03 §3.10 — the local copy goes ONLY now (server 200), then the watch page.
+  complete(ctx) {
+    const url = ctx.watchUrl; lastWatchUrl = url;
+    (async () => {
+      await deleteLocalSession();
+      try { await chrome.storage.local.set({ shareLink: url, recording: false, recState: { recording: false }, lastRecording: { url, title: 'Screen recording', at: Date.now() } }); } catch (e) {}
+      try { chrome.runtime.sendMessage({ type: 'UPLOAD_DONE', url, title: 'Screen recording' }); } catch (e) {}
+      openTab(url);
+      setTimeout(closeWindow, 1200);
+    })();
+  },
+  download() { saveBlobLocally(); keepLocalSessionForRecovery(); },
+  discard() { discardLocalSession(); },
+  // docs/03 §3.11 — cleanup then CLEANED.
+  cleanup(ctx) {
+    try { if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop(); } catch (e) {}
+    mediaRecorder = null;
+    chunks = [];
+    if (captureWatchOff) { try { captureWatchOff(); } catch (e) {} captureWatchOff = null; }
+    if (capture) { try { capture.dispose(); } catch (e) {} capture = null; }
+    if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+    countdownEl.classList.remove('show');
+    discardLocalSession();
+    closeBubble();
+    if (ctx.restart) focusWindow();
+    machine.send({ type: 'CLEANED' });
+  },
+  wakeLock() {
+    let lock = null;
+    try { navigator.wakeLock && navigator.wakeLock.request('screen').then((l) => { lock = l; }).catch(() => {}); } catch (e) {}
+    return () => { try { lock && lock.release(); } catch (e) {} };
+  },
+  setTimer(fn, ms) { const t = setTimeout(fn, ms); return () => clearTimeout(t); },
+  persist(patch) { markLocalSession(patch); },
+  warn(code) { render(machine.projection(), machine.state, machine.context); },
+  clearProjection() { try { chrome.storage.local.set({ recording: false, recState: { recording: false } }); } catch (e) {} },
+  // docs/03 §11 — recSession for overlays; the legacy keys mirrored in parallel.
+  publish(projection, state, ctx) {
+    render(projection, state, ctx);
+    const recState = projection.recording
+      ? { recording: true, startTime: projection.startedAt, paused: state === 'paused', pausedAccum: projection.pausedTotal, pauseStartedAt: projection.pauseStartedAt }
+      : { recording: false };
+    try { chrome.storage.local.set({ recSession: projection, recording: !!projection.recording, startTime: projection.startedAt, recState }); } catch (e) {}
+  },
+};
+
+const machine = VeoRecMachine.createMachine({
+  effects,
+  log: (level, msg, meta) => { try { (level === 'warn' ? console.warn : console.log)('[machine]', msg, meta || ''); } catch (e) {} },
+});
+
+async function showCameraPreview(camStream) {
+  try {
+    const v = document.createElement('video');
+    v.srcObject = camStream; v.muted = true; v.playsInline = true;
+    await v.play();
+    if (!v.videoWidth) await new Promise((r) => v.addEventListener('loadedmetadata', r, { once: true }));
+    canvas.width = v.videoWidth || 1280; canvas.height = v.videoHeight || 720;
+    const ctx2d = canvas.getContext('2d');
+    previewWrap.classList.add('show');
+    const draw = () => { ctx2d.drawImage(v, 0, 0, canvas.width, canvas.height); rafId = requestAnimationFrame(draw); };
+    draw();
+  } catch (e) { /* preview is optional */ }
+}
+
+// ── Rendering: the projection → the window ──────────────────────────────────
+const WARN_TEXT = (code) => {
+  if (!code) return '';
+  if (typeof VeoRecCapture !== 'undefined' && VeoRecCapture.WARNING_TEXT[code]) return VeoRecCapture.WARNING_TEXT[code];
+  if (code === 'duration_limit_near') return '30 seconds remaining on your plan limit';
+  if (code === 'byte_limit_near') return 'Approaching your size limit — wrapping up soon…';
+  return '';
+};
+
+function render(projection, state, ctx) {
+  const recording = state === 'recording' || state === 'paused';
+  if (recording) {
+    controls.style.display = 'flex';
+    mainBtn.style.display = 'none';
+    timerEl.classList.add('show');
+    pauseBtn.textContent = state === 'paused' ? '▶ Resume' : '⏸ Pause';
+    const recMsg = opts.camera === 'bubble' ? '● Recording… (camera bubble is on your tab)' : '● Recording…';
+    const warn = WARN_TEXT(ctx.warning);
+    if (state === 'paused') setStatus('⏸ Paused', 'uploading');
+    else setStatus(warn ? recMsg + ' ⚠ ' + warn : recMsg, 'recording');
+    if (warn && ctx.warning !== renderedWarning) { renderedWarning = ctx.warning; overlayMsg({ type: 'SR_OVERLAY_WARN', text: warn }); if (ctx.warning === 'duration_limit_near') timerEl.classList.add('limitWarn'); }
+    if (!uiTick) uiTick = setInterval(tickTimer, 500);
+    tickTimer();
+    return;
+  }
+  if (uiTick) { clearInterval(uiTick); uiTick = null; }
+  if (state === 'countdown') { controls.style.display = 'none'; setStatus('Get ready…'); return; }
+  if (state === 'stopping' || state === 'finalizing') {
+    controls.style.display = 'none'; previewWrap.classList.remove('show'); timerEl.classList.remove('show');
+    setStatus(ctx.stopSource === 'limit' ? `⏱ Recording limit reached (${Math.round(recordingLimitSec / 60)} min) — saving…` : 'Finishing…', 'uploading');
+    return;
+  }
+  if (state === 'uploading') {
+    controls.style.display = 'none'; timerEl.classList.remove('show');
+    const pct = projection.uploadedPct;
+    const mb = lastBlob ? ` (${(lastBlob.size / 1048576).toFixed(1)} MB)` : '';
+    setStatus(pct != null && pct > 0 && pct < 100 ? `Uploading… ${pct}%${mb}` : `Uploading…${mb}`, 'uploading');
+    return;
+  }
+  if (state === 'upload_failed') { renderUploadFailed(ctx); return; }
+  if (state === 'completed') { setStatus('Saved ✓  Opening your video…', 'done'); return; }
+  if (state === 'saved_locally') { setStatus('Saved to your device. The recording is kept here for recovery until you discard it.', 'done'); showStartButton(); return; }
+  if (state === 'permission_denied') { renderPermissionDenied(ctx); return; }
+  if (state === 'idle' && renderedWarning !== null) renderedWarning = null;
+}
+let renderedWarning = null;
+
+function tickTimer() {
+  const s = Math.floor(machine.elapsedMs() / 1000);
+  const text = fmtClock(s);
+  timerEl.textContent = text;
+  overlayMsg({ type: 'SR_OVERLAY_TICK', text });
+}
+
+/** docs/03 §3.9 — Retry / Save to device / Discard; plan refusals get the quota options. */
+function renderUploadFailed(ctx) {
+  controls.style.display = 'none'; timerEl.classList.remove('show'); previewWrap.classList.remove('show');
+  const code = ctx.lastError;
+  const message = lastUploadMessage;
+  if (code === 'plan_limit') { showUpgradePrompt(message); showQuotaOptions(); return; }
+  if (code === 'unauthorized') { showStartButton('Session expired — please sign in again via the extension popup.'); showDownloadFallback(); return; }
+  if (code === 'empty') { showStartButton('Nothing was recorded — please try again.'); return; }
+  showStartButton(code === 'timeout' ? 'Upload timed out — check your connection and try again.' : 'Upload failed: ' + (message || code || 'error'));
+  let retry = document.getElementById('retryUpload');
+  if (!retry) {
+    retry = document.createElement('button');
+    retry.id = 'retryUpload'; retry.className = 'btn btn-start'; retry.style.marginTop = '10px';
+    retry.textContent = '↻ Retry upload';
+    retry.addEventListener('click', () => { retry.style.display = 'none'; machine.send({ type: 'RETRY_UPLOAD' }); });
+    (mainBtn.parentNode || document.body).insertBefore(retry, mainBtn.nextSibling);
+  }
+  retry.style.display = ctx.retryable ? '' : 'none';
+  showDownloadFallback();
+}
+
+/** docs/03 §3.2 — mic denied is an explicit choice; other failures show the docs/18 §4 copy. */
+function renderPermissionDenied(ctx) {
+  controls.style.display = 'none'; previewWrap.classList.remove('show');
+  const code = ctx.lastError;
+  let box = document.getElementById('permissionChoice');
+  if (box) box.remove();
+  if (code === 'mic_denied') {
+    mainBtn.style.display = 'none';
+    setStatus('Your microphone could not be accessed. Record without it, fix the permission, or cancel.', 'uploading');
+    box = document.createElement('div');
+    box.id = 'permissionChoice'; box.className = 'recovery-actions'; box.style.justifyContent = 'center'; box.style.marginTop = '10px';
+    const mk = (label, cls, fn) => { const b = document.createElement('button'); b.className = `btn ${cls}`; b.textContent = label; b.addEventListener('click', () => { box.remove(); fn(); }); box.appendChild(b); };
+    mk('🎙 Record without mic', 'btn-start', () => machine.send({ type: 'RETRY', config: { audio: false } }));
+    mk('🔧 Fix permission', 'btn-pause', () => { openTab('chrome://settings/content/microphone'); machine.send({ type: 'RETRY' }); });
+    mk('✕ Cancel', 'btn-cancel', () => machine.send({ type: 'DISMISS' }));
+    (mainBtn.parentNode || document.body).insertBefore(box, mainBtn.nextSibling);
+    return;
+  }
+  const copy = {
+    permission_dismissed: 'Click “Start Recording”, then choose what to share.',
+    permission_denied: 'Screen recording was blocked. Allow it in your browser settings, then click Start again.',
+    no_device: 'No camera or microphone was found. Connect one, or record without it.',
+    tab_capture_failed: 'This tab could not be captured — try “Entire Screen” instead.',
+    constraint_failed: 'Your device could not record at this quality. Try a lower quality.',
+    device_busy: 'The camera or microphone is in use by another app.',
+  };
+  // The Start button's default handler sends RETRY while in permission_denied.
+  showStartButton(copy[code] || ('Error: ' + (code || 'could not start recording')));
+}
+
+// ── Commands (docs/03 §12): buttons, popup and overlay → events ─────────────
+async function startRecording() {
+  hideRecoveryCard();
+  ['quotaBlocked', 'permissionChoice', 'retryUpload', 'dlFallback', 'quotaRetry'].forEach((id) => { const el = document.getElementById(id); if (el) el.remove(); });
+  mainBtn.textContent = '▶ Start Recording';
+  const config = { ...opts };
+  if (machine.state === 'idle') {
+    // T-402: local recovery protection (docs/05 §4) — refuse to start with under
+    // 500 MB of free storage (better than dying mid-recording); warn under 2 GB.
+    // A store that cannot be opened leaves the take unprotected but never
+    // prevents recording: better un-protected than not recorded (docs/03 §7).
+    const store = await openLocalStore();
+    if (store) {
+      const space = await store.checkSpace().catch(() => ({ level: 'unknown', ok: true }));
+      if (!space.ok) { showStartButton('Not enough free disk space to protect this recording (under 500 MB). Free up space and try again.'); return; }
+      if (space.level === 'warn') overlayMsg({ type: 'SR_OVERLAY_WARN', text: 'Low disk space — recovery protection may run out during a long recording.' });
+    }
+    machine.send({ type: 'START', config, durationLimitSec: recordingLimitSec });
+  }
+  else if (machine.state === 'permission_denied') machine.send({ type: 'RETRY' });
+  else if (machine.state === 'upload_failed') {
+    // Starting over never discards a failed take silently: it is kept as
+    // `failed` and the relaunch's recovery scan offers it (docs/05 §6).
+    keepLocalSessionForRecovery();
+    window.location.reload();
+  }
+  else if (machine.state === 'saved_locally' || machine.state === 'completed') { window.location.reload(); }
+}
+mainBtn.addEventListener('click', () => { if (!mainBtn.dataset.custom) startRecording(); });
+pauseBtn.addEventListener('click', () => machine.send({ type: machine.state === 'paused' ? 'RESUME' : 'PAUSE' }));
+stopBtn.addEventListener('click', () => machine.send({ type: 'STOP', source: 'user' }));
+cancelBtn.addEventListener('click', () => { machine.send({ type: 'CANCEL' }); setTimeout(closeWindow, 300); });
 copyBtn.addEventListener('click', () => {
-  navigator.clipboard.writeText(linkUrl.textContent).then(() => {
-    copyBtn.textContent = '✓ Copied!';
-    setTimeout(() => { copyBtn.textContent = '🔗 Copy Link'; }, 2000);
-  });
+  navigator.clipboard.writeText(linkUrl.textContent).then(() => { copyBtn.textContent = '✓ Copied!'; setTimeout(() => { copyBtn.textContent = '🔗 Copy Link'; }, 2000); });
 });
 
 // Remote controls — from the popup (STOP_RECORDING) and the on-screen overlay
-// toolbar (SR_PAUSE / SR_STOP / SR_CANCEL).
+// toolbar (SR_PAUSE / SR_STOP / SR_CANCEL / SR_RESTART). Invalid-in-state
+// commands are ignored by the machine and logged, never crash.
 chrome.runtime.onMessage.addListener((msg) => {
   if (!msg) return;
-  const active = mediaRecorder && mediaRecorder.state !== 'inactive';
-  if ((msg.type === 'STOP_RECORDING' || msg.type === 'SR_STOP') && active) stopRecording();
-  if (msg.type === 'SR_PAUSE' && active) togglePause();
-  if (msg.type === 'SR_CANCEL') cancelRecording();
-  if (msg.type === 'SR_RESTART') restartRecording();
+  if (msg.type === 'STOP_RECORDING' || msg.type === 'SR_STOP') machine.send({ type: 'STOP', source: 'user' });
+  if (msg.type === 'SR_PAUSE') machine.send({ type: machine.state === 'paused' ? 'RESUME' : 'PAUSE' });
+  if (msg.type === 'SR_CANCEL') { machine.send({ type: 'CANCEL' }); setTimeout(closeWindow, 300); }
+  if (msg.type === 'SR_RESTART') machine.send({ type: 'RESTART' });
 });
 
-// Discard the current take (no upload) and immediately start a fresh recording,
-// keeping the on-screen overlay in place. Triggered by the toolbar's Restart.
-function restartRecording() {
-  if (mediaRecorder) {
-    mediaRecorder.onstop = null;
-    if (mediaRecorder.state !== 'inactive') { try { mediaRecorder.stop(); } catch (e) {} }
-  }
-  clearInterval(timerInterval);
-  chunks = [];
-  discardLocalSession();                         // T-402: the discarded take is not kept
-  cleanupStreams();
-  // Bring the window forward so the screen-share picker is usable, then re-record.
-  try { chrome.windows.getCurrent((w) => { if (w && w.id != null) chrome.windows.update(w.id, { state: 'normal', focused: true }); }); } catch (e) {}
-  setStatus('Restarting…');
-  beginRecording().catch(onStartError);
-}
+// docs/03 §9: closing the window while a take is active or uploading warns; on a
+// real unload the IndexedDB data survives → recovery on next launch.
+window.addEventListener('beforeunload', (e) => {
+  const s = machine.state;
+  if (['recording', 'paused', 'stopping', 'finalizing', 'uploading'].includes(s)) { e.preventDefault(); e.returnValue = ''; }
+});
 
 // On load: read options carried from popup, run the recovery scan (docs/05 §6,
-// docs/03 §3.1 — BEFORE anything else), then auto-start only when nothing
-// needs the user's attention.
+// docs/03 §3.1 — BEFORE anything else), the quota pre-flight (docs/03 §3.0),
+// then auto-start only when nothing needs the user's attention.
 (async () => {
   try {
     const { recOptions } = await chrome.storage.local.get('recOptions');
     if (recOptions) opts = { ...opts, ...recOptions };
   } catch {}
+  // Normalise the legacy countdown flag: true = 3 s, false/0 = none.
+  if (opts.countdown === true) opts.countdown = 3;
+  if (!opts.countdown) opts.countdown = 0;
   setStatus('Preparing your recording…');
   await loadPlanLimit();           // match the countdown to the user's plan
   const verdict = await runRecoveryScan().catch(() => ({ proceed: true }));
   if (!verdict.proceed) return;
-  // T-307: quota pre-flight (docs/03 §3.0). Blocked → the exact block message
-  // with Manage videos / Upgrade instead of Start; near-limit → banner, proceed;
-  // unknown → proceed (the server enforces at session creation regardless).
   const quota = await loadQuotaPreflight();
   if (quota.state === 'blocked') { showQuotaBlocked(quota); return; }
   if (quota.state === 'warn') overlayMsg({ type: 'SR_OVERLAY_WARN', text: quota.message });
-  beginRecording().catch(onStartError);
+  startRecording();
 })();

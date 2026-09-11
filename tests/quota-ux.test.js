@@ -101,7 +101,7 @@ const NEAR_MSG = "You're close to your free limit — this may be one of your la
   const code = rec.split(/\r?\n/).filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n');
   ok(/quotaPreflight\.js/.test(html), 'recorder.html loads quotaPreflight.js');
   ok(/const quota = await loadQuotaPreflight\(\);\s*if \(quota\.state === 'blocked'\) \{ showQuotaBlocked\(quota\); return; \}/.test(code), 'the recorder gates Start on the pre-flight AFTER the recovery scan');
-  ok(/if \(quota\.state === 'warn'\) overlayMsg\(/.test(code) && /beginRecording\(\)\.catch\(onStartError\);\n\}\)\(\);/.test(code), 'near-limit warns and still records');
+  ok(/if \(quota\.state === 'warn'\) overlayMsg\(/.test(code) && /startRecording\(\);\n\}\)\(\);/.test(code), 'near-limit warns and still records (T-503: starts through the machine)');
   ok(/if \(!res\.ok\) return \{ state: 'unknown' \}/.test(code), 'a usage fetch failure never blocks recording');
   ok(/mainBtn\.style\.display = 'none';\s*setStatus\(verdict\.message/.test(code) && /Manage videos/.test(rec) && /Upgrade/.test(rec) && /Check again/.test(rec), 'blocked: Start replaced by the exact message with Manage videos / Upgrade (and Check again)');
   ok(/showQuotaOptions\(\);/.test(code) && /Delete a video & retry/.test(rec) && /showDownloadFallback\(\);/.test(code.slice(code.indexOf('function showQuotaOptions'))), 'a quota refusal at finalize offers Save to device / Delete a video & retry / Upgrade');
