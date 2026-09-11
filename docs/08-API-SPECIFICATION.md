@@ -68,6 +68,8 @@ Error (every non-2xx):
 | POST `/uploads/:id/complete` | ⚿ owner | idempotent (completed → replay canonical result); tx per `06` §7; enqueues probe |
 | DELETE `/uploads/:id` | ⚿ owner | abort; idempotent; releases the quota reservation exactly once |
 
+**Atomic quota reservation (T-306, `16` §4.3).** `POST /uploads` reserves `min(plan.max_upload_bytes, available)` bytes and one video slot inside the same transaction that inserts the session; `byteCeiling` in the response **is** that reservation. Guard failure ⇒ `403 {error:{code:'storage_limit'|'video_limit', upgradeRequired:true, meta:{usedBytes,reservedBytes,limitBytes,videoCount,reservedSlots,maxVideos,plan}}}` and **no session is created**. Completion reconciles with the HEAD size; abort, expiry, an over-ceiling manifest and a refused completion release it. `GET /me/usage` (below) reads the same live aggregates as the guard.
+
 **Single-PUT mode (T-305, `06` §12).** `POST /uploads` with `{recordingId, mimeType, mode:'single', sizeBytes}` returns `201 {uploadSessionId, mode:'single', uploadUrl, uploadUrlExpiresAt, uploadHeaders:{'Content-Type','Content-Length'}, byteCeiling, expiresAt, status}`; the browser PUTs the whole file to `uploadUrl`, then `POST /uploads/:id/complete` with `{parts:[]}`. `sizeBytes` is required (`400 invalid_request`), capped at 33,554,432 (`400`, use multipart) and at the plan ceiling (`403 storage_limit`, `upgradeRequired`). Part endpoints answer `409 invalid_state`; completing before the PUT answers `409 upload_object_missing`. The web editor's "Add video → Upload" uses this when `GET /client-config` answers `webUpload.path:"v1"` (§14a); the application server never receives the bytes.
 
 **Deprecated (T-305): `POST /recordings/:id/replace`** (memory-multer). Kept functional and unchanged; every use is logged as `deprecated_replace_used` and counted (`19` §8.3). Removed in Phase 14 once that count stays at zero over a full observation window. Do not add callers.
@@ -150,7 +152,7 @@ Clients poll `GET /recordings/:id/status` (or the transcript endpoint) — repla
 |---|---|---|
 | GET `/plans` | – | public catalog (`plans.listPublicPlans`) |
 | GET `/me/entitlements` | ⚿ | entitlement summary (extension recorder reads this) |
-| GET `/me/usage` | ⚿ | **dual quota meters** — `{storage:{usedBytes,reservedBytes,limitBytes}, videos:{count,max}, recordingLimitSeconds, maxResolution}` (exact shape `16` §4.5). The UI renders storage and video count as two separate meters, never one blended percentage |
+| GET `/me/usage` | ⚿ | **dual quota meters** — `{storage:{usedBytes,reservedBytes,limitBytes,pendingDeletionBytes,display}, videos:{count,reserved,max,display}, recordingLimitSeconds, maxResolution, maxUploadBytes, minStartBytes, model}` (`16` §4.5; **implemented T-306** at `/api/v1/me/usage`, `Cache-Control: no-store`). The UI renders storage and video count as two separate meters, never one blended percentage. `model` is `legacy` or `v2` per `QUOTA_ENFORCEMENT_V2` |
 | GET `/billing/config` | – | Paddle bootstrap (as today) |
 | POST `/billing/checkout` | ⚿ | `{billingCycle}` → checkout config w/ customData {userId,planSlug,billingCycle} |
 | GET `/billing/subscription` | ⚿ | local + remote view |

@@ -55,6 +55,33 @@ function start(deps) {
     return flagged;
   }
 
+  // ── T-306: PostgreSQL ledger maintenance (docs/10 §3) ─────────────────────
+  // Present only when the v1 stack is mounted (deps.maintenance). Hourly
+  // upload_expiry heals abandoned sessions and returns their reservations;
+  // daily usage_sync re-derives the ledger counters from the rows and logs
+  // drift. Both are plain functions from @veorec/db — the Phase 6 queue takes
+  // them over without change. Never blocks the legacy jobs: each runs in its
+  // own try, and a failure is logged, not thrown.
+  const maintenance = deps.maintenance || null;
+  async function hourlyUploadExpiry() {
+    if (!maintenance) return null;
+    try {
+      const { uploadExpiry } = require('../db/src/maintenance/upload-expiry');
+      const r = await uploadExpiry(maintenance);
+      console.log(`[cron] uploadExpiry: expired ${r.expired}, released ${r.released}`);
+      return r;
+    } catch (e) { console.error('[cron] uploadExpiry error:', e.message); return null; }
+  }
+  async function dailyLedgerSync() {
+    if (!maintenance) return null;
+    try {
+      const { usageSync } = require('../db/src/maintenance/usage-sync');
+      const r = await usageSync(maintenance);
+      console.log(`[cron] ledgerSync: synced ${r.synced} users, ${r.drifted} drifted`);
+      return r;
+    } catch (e) { console.error('[cron] ledgerSync error:', e.message); return null; }
+  }
+
   async function runAll(tag = 'scheduled') {
     try {
       await dailyUsageSync();
@@ -63,14 +90,19 @@ function start(deps) {
     } catch (e) {
       console.error(`[cron:${tag}] error:`, e.message);
     }
+    await hourlyUploadExpiry();
+    await dailyLedgerSync();
   }
 
-  // first run shortly after boot, then every 24h
+  // first run shortly after boot, then every 24h; upload expiry hourly
   const startupTimer = setTimeout(() => runAll('startup'), 60 * 1000);
   const interval = setInterval(() => runAll('daily'), DAY);
+  const hourly = setInterval(() => hourlyUploadExpiry(), 60 * 60 * 1000);
+  if (hourly.unref) hourly.unref();
 
   return { dailyUsageSync, dailySubscriptionSync, dailyStorageVerification, runAll,
-    stop() { clearTimeout(startupTimer); clearInterval(interval); } };
+    hourlyUploadExpiry, dailyLedgerSync,
+    stop() { clearTimeout(startupTimer); clearInterval(interval); clearInterval(hourly); } };
 }
 
 module.exports = { start };

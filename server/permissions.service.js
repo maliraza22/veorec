@@ -10,6 +10,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 const entitlements = require('./entitlements');
 const usageService = require('./usage.service');
+const plans = require('./plans');
 
 const ALLOW = (meta) => ({ allowed: true, meta });
 const DENY = (reason, meta) => ({ allowed: false, reason, upgradeRequired: true, meta });
@@ -108,15 +109,24 @@ function canUploadVideo(user, incomingBytes = 0) {
   const plan = entitlements.resolve(user);
   const usage = usageService.get(user.id);
   const used = usage.storageUsedBytes || 0;
-  const limit = plan.storageLimitBytes;
+  // T-306: the active limit set. With QUOTA_ENFORCEMENT_V2 unset this is
+  // exactly plan.storageLimitBytes — today's behaviour, byte for byte. With it
+  // set to "true" the docs/16 §1.1 integers apply here too (the notice-period
+  // flip), with the §4.6 block message.
+  const limits = plans.limitsFor(plan);
+  const limit = limits.maxStorageBytes;
   const projected = used + incomingBytes;
 
   if (projected > limit) {
     const limitGB = plan.storageLimitGB;
     return DENY(
-      plan.slug === 'free'
-        ? `Storage limit reached. Upgrade to Pro for 100GB storage.`
-        : `Storage limit of ${limitGB}GB reached. Free up space or contact us to add more.`,
+      limits.model === 'v2'
+        ? (plan.slug === 'free'
+          ? "You've reached your 5 GB free storage limit. Delete a video or upgrade to continue recording."
+          : `You've reached your ${Math.round(limit / (1024 ** 3))} GB storage limit. Delete a video or upgrade to continue recording.`)
+        : (plan.slug === 'free'
+          ? `Storage limit reached. Upgrade to Pro for 100GB storage.`
+          : `Storage limit of ${limitGB}GB reached. Free up space or contact us to add more.`),
       {
         usedBytes: used,
         limitBytes: limit,
@@ -135,15 +145,20 @@ function canUploadVideo(user, incomingBytes = 0) {
  */
 function canCreateVideo(user) {
   const plan = entitlements.resolve(user);
-  if (plan.maxVideos == null) return ALLOW({ plan: plan.slug });
+  // T-306: same switch as canUploadVideo — legacy field when OFF, §1.1 when ON.
+  const limits = plans.limitsFor(plan);
+  const maxVideos = limits.maxActiveVideos;
+  if (maxVideos == null) return ALLOW({ plan: plan.slug });
   const count = usageService.get(user.id).videoCount || 0;
-  if (count >= plan.maxVideos) {
+  if (count >= maxVideos) {
     return DENY(
-      `You've reached the ${plan.maxVideos}-video limit on the ${plan.name} plan. Upgrade to Pro for unlimited videos.`,
-      { videoCount: count, maxVideos: plan.maxVideos, plan: plan.slug }
+      limits.model === 'v2' && plan.slug === 'free'
+        ? "You've reached your 50-video free limit. Delete a video or upgrade to continue recording."
+        : `You've reached the ${maxVideos}-video limit on the ${plan.name} plan. Upgrade to Pro for unlimited videos.`,
+      { videoCount: count, maxVideos, plan: plan.slug }
     );
   }
-  return ALLOW({ videoCount: count, maxVideos: plan.maxVideos, plan: plan.slug });
+  return ALLOW({ videoCount: count, maxVideos, plan: plan.slug });
 }
 
 module.exports = {

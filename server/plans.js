@@ -293,9 +293,99 @@ function publicPlan(plan) {
   };
 }
 
+// ── T-306: the docs/16 §1.1 quota model, behind an enforcement switch ─────────
+//
+// The target free plan is 50 active videos AND 5 GiB retained (whichever is
+// reached first), with a per-recording byte ceiling. docs/23 Phase 3 forbids
+// flipping that enforcement on without ≥14 days of in-app notice, so the
+// target integers live HERE, beside the legacy fields, and `limitsFor()`
+// chooses which set is active:
+//
+//   QUOTA_ENFORCEMENT_V2 unset / anything but exactly "true"  → legacy limits
+//   QUOTA_ENFORCEMENT_V2 = "true"                              → §1.1 integers
+//
+// OFF is byte-identical to today's entitlements. ON is the notice-period flip.
+// "Grandfathering" (docs/23) is not a stored flag: a user already over the new
+// cap is simply blocked from NEW recordings by the same guard that blocks
+// everyone else, and nothing they own is ever trimmed or deleted.
+//
+// Exact values — integers, never strings (docs/16 §1.1).
+const MiB = 1024 * 1024;
+const QUOTA_V2 = {
+  free: {
+    maxActiveVideos: 50,
+    maxStorageBytes: 5_368_709_120,        // 5 GiB (marketed "5 GB")
+    maxRecordingDurationSeconds: 600,
+    maxUploadBytes: 536_870_912,           // 512 MiB per-recording hard byte ceiling
+    minStartBytes: 67_108_864,             // 64 MiB — refuse to start below this much free quota
+    maxResolution: { width: 1920, height: 1080 },
+  },
+  pro: {
+    maxActiveVideos: null,                 // unlimited
+    maxStorageBytes: 1_099_511_627_776,    // 1 TiB
+    maxRecordingDurationSeconds: 36_000,
+    maxUploadBytes: 21_474_836_480,        // 20 GiB
+    minStartBytes: 67_108_864,
+    maxResolution: { width: 1920, height: 1080 },
+  },
+  business: {
+    maxActiveVideos: null,
+    maxStorageBytes: 1_099_511_627_776,
+    maxRecordingDurationSeconds: 14_400,
+    maxUploadBytes: 21_474_836_480,
+    minStartBytes: 67_108_864,
+    maxResolution: { width: 1920, height: 1080 },
+  },
+  enterprise: {
+    maxActiveVideos: null,
+    maxStorageBytes: 10_995_116_277_760,   // 10 TiB
+    maxRecordingDurationSeconds: 36_000,
+    maxUploadBytes: 21_474_836_480,
+    minStartBytes: 67_108_864,
+    maxResolution: { width: 3840, height: 2160 },
+  },
+};
+
+/** Only the literal 'true' turns the new model on. */
+function quotaEnforcementV2(env = process.env) {
+  return env.QUOTA_ENFORCEMENT_V2 === 'true';
+}
+
+/**
+ * The limit set the quota guard and the meters use for a plan. The same shape
+ * either way, so no caller branches on the switch:
+ *   { model, planSlug, maxActiveVideos, maxStorageBytes, maxUploadBytes,
+ *     minStartBytes, maxRecordingDurationSeconds, maxResolution }
+ * Legacy mode maps today's fields 1:1 (maxVideos, storageLimitBytes,
+ * recordingLimitMinutes) — the per-recording ceiling and the start floor did
+ * not exist before, so they take the §1.1 values in both modes: they only ever
+ * cap a single take, never a user's entitlement.
+ */
+function limitsFor(plan, env = process.env) {
+  const p = plan && plan.slug ? plan : getPlan(plan);
+  const v2 = QUOTA_V2[p.slug] || QUOTA_V2.free;
+  if (quotaEnforcementV2(env)) {
+    return { model: 'v2', planSlug: p.slug, ...v2 };
+  }
+  return {
+    model: 'legacy',
+    planSlug: p.slug,
+    maxActiveVideos: p.maxVideos == null ? null : Number(p.maxVideos),
+    maxStorageBytes: Number(p.storageLimitBytes),
+    maxRecordingDurationSeconds: Number(p.recordingLimitMinutes) * 60,
+    maxUploadBytes: v2.maxUploadBytes,
+    minStartBytes: v2.minStartBytes,
+    maxResolution: p.exportQuality === '4k' ? { width: 3840, height: 2160 } : { width: 1920, height: 1080 },
+  };
+}
+
 module.exports = {
   PLANS,
   GB,
+  MiB,
+  QUOTA_V2,
+  quotaEnforcementV2,
+  limitsFor,
   DEFAULT_PLAN_SLUG,
   getPlan,
   listPublicPlans,

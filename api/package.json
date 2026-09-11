@@ -9,10 +9,11 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node ../tests/identity-bridge.test.js && node ../tests/uploads-api.test.js && node ../tests/recordings-api.test.js",
+    "test": "node ../tests/identity-bridge.test.js && node ../tests/uploads-api.test.js && node ../tests/recordings-api.test.js && node ../tests/quota.test.js",
     "test:uploads": "node ../tests/uploads-api.test.js",
     "test:recordings": "node ../tests/recordings-api.test.js",
-    "test:identity": "node ../tests/identity-bridge.test.js"
+    "test:identity": "node ../tests/identity-bridge.test.js",
+    "test:quota": "node ../tests/quota.test.js"
   },
   "dependencies": {
     "express": "^4.21.2"

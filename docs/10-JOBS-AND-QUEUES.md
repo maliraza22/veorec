@@ -72,6 +72,8 @@ Hard-purge soft-deleted recordings >30d (R2 objects then rows); purge `rejected_
 ### `maintenance.usage_sync` (repeat daily)
 Re-derive the quota ledger per user from Postgres aggregates — `storage_retained_bytes` from `counts_toward_quota` assets, `active_video_count` from recording statuses, `storage_pending_deletion_bytes` from soft-deleted rows — expire orphaned `storage_reservations`, and log drift > 1% (replaces `cron.dailyUsageSync`).
 
+> **Interim home (T-306):** `usage_sync` and `upload_expiry` are implemented as plain functions in `@veorec/db` (`db/src/maintenance/usage-sync.js`, `upload-expiry.js`), runnable by `node db/src/cli/maintenance.js <usage_sync|upload_expiry>`, and — until this queue exists (Phase 6) — scheduled by the legacy in-process `server/cron.js` whenever the v1 stack is mounted (hourly expiry, daily sync). The Phase 6 workers call the same functions.
+
 ### `maintenance.subscription_sync` (repeat daily)
 Reconcile each subscription with Paddle via `billing.service.syncSubscription` (replaces `cron.dailySubscriptionSync`). Also `maintenance.storage_verification` — flag over-limit accounts (as `cron.js:45-56`).
 

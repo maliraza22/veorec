@@ -164,6 +164,11 @@ const selectedAt = (percent) => new Set(POPULATION.filter((u) => pathAt(u, perce
       return { child, log: () => out };
     }
 
+    // pino writes asynchronously; give a line up to 2s to reach the pipe.
+    async function waitLog(srv, re) {
+      for (let i = 0; i < 20; i += 1) { if (re.test(srv.log())) return true; await sleep(100); }
+      return re.test(srv.log());
+    }
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 't304-'));
     let srv = await startServer(3291, 100, dataDir);          // 100% → everyone
     let token = null, legacyUserId = null;
@@ -187,7 +192,7 @@ const selectedAt = (percent) => new Set(POPULATION.filter((u) => pathAt(u, perce
       })).json();
       ok(noMirror.upload.path === 'legacy',
         'at 100%, an account with no PostgreSQL mirror is still sent to legacy');
-      ok(/account_not_migrated/.test(srv.log()),
+      ok(await waitLog(srv, /account_not_migrated/),
         'and the reason is recorded as account_not_migrated, not a generic legacy decision');
       ok(!new RegExp(legacyUserId).test(JSON.stringify(noMirror)),
         'the response contains no user identifier');
@@ -209,7 +214,7 @@ const selectedAt = (percent) => new Set(POPULATION.filter((u) => pathAt(u, perce
         headers: { Authorization: `Bearer ${token}` },
       })).json();
       ok(again.upload.path === 'v1', 'the same user gets the same answer on a repeat call');
-      ok(/rollout_decision/.test(srv.log()), 'each decision is recorded in telemetry');
+      ok(await waitLog(srv, /rollout_decision/), 'each decision is recorded in telemetry');
     } finally {
       srv.child.kill(); await sleep(400);
     }
@@ -227,7 +232,7 @@ const selectedAt = (percent) => new Set(POPULATION.filter((u) => pathAt(u, perce
       ok(rolledBack.upload.path === 'legacy',
         'ROLLBACK DRILL step 2 — after setting the rollout to 0%, the SAME user resolves to legacy');
       ok(rolledBack.upload.v1Enabled === false, 'the client is told v1 is disabled');
-      ok(/legacy_disabled/.test(srv.log()), 'the rollback decision is recorded in telemetry');
+      ok(await waitLog(srv, /legacy_disabled/), 'the rollback decision is recorded in telemetry');
 
       const recordingsAfter = (await db.execute(sql`select count(*)::int n from recordings`)).rows[0].n;
       const usersAfter = (await db.execute(sql`select count(*)::int n from users`)).rows[0].n;

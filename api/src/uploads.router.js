@@ -83,6 +83,12 @@ function createUploadRouter(deps) {
     // as the legacy path. A no-op by default, so the router stays usable
     // without it and no parallel metrics store is created.
     telemetry = { uploadStarted() {}, uploadFinished() {} },
+    // T-306: the quota ledger (api/src/quota createQuota). When present, session
+    // creation reserves quota atomically in the same transaction that inserts
+    // the session, completion reconciles, and abort releases. When absent the
+    // T-301 `entitlements` seam applies unchanged — so the router is usable
+    // (and its earlier suites hold) without a ledger.
+    quota = null,
   } = deps;
 
   const router = express.Router();
@@ -150,39 +156,67 @@ function createUploadRouter(deps) {
 
     const container = MIME_CONTAINER[mimeType];
     const storageKey = keys.source(recordingId, container);
-    const planCeiling = await entitlements.byteCeiling({ repos, scope, recording });
+    const expiresAt = new Date(Date.now() + SESSION_TTL_MS);
+    const limits = quota ? await quota.resolveLimits(req) : null;
+    // Without a ledger (T-301 seam) the ceiling is the plan's; with one, the
+    // ceiling IS the reservation, decided inside the transaction below.
+    const planCeiling = quota ? null : await entitlements.byteCeiling({ repos, scope, recording });
+
+    /**
+     * Insert the session row — and, with a ledger, reserve quota in the SAME
+     * transaction (docs/06 §3, docs/16 §4.3): usage row lock → live totals →
+     * guarded UPDATE → session → reservation row. A guard refusal throws the
+     * 403 and rolls everything back, so no session and no reservation exist.
+     * `fixedCeiling` (single mode) caps the reservation at the declared size's
+     * mode ceiling; the declared size itself must fit or the create is refused.
+     */
+    async function persistSession(fields, { fixedCeiling = null, declaredBytes = null } = {}) {
+      if (!quota) {
+        return repos.uploads.createSession(scope, { ...fields, byteCeiling: fixedCeiling ?? planCeiling, expiresAt });
+      }
+      return withTransaction(async (tx) => {
+        const { reserveBytes } = await quota.reserve({
+          tx, scope, limits, expiresAt, maxBytes: fixedCeiling, declaredBytes,
+        });
+        const session = await tx.uploads.createSession(scope, { ...fields, byteCeiling: reserveBytes, expiresAt });
+        await quota.attach({ tx, scope, uploadSessionId: session.id, reserveBytes, expiresAt });
+        return session;
+      });
+    }
+
+    async function replayOnConflict(err) {
+      if (err && err.code === 'conflict') {
+        const existing = await repos.uploads.findByIdempotencyKey(scope, idempotencyKey)
+          || await repos.uploads.findOpenForRecording(scope, recordingId);
+        if (existing) return existing;
+      }
+      throw err;
+    }
 
     if (mode === 'single') {
       // docs/06 §12: the single-mode ceiling is the byte ceiling — never more
       // than the plan allows, never more than 32 MiB. The declared size must
       // already fit, or the PUT we are about to sign could never succeed.
-      const byteCeiling = Math.min(planCeiling, SINGLE_MAX_BYTES);
-      if (sizeBytes > byteCeiling) {
+      if (!quota && sizeBytes > Math.min(planCeiling, SINGLE_MAX_BYTES)) {
         throw forbidden('storage_limit',
           'This upload would exceed the size limit reserved for the recording.',
-          { upgradeRequired: true, meta: { byteCeiling, sizeBytes } });
+          { upgradeRequired: true, meta: { byteCeiling: Math.min(planCeiling, SINGLE_MAX_BYTES), sizeBytes } });
       }
       // No multipart upload to open: the row is the only thing created here.
       let session;
       try {
-        session = await repos.uploads.createSession(scope, {
+        session = await persistSession({
           recordingId, storageKey, storageUploadId: null, mode: 'single',
-          partSize: sizeBytes, byteCeiling, clientMime: mimeType,
-          idempotencyKey, expiresAt: new Date(Date.now() + SESSION_TTL_MS),
-        });
+          partSize: sizeBytes, clientMime: mimeType, idempotencyKey,
+        }, { fixedCeiling: SINGLE_MAX_BYTES, declaredBytes: sizeBytes });
       } catch (err) {
-        if (err && err.code === 'conflict') {
-          const existing = await repos.uploads.findByIdempotencyKey(scope, idempotencyKey)
-            || await repos.uploads.findOpenForRecording(scope, recordingId);
-          if (existing) return res.status(200).json(await sessionBody(storage, existing));
-        }
-        throw err;
+        const existing = await replayOnConflict(err);
+        return res.status(200).json(await sessionBody(storage, existing));
       }
       telemetry.uploadStarted(req, { sizeBytes, mode: 'single' });
       return res.status(201).json(await sessionBody(storage, session));
     }
 
-    const byteCeiling = planCeiling;
     // The multipart upload is created BEFORE the row, so a row never claims a
     // storage upload that does not exist. The reverse would leave a session the
     // client could presign against with no upload behind it.
@@ -192,22 +226,18 @@ function createUploadRouter(deps) {
 
     let session;
     try {
-      session = await repos.uploads.createSession(scope, {
+      session = await persistSession({
         recordingId, storageKey, storageUploadId: uploadId,
-        partSize: DEFAULT_PART_SIZE, byteCeiling, clientMime: mimeType,
-        idempotencyKey, expiresAt: new Date(Date.now() + SESSION_TTL_MS),
+        partSize: DEFAULT_PART_SIZE, clientMime: mimeType, idempotencyKey,
       });
     } catch (err) {
       // The row lost a race (concurrent create with the same key, or another
-      // session for this recording). Abandoning the multipart we just opened
-      // would leak an incomplete upload, so abort it — abort is idempotent.
+      // session for this recording), or the quota guard refused. Abandoning
+      // the multipart we just opened would leak an incomplete upload, so abort
+      // it — abort is idempotent.
       await storage.abortMultipartUpload(storageKey, uploadId).catch(() => {});
-      if (err && err.code === 'conflict') {
-        const existing = await repos.uploads.findByIdempotencyKey(scope, idempotencyKey)
-          || await repos.uploads.findOpenForRecording(scope, recordingId);
-        if (existing) return res.status(200).json(await sessionBody(storage, existing));
-      }
-      throw err;
+      const existing = await replayOnConflict(err);
+      return res.status(200).json(await sessionBody(storage, existing));
     }
 
     telemetry.uploadStarted(req, { sizeBytes: null, mode: 'multipart' });
@@ -364,9 +394,17 @@ function createUploadRouter(deps) {
       const ceiling = Number(session.byteCeiling);
       if (total > ceiling) {
         // Over the ceiling: abort the multipart so the parts do not linger, and
-        // refuse. No application state is created.
+        // refuse. No application state is created — and with a ledger, the
+        // reservation goes back too (T-306), or it would sit held until expiry.
         await storage.abortMultipartUpload(session.storageKey, session.storageUploadId).catch(() => {});
-        await repos.uploads.setSessionStatus(scope, session.id, 'aborted');
+        if (quota) {
+          await withTransaction(async (tx) => {
+            await quota.release({ tx, scope, session, status: 'released' });
+            await tx.uploads.setSessionStatus(scope, session.id, 'aborted');
+          });
+        } else {
+          await repos.uploads.setSessionStatus(scope, session.id, 'aborted');
+        }
         throw unprocessable('upload_manifest_invalid',
           'The upload is larger than the limit reserved for this recording.',
           { meta: { byteCeiling: ceiling, declaredBytes: total } });
@@ -388,24 +426,49 @@ function createUploadRouter(deps) {
 
     // Entitlement at completion (docs/06 §7 step 5): re-checked with the REAL
     // size, which is the only size that was ever trustworthy.
-    const verdict = await entitlements.checkAtComplete({
-      repos, scope, session, sizeBytes: stored.contentLength,
-    });
-    if (!verdict.allowed) {
-      // The source is NOT deleted — user content is never silently destroyed;
-      // an upgrade can still rescue it (docs/06 §7).
+    //
+    // Rejection keeps the source (user content is never silently destroyed —
+    // an upgrade can still rescue it, docs/06 §7), marks the recording
+    // rejected_limit, aborts the session and, with a ledger, RELEASES the
+    // reservation so the refused bytes do not stay counted against the user.
+    const reject = async (verdict) => {
       await repos.recordings.updateSystem(session.recordingId, { status: 'rejected_limit' },
         'T-301: entitlement rejected the upload at completion');
-      await repos.uploads.setSessionStatus(scope, session.id, 'aborted');
+      if (quota) {
+        await withTransaction(async (tx) => {
+          await quota.release({ tx, scope, session, status: 'released' });
+          await tx.uploads.setSessionStatus(scope, session.id, 'aborted');
+        });
+      } else {
+        await repos.uploads.setSessionStatus(scope, session.id, 'aborted');
+      }
       telemetry.uploadFinished(req, 'rejected_limit', { code: verdict.code || 'storage_limit', mode: session.mode });
       throw forbidden(verdict.code || 'storage_limit', verdict.message
         || 'This upload exceeds your plan.', { upgradeRequired: true, meta: verdict.meta });
+    };
+    if (!quota) {
+      const verdict = await entitlements.checkAtComplete({ repos, scope, session, sizeBytes: stored.contentLength });
+      if (!verdict.allowed) await reject(verdict);
     }
 
     // 5+6. One short transaction: session, recording, asset and the outbox row
     // commit together. If any part fails, none of it happened — the database
     // can never claim a completed recording whose asset row is missing.
+    //
+    // T-306: with a ledger, the plan re-check and the reconciliation happen
+    // HERE, under the usage row lock (docs/16 §4.4 — "all in the same
+    // transaction as the event"): retained += real size, reserved −= the
+    // reservation, one slot back, active += 1, reservation reconciled. A
+    // failed re-check throws out of the transaction (nothing committed) and is
+    // then handled by `reject` above.
+    let quotaVerdict = null;
     const result = await withTransaction(async (tx) => {
+      if (quota) {
+        const limits = await quota.resolveLimits(req);
+        const v = await quota.checkAtComplete({ tx, scope, limits, session, sizeBytes: stored.contentLength });
+        if (!v.allowed) { quotaVerdict = v; throw new ApiError(403, v.code || 'storage_limit', v.message || 'Rejected'); }
+        await quota.reconcile({ tx, scope, session, sizeBytes: stored.contentLength });
+      }
       await tx.uploads.setSessionStatus(scope, session.id, 'completed',
         { completedAt: new Date() });
       await tx.recordings.updateSystem(session.recordingId,
@@ -424,6 +487,11 @@ function createUploadRouter(deps) {
         recordingId: session.recordingId, payload: { storageKey: session.storageKey },
       });
       return tx.uploads.getSession(scope, session.id);
+    }).catch(async (err) => {
+      // A quota verdict threw out of the transaction: nothing was committed.
+      // Now apply the rejection outcome in its own transaction.
+      if (quotaVerdict) await reject(quotaVerdict);
+      throw err;
     });
 
     telemetry.uploadFinished(req, 'success', { sizeBytes: stored.contentLength, mode: session.mode });
@@ -464,7 +532,17 @@ function createUploadRouter(deps) {
           'v1 upload abort: single-PUT object delete failed; marking the session aborted anyway');
       });
     }
-    await repos.uploads.setSessionStatus(scope, session.id, 'aborted');
+    // T-306: the reservation is returned in the same transaction that aborts
+    // the session (docs/16 §4.4). Release is idempotent — a re-abort, or a
+    // session that never held a reservation, releases nothing.
+    if (quota) {
+      await withTransaction(async (tx) => {
+        await quota.release({ tx, scope, session, status: 'released' });
+        await tx.uploads.setSessionStatus(scope, session.id, 'aborted');
+      });
+    } else {
+      await repos.uploads.setSessionStatus(scope, session.id, 'aborted');
+    }
     return res.json({ uploadSessionId: session.id, status: 'aborted' });
   }));
 

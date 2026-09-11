@@ -8,12 +8,16 @@
 
 const { createUploadRouter, defaultEntitlements } = require('./uploads.router');
 const { createRecordingsRouter, defaultEntitlements: defaultRecordingEntitlements } = require('./recordings.router');
+const { createMeRouter } = require('./me.router');
+const quota = require('./quota');
 const errors = require('./errors');
 const identity = require('./identity');
 
 module.exports = {
   createUploadRouter, defaultEntitlements,
   createRecordingsRouter, defaultRecordingEntitlements,
+  // T-306: the quota ledger and the caller's own meters.
+  createMeRouter, ...quota,
   ...identity,
   ...errors,
 };

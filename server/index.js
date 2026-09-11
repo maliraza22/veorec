@@ -336,6 +336,10 @@ app.get('/api/client-config', requireAuth, async (req, res) => {
   res.json(rollout.clientConfigBody(decision, web));
 });
 
+// T-306: set when the v1 stack mounts; the scheduler runs the maintenance
+// jobs only then (there is no PostgreSQL ledger to maintain otherwise).
+let maintenanceDeps = null;
+
 // ── /api/v1 upload sessions (T-301) ─────────────────────────────────────────
 // OFF unless V1_UPLOAD_API is exactly "true". When off, none of the new
 // packages are loaded and the legacy app is byte-identical to before, so
@@ -348,21 +352,37 @@ app.get('/api/client-config', requireAuth, async (req, res) => {
 // every current client uses.
 if (process.env.V1_UPLOAD_API === 'true') {
   try {
-    const { createUploadRouter, createRecordingsRouter } = require('../api/src/index.js');
+    const { createUploadRouter, createRecordingsRouter, createMeRouter, createQuota } = require('../api/src/index.js');
     const { repositories, withTransaction } = require('../db/src/index.js');
     const storagePkg = require('../storage/src/index.js');
+    // T-306: the quota ledger. Limits come from the ONE plan catalog
+    // (server/plans.js limitsFor, honouring QUOTA_ENFORCEMENT_V2) resolved
+    // through the legacy entitlement resolver — legacy auth is the identity
+    // source of truth during the migration window, and T-1302 replaces this
+    // resolver, not the algorithm. The identity bridge has already put the
+    // legacy id on req.legacyUserId by the time the router asks.
+    const quota = createQuota({
+      resolveLimits: (r) => plans.limitsFor(entitlements.resolve(users.findById(r.legacyUserId || r.userId))),
+      logger,
+    });
     app.use('/api/v1', createUploadRouter({
       repositories, withTransaction,
       storage: storagePkg.storageProvider(),
       keys: storagePkg.keys,
       requireAuth,
       logger,
+      quota,
       // T-304: the v1 path reports its own result, tagged path='v1'.
       telemetry: {
         uploadStarted: (r, meta) => kpi.uploadStarted(r, { ...meta, path: 'v1', store: 'r2' }),
         uploadFinished: (r, outcome, meta) => kpi.uploadFinished(r, outcome, { ...meta, path: 'v1', store: 'r2' }),
       },
     }));
+    // T-306: the caller's own dual quota meters (docs/16 §4.5).
+    app.use('/api/v1', createMeRouter({ repositories, requireAuth, quota, logger }));
+    // T-306: maintenance jobs in the existing in-process scheduler until the
+    // Phase 6 queue owns them — hourly upload_expiry, daily usage_sync.
+    maintenanceDeps = { repositories, withTransaction, storage: storagePkg.storageProvider(), logger };
     // T-302: recordings CRUD, served from PostgreSQL. Same flag, same
     // rollback: the legacy /api/recordings routes are untouched and remain what
     // every current client uses.
@@ -2215,7 +2235,7 @@ async function listUserVideos(userId) {
   } catch { return []; }
 }
 
-cron.start({ listUsers: loadAllUsers, listVideos: listUserVideos });
+cron.start({ listUsers: loadAllUsers, listVideos: listUserVideos, maintenance: maintenanceDeps });
 
 // ── Serve client build ────────────────────────────────────────────────────────
 const clientDist = path.join(__dirname, '../client/dist');
