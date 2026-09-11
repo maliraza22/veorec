@@ -28,6 +28,10 @@ chunks     keyPath: [sessionId, seq]
 parts      keyPath: [sessionId, partNumber]
 ```
 
+### 2.1 As implemented (T-401)
+
+`extension/recorderStore.js` — plain UMD like the uploader (**not `store/recorderStore.ts`**: the extension has no TypeScript toolchain or build step, T-303), global `VeoRecRecorderStore`, testable in Node with fake-indexeddb. `openStore()` opens `veorec-recorder` v1 with the three stores above, requests `navigator.storage.persist()` best-effort and logs the grant, and returns: `checkSpace()` (§4: `ok` / `warn` below 2 GB / `insufficient_disk` below 500 MB; an unknown or failing estimate never blocks); `createSession` / `getSession` / `listSessions` / `updateSession` (bumps the `updatedAt` heartbeat) / `heartbeat` / `setStatus` / `liveness(session)` (§3: `live` within 15 s, else `dead`); `appendChunk(sessionId, bytes)` — **queued per session so `seq` is assigned in arrival order even when the recorder does not await**, `chunkCount`/`totalBytes` maintained in the same transaction, one retry then `persist_failed`, `QuotaExceededError` → `quota_exceeded` with no retry; `getChunks` (ordered, inclusive ranges) and `assembleBlob` (the local-download source); `upsertPart` / `setPartStatus` / `listParts` (§5 rows; an upsert that omits `status` keeps the stored one, so bumping `attempts` can never demote an uploaded part); `pruneChunks(sessionId, {force})` — nothing pruned unless forced, and then only chunks covered by parts that are `uploaded` **and** carry an etag; `deleteSession` (session + chunks + parts, one transaction); `gc()` (§7, 7 days, console notice). No network, no `chrome.*`, no knowledge of the uploader. Wiring into `dataavailable`, the finalize path and delete-after-complete is T-402; the recovery flow and UI are T-403.
+
 ## 3. `sessions` store
 
 ```ts

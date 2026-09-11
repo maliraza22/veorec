@@ -223,3 +223,15 @@ recorder state-machine rewrite, no web upload path (T-305), no cutover flag
 plumbing or telemetry (T-304), no legacy route change. The flag is off and no
 client ships it enabled.
 
+
+### 5.2 RecorderStore (delivered by T-401)
+
+`extension/recorderStore.js` (UMD, global `VeoRecRecorderStore`) is the local
+recovery database of `05` §2–§5, §7: sessions with the 15 s heartbeat, chunks
+written in arrival order on a per-session queue, part bookkeeping with the
+etag as the durable proof, prune-only-under-pressure, atomic session deletion
+and 7-day GC. It stores what it is told and returns it in order — no network,
+no `chrome.*`, nothing of the uploader. The recorder does not use it yet: T-402
+wires `dataavailable` → store → uploader and delete-after-complete; T-403 adds
+the launch scan and recovery card. Loaded by `recorder.html` alongside
+`uploader.js` when T-402 lands.

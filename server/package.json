@@ -8,11 +8,12 @@
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "test": "node ../tests/fixwebm.test.js && node ../tests/observability.test.js && node ../tests/kpi.test.js && node ../tests/r2mirror.test.js && node ../tests/uploader.test.js && node ../tests/rollout.test.js && node ../tests/web-upload.test.js",
+    "test": "node ../tests/fixwebm.test.js && node ../tests/observability.test.js && node ../tests/kpi.test.js && node ../tests/r2mirror.test.js && node ../tests/uploader.test.js && node ../tests/rollout.test.js && node ../tests/web-upload.test.js && node ../tests/recorder-store.test.js",
     "test:r2mirror": "node ../tests/r2mirror.test.js",
     "test:uploader": "node ../tests/uploader.test.js",
     "test:rollout": "node ../tests/rollout.test.js",
-    "test:web": "node ../tests/web-upload.test.js"
+    "test:web": "node ../tests/web-upload.test.js",
+    "test:store": "node ../tests/recorder-store.test.js"
   },
   "dependencies": {
     "@sentry/node": "^10.73.0",
@@ -27,6 +28,7 @@
     "uuid": "^9.0.1"
   },
   "devDependencies": {
+    "fake-indexeddb": "^6.2.5",
     "nodemon": "^3.1.0",
     "pino-pretty": "^13.1.3"
   }
