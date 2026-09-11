@@ -6,7 +6,7 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../AuthContext';
 import { useBilling } from '../hooks/useBilling';
-import StorageMeter from './StorageMeter';
+import { DualMeters } from './StorageMeter';
 import NotificationsBell from './NotificationsBell';
 import API from '../api';
 import s from './AppShell.module.css';
@@ -117,20 +117,12 @@ export default function AppShell({ active = 'library', search, onSearch, headerR
         </nav>
 
         <div className={s.sidebarFoot}>
+          {/* T-307: BOTH meters, always (docs/16 §4.6) — either limit alone can
+              block the next recording, so neither is ever hidden behind the other. */}
           {usage && (
-            plan && plan.maxVideos != null ? (
-              <div className={s.storageBox}>
-                <div className={s.storageLabel}>{usage.videoCount || 0} / {plan.maxVideos} videos</div>
-                <div style={{ height: 6, background: 'var(--surface2,#ececf5)', borderRadius: 999, overflow: 'hidden', marginTop: 6 }}>
-                  <div style={{ height: '100%', width: `${Math.min(100, ((usage.videoCount || 0) / plan.maxVideos) * 100)}%`, background: '#5b5bf6', borderRadius: 999 }} />
-                </div>
-              </div>
-            ) : (
-              <div className={s.storageBox}>
-                <div className={s.storageLabel}>Storage</div>
-                <StorageMeter usage={usage} isPaid={isPaid} showUpgradeHint={false} />
-              </div>
-            )
+            <div className={s.storageBox} data-testid="sidebar-quota">
+              <DualMeters usage={usage} isPaid={isPaid} showUpgradeHint={false} />
+            </div>
           )}
           <Link to="/billing" className={s.navItem}><CreditCard size={18} /> Billing &amp; plan</Link>
           {!isPaid && (

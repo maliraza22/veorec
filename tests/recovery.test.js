@@ -236,7 +236,7 @@ function fakeUploaderFactory(plan) {
   const scripts = html.match(/<script src="([^"]+)"><\/script>/g).map((x) => x.match(/"([^"]+)"/)[1]);
   ok(scripts.indexOf('recovery.js') > scripts.indexOf('uploader.js') && scripts.indexOf('recovery.js') < scripts.indexOf('recorder.js'), 'recovery.js loads after uploader.js and before recorder.js');
   ok(/id="recoveryCard"/.test(html), 'the recovery card container exists');
-  ok(/const verdict = await runRecoveryScan\(\)[\s\S]*?if \(verdict\.proceed\) beginRecording\(\)/.test(code), 'the launch scan runs BEFORE auto-start and gates it');
+  ok(/const verdict = await runRecoveryScan\(\)[\s\S]*?if \(!verdict\.proceed\) return;[\s\S]*?beginRecording\(\)\.catch\(onStartError\)/.test(code), 'the launch scan runs BEFORE auto-start and gates it (T-307 adds the quota pre-flight between them)');
   ok(/if \(result\.live\)[\s\S]*?already running in another VeoRec window/.test(rec), 'a live session elsewhere refuses to start with a plain message');
   ok(/mk\('⬆ Resume upload'/.test(rec) && /mk\('⬇ Download'/.test(rec) && /mk\('🗑 Discard'/.test(rec), 'Resume / Download / Discard actions');
   ok(/if \(d\.ownedByCurrentUser\) mk\('⬆ Resume upload'/.test(code), 'Resume is offered only for the current user\'s sessions');
@@ -244,7 +244,7 @@ function fakeUploaderFactory(plan) {
   ok(/fixWebmDuration: \(typeof fixWebmDuration === 'function' \? fixWebmDuration : null\)/.test(code), 'local download uses fixWebmDuration');
   ok(/window\.confirm\('Discard this unfinished recording\?/.test(rec), 'discard asks first');
   ok(/out\.kind === 'auth_required'/.test(code) && /nothing was lost/.test(rec), 'auth failure keeps the data and says so');
-  ok(/out\.kind === 'quota'/.test(code) && /delete a video and try again/.test(rec), 'a quota verdict keeps Download / delete-and-retry');
+  ok(/out\.kind === 'quota'/.test(code) && /Delete a video & retry/.test(rec), 'a quota verdict keeps Download / Delete a video & retry (T-307 made them explicit buttons)');
   ok(/showRecoverableBadge\(data\.recoverable\)/.test(popup) && /unsaved recording/.test(popup) && /recorder\.html\?recover=1/.test(popup), 'the popup shows a recovered-recordings badge that opens the recorder');
   ok(/chrome\.storage\.onChanged\.addListener/.test(popup) && /changes\.recoverable/.test(popup), 'the badge updates live');
 

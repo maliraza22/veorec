@@ -612,6 +612,67 @@ function discardLocalSession() {
   recStore.deleteSession(id).catch(() => {});
 }
 
+// ── T-307 quota pre-flight (docs/03 §3.0, docs/16 §4.6) ─────────────────────
+// UX only: the authoritative gate is the server's atomic reservation at
+// upload-session creation (T-306). A fetch failure never blocks recording.
+
+const DASHBOARD_URL = 'https://veorec.com/';
+const PRICING_URL = 'https://veorec.com/pricing';
+const openTab = (url) => { try { chrome.tabs.create({ url }); } catch (e) { try { window.open(url, '_blank'); } catch (e2) {} } };
+
+async function loadQuotaPreflight() {
+  if (typeof VeoRecQuotaPreflight === 'undefined') return { state: 'unknown' };
+  try {
+    const { sr_token } = await chrome.storage.local.get('sr_token');
+    if (!sr_token) return { state: 'unknown' };
+    const res = await fetch(`${SERVER}/api/v1/me/usage`, { headers: { Authorization: `Bearer ${sr_token}` } });
+    if (!res.ok) return { state: 'unknown' };          // 404 (v1 off) / 503 (not migrated) / anything: proceed
+    const usage = await res.json();
+    return VeoRecQuotaPreflight.assess({ usage, quality: opts.quality });
+  } catch (e) { return { state: 'unknown' }; }
+}
+
+/** Blocked: Start is replaced by the exact block message + Manage videos / Upgrade. */
+function showQuotaBlocked(verdict) {
+  controls.style.display = 'none';
+  previewWrap.classList.remove('show');
+  mainBtn.style.display = 'none';
+  setStatus(verdict.message, 'uploading');
+  let box = document.getElementById('quotaBlocked');
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'quotaBlocked';
+    box.className = 'recovery-actions';
+    box.style.justifyContent = 'center';
+    box.style.marginTop = '10px';
+    const mk = (label, cls, fn) => { const b = document.createElement('button'); b.className = `btn ${cls}`; b.textContent = label; b.addEventListener('click', fn); box.appendChild(b); };
+    mk('🗂 Manage videos', 'btn-pause', () => openTab(DASHBOARD_URL));
+    mk('⭐ Upgrade', 'btn-start', () => openTab(PRICING_URL));
+    mk('↻ Check again', 'btn-cancel', async () => {
+      const again = await loadQuotaPreflight();
+      if (again.state !== 'blocked') { box.remove(); showStartButton('Ready.'); if (again.state === 'warn') overlayMsg({ type: 'SR_OVERLAY_WARN', text: again.message }); }
+      else setStatus(again.message, 'uploading');
+    });
+    (mainBtn.parentNode || document.body).insertBefore(box, mainBtn.nextSibling);
+  }
+}
+
+/** After a quota refusal at finalize: Save to device / Delete a video & retry / Upgrade. */
+function showQuotaOptions() {
+  showDownloadFallback();
+  let btn = document.getElementById('quotaRetry');
+  if (!btn) {
+    btn = document.createElement('button');
+    btn.id = 'quotaRetry';
+    btn.className = 'btn';
+    btn.style.marginTop = '10px';
+    btn.textContent = '🗂 Delete a video & retry';
+    btn.addEventListener('click', () => openTab(DASHBOARD_URL));
+    (mainBtn.parentNode || document.body).insertBefore(btn, mainBtn.nextSibling);
+  }
+  btn.style.display = '';
+}
+
 // ── T-403 recovery (docs/05 §6) ─────────────────────────────────────────────
 // Runs at launch before idle. A take interrupted by a crash is offered as
 // Resume upload / Download / Discard; a recording that is LIVE in another
@@ -722,7 +783,16 @@ async function recoveryResume(store, s, row, msg) {
   }
   row.querySelectorAll('button').forEach((b) => { b.disabled = false; });
   if (out.kind === 'auth_required') msg.textContent = 'Your sign-in has expired. Sign in via the extension popup, then resume — nothing was lost.';
-  else if (out.kind === 'quota') msg.textContent = (out.message || 'You have reached your plan limit.') + ' You can still download this recording, or delete a video and try again.';
+  else if (out.kind === 'quota') {
+    // T-307 (docs/05 §6.1.3): the card keeps offering Download / Delete a video & retry / Upgrade.
+    msg.textContent = (out.message || 'You have reached your plan limit.') + ' You can still download this recording.';
+    const actions = row.querySelector('.recovery-actions');
+    if (actions && !row.querySelector('[data-quota-action]')) {
+      const mk = (label, cls, fn) => { const b = document.createElement('button'); b.className = `btn ${cls}`; b.dataset.quotaAction = '1'; b.textContent = label; b.addEventListener('click', fn); actions.appendChild(b); };
+      mk('🗂 Delete a video & retry', 'btn-pause', () => openTab(DASHBOARD_URL));
+      mk('⭐ Upgrade', 'btn-start', () => openTab(PRICING_URL));
+    }
+  }
   else if (out.kind === 'cross_account') msg.textContent = 'This recording belongs to another account. You can download or discard it.';
   else msg.textContent = 'Could not upload right now — your recording is kept. Try again later, or download it.';
 }
@@ -907,7 +977,9 @@ async function handleStop() {
       if (res.status === 403 && data.upgradeRequired) {
         setStatus((data.error || 'Upgrade required to save this recording.') + ' ', 'uploading');
         showUpgradePrompt(data.error);
-        showDownloadFallback();   // don't lose their recording
+        // T-307 (docs/03 §3.0): a take in progress is never discarded by a quota
+        // verdict — Save to device / Delete a video & retry / Upgrade.
+        showQuotaOptions();
         return;
       }
       showStartButton(res.status === 401
@@ -985,5 +1057,12 @@ function restartRecording() {
   setStatus('Preparing your recording…');
   await loadPlanLimit();           // match the countdown to the user's plan
   const verdict = await runRecoveryScan().catch(() => ({ proceed: true }));
-  if (verdict.proceed) beginRecording().catch(onStartError);
+  if (!verdict.proceed) return;
+  // T-307: quota pre-flight (docs/03 §3.0). Blocked → the exact block message
+  // with Manage videos / Upgrade instead of Start; near-limit → banner, proceed;
+  // unknown → proceed (the server enforces at session creation regardless).
+  const quota = await loadQuotaPreflight();
+  if (quota.state === 'blocked') { showQuotaBlocked(quota); return; }
+  if (quota.state === 'warn') overlayMsg({ type: 'SR_OVERLAY_WARN', text: quota.message });
+  beginRecording().catch(onStartError);
 })();

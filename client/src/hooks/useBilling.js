@@ -1,10 +1,16 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useAuth } from '../AuthContext';
 import API from '../api';
+import { normalizeUsage, assessQuota } from '../lib/quotaMeters';
 
 // Central hook for everything monetization on the client. It NEVER decides access
 // (the server does) — it only fetches the trusted summary so the UI can render
 // the right state: meters, badges, locked features, upgrade prompts.
+//
+// T-307: `usage` is the normalized DUAL-meter shape (lib/quotaMeters): the v1
+// GET /api/v1/me/usage body when the v1 stack serves this account (the same
+// live aggregates the quota guard evaluates), else the legacy summary + plan.
+// The raw legacy body stays available as `usage.legacy` for older consumers.
 export function useBilling() {
   const { token } = useAuth();
   const [entitlements, setEntitlements] = useState(null);
@@ -17,12 +23,19 @@ export function useBilling() {
     if (!token) { setLoading(false); return; }
     setLoading(true);
     try {
-      const [eRes, uRes] = await Promise.all([
-        fetch(`${API}/api/me/entitlements`, { headers: authHeaders }),
-        fetch(`${API}/api/me/usage`, { headers: authHeaders }),
+      const safe = (p) => p.catch(() => null);
+      const [eRes, uRes, vRes] = await Promise.all([
+        safe(fetch(`${API}/api/me/entitlements`, { headers: authHeaders })),
+        safe(fetch(`${API}/api/me/usage`, { headers: authHeaders })),
+        safe(fetch(`${API}/api/v1/me/usage`, { headers: authHeaders })),
       ]);
-      setEntitlements(eRes.ok ? await eRes.json() : null);
-      setUsage(uRes.ok ? await uRes.json() : null);
+      const ent = eRes && eRes.ok ? await eRes.json() : null;
+      const legacy = uRes && uRes.ok ? await uRes.json() : null;
+      // 404 (v1 not mounted), 503 account_not_migrated, anything else → legacy.
+      const v1 = vRes && vRes.ok ? await vRes.json().catch(() => null) : null;
+      setEntitlements(ent);
+      const meters = normalizeUsage({ v1, legacy, plan: ent && ent.plan });
+      setUsage(meters ? { ...meters, legacy, quota: assessQuota(meters) } : null);
     } catch { /* leave nulls */ } finally { setLoading(false); }
   }, [token]);
 

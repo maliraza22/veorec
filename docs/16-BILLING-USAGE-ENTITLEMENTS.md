@@ -163,6 +163,14 @@ Nightly `maintenance.usage_sync` re-derives `retained`, `active_video_count`, an
 
 **Jobs.** `maintenance.usage_sync` (daily) and `maintenance.upload_expiry` (hourly) are plain functions in `@veorec/db` (`db/src/maintenance/*`), runnable by CLI (`db/src/cli/maintenance.js`) and, until the Phase 6 queue owns them, scheduled by the legacy in-process `server/cron.js` when the v1 stack is mounted.
 
+### 4.8 As implemented (T-307)
+
+**Dual meters (web).** `client/src/lib/quotaMeters.js` normalizes the v1 `GET /api/v1/me/usage` body (the same live aggregates the guard evaluates) — or, when the v1 stack does not serve the account (404 / 503 `account_not_migrated`), the legacy `/api/me/usage` summary plus the plan — into one shape: `storage.display` ("4.2 GB / 5 GB") and `videos.display` ("38 / 50", or the bare count with no cap). `useBilling().usage` is that shape. `StorageMeter` and `VideosMeter` (`components/StorageMeter.jsx`) each render their own bar and reading; `DualMeters` stacks both. The dashboard sidebar and the billing page render **both, always** — the earlier either/or sidebar and the "Videos recorded" line with no limit are gone. **No blended percentage exists anywhere** (asserted on the shape and on every component). Near-limit hint (§4.6 copy, exact) at ≥ 80% storage or ≥ max−5 videos.
+
+**Recorder pre-flight (`03` §3.0).** `extension/quotaPreflight.js` (UMD) assesses the `/api/v1/me/usage` body before Start is accepted: **blocked** (available < `minStartBytes`, or videos + reserved slots ≥ cap) replaces Start with the exact §4.6 block message and *Manage videos* / *Upgrade* / *Check again*; **warn** (available < `maxUploadBytes`, or ≥ max−5 videos) shows the near-limit copy plus "You have storage for about N more minutes at this quality" (bytes/s per quality from §1.1's derivation) and records anyway — the take is byte-capped by its reservation; **unknown** (fetch failed, v1 off, account not migrated) proceeds — the server enforces at session creation regardless. Runs after the T-403 recovery scan and before auto-start.
+
+**Finalize and recovery.** A quota refusal at finalize keeps the take (Save to device / *Delete a video & retry* / Upgrade — `03` §3.0); a quota verdict on the recovery card keeps Download / *Delete a video & retry* / Upgrade (`05` §6.1.3). The messages shown are the server's own (§4.6 copy under `QUOTA_ENFORCEMENT_V2`).
+
 ## 5. Paddle integration
 
 - **Checkout**: Paddle.js overlay (MoR requirement); server provides `{priceId, clientToken, environment, customData:{userId, planSlug, billingCycle}}` (`billing.service.createCheckout` port). Environment-split credentials (`*_SANDBOX` vs production) and the `PAYMENTS_LIVE` master switch are preserved verbatim (`billing.config.js` — good design: sandbox default, cannot take money until the flag flips, webhook secret required for checkout to be considered configured).
