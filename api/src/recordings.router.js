@@ -24,6 +24,7 @@
 const crypto = require('crypto');
 const express = require('express');
 const { errorHandler, badRequest, forbidden, notFound } = require('./errors');
+const { createIdentityBridge, scopeOf } = require('./identity');
 
 const MAX_TITLE = 200;
 const MAX_DESCRIPTION = 5000;
@@ -65,8 +66,11 @@ function createRecordingsRouter(deps) {
   const router = express.Router();
   router.use(express.json({ limit: '256kb' }));   // metadata only — never media
   router.use(requireAuth);
+  // Translate the legacy id to the PostgreSQL identity ONCE, here, before any
+  // ownership scope is built. `req.userId` is deliberately untouched: the same
+  // requireAuth instance serves 59 legacy routes that read it as the legacy id.
+  router.use(createIdentityBridge({ repositories, logger }));
 
-  const scopeOf = (req) => ({ userId: req.userId });
 
   // ── POST /recordings ──────────────────────────────────────────────────────
   router.post('/recordings', asyncRoute(async (req, res) => {
@@ -90,7 +94,9 @@ function createRecordingsRouter(deps) {
       if (typeof idempotencyKey !== 'string' || idempotencyKey.length > 200) {
         throw badRequest('invalid_request', 'Idempotency-Key must be a string of at most 200 characters.');
       }
-      id = derivedRecordingId(req.userId, idempotencyKey);
+      // Namespaced by the POSTGRESQL identity: the recording is a PostgreSQL
+      // row, so the legacy id has no business appearing inside its key.
+      id = derivedRecordingId(req.pgUserId, idempotencyKey);
       const existing = await repos.recordings.get(scope, id);
       if (existing) return res.status(200).json(summary(existing, null));
     }

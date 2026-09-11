@@ -33,6 +33,7 @@ const express = require('express');
 const {
   ApiError, errorHandler, badRequest, forbidden, notFound, conflict, unprocessable,
 } = require('./errors');
+const { createIdentityBridge, scopeOf } = require('./identity');
 
 // docs/06 §3
 const DEFAULT_PART_SIZE = 8 * 1024 * 1024;      // 8 MiB
@@ -70,8 +71,11 @@ function createUploadRouter(deps) {
   const router = express.Router();
   router.use(express.json({ limit: '1mb' }));   // manifests only — never bytes
   router.use(requireAuth);
+  // Translate the legacy id to the PostgreSQL identity ONCE, here, before any
+  // ownership scope is built. `req.userId` is deliberately untouched: the same
+  // requireAuth instance serves 59 legacy routes that read it as the legacy id.
+  router.use(createIdentityBridge({ repositories, logger }));
 
-  const scopeOf = (req) => ({ userId: req.userId });
 
   // ── POST /uploads — create (or replay) a session ──────────────────────────
   router.post('/uploads', asyncRoute(async (req, res) => {

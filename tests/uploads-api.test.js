@@ -104,14 +104,19 @@ const nextId = () => `u${RUN}${(n += 1)}`;
     return { status: res.status, body: json };
   };
 
-  async function seedUser(uid) {
+  // The caller authenticates with a LEGACY id; the PostgreSQL row the importer
+  // and dual-write produce is `usr_<legacyId>`. Seeding it this way is what
+  // makes these suites exercise the identity bridge rather than side-step it.
+  const pgId = (legacyId) => `usr_${legacyId}`;
+  async function seedUser(legacyId) {
     await db.execute(sql`INSERT INTO users (id,email,name,password_hash)
-      VALUES (${uid}, ${`${uid}@example.com`}, 'U', 'x') ON CONFLICT (id) DO NOTHING`);
-    return uid;
+      VALUES (${pgId(legacyId)}, ${`${legacyId}@example.com`}, 'U', 'x') ON CONFLICT (id) DO NOTHING`);
+    return legacyId;                      // callers authenticate with the legacy id
   }
-  async function seedRecording(uid, rid, status = 'recording') {
+  async function seedRecording(legacyUserId, rid, status = 'recording') {
+    // Owned by the POSTGRESQL identity, which is what the FK references.
     await db.execute(sql`INSERT INTO recordings (id,user_id,title,status,source_kind,privacy)
-      VALUES (${rid}, ${uid}, 'T-301', ${status}, 'extension', 'unlisted') ON CONFLICT (id) DO NOTHING`);
+      VALUES (${rid}, ${pgId(legacyUserId)}, 'T-301', ${status}, 'extension', 'unlisted') ON CONFLICT (id) DO NOTHING`);
     return rid;
   }
   const createSession = (rid, key, as, mime = 'video/webm') =>
@@ -145,7 +150,8 @@ const nextId = () => `u${RUN}${(n += 1)}`;
     const s1 = c1.body.uploadSessionId;
 
     const row = (await db.execute(sql`select * from upload_sessions where id = ${s1}`)).rows[0];
-    ok(row.recording_id === rec1 && row.user_id === alice, 'the session row is bound to the recording and owner');
+    ok(row.recording_id === rec1 && row.user_id === pgId(alice),
+      'the session row is bound to the recording and the POSTGRESQL owner');
     ok(row.storage_key === `sources/${rec1}/source.webm`, 'the session targets the canonical source key');
     ok(!!row.storage_upload_id, 'a storage multipart upload was created and recorded');
     ok(row.status === 'pending', 'a new session starts pending');

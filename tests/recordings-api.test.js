@@ -82,14 +82,17 @@ const nextId = () => `r${RUN}${(n += 1)}`;
     return { status: res.status, body: json };
   };
 
-  async function seedUser(uid) {
+  // Callers authenticate with a LEGACY id; the mirrored PostgreSQL row is
+  // `usr_<legacyId>`. These suites therefore go through the identity bridge.
+  const pgId = (legacyId) => `usr_${legacyId}`;
+  async function seedUser(legacyId) {
     await db.execute(sql`INSERT INTO users (id,email,name,password_hash)
-      VALUES (${uid}, ${`${uid}@example.com`}, 'U', 'x') ON CONFLICT (id) DO NOTHING`);
-    await db.execute(sql`INSERT INTO usage (user_id) VALUES (${uid}) ON CONFLICT (user_id) DO NOTHING`);
-    return uid;
+      VALUES (${pgId(legacyId)}, ${`${legacyId}@example.com`}, 'U', 'x') ON CONFLICT (id) DO NOTHING`);
+    await db.execute(sql`INSERT INTO usage (user_id) VALUES (${pgId(legacyId)}) ON CONFLICT (user_id) DO NOTHING`);
+    return legacyId;
   }
-  const usageOf = async (uid) =>
-    (await db.execute(sql`select * from usage where user_id = ${uid}`)).rows[0];
+  const usageOf = async (legacyId) =>
+    (await db.execute(sql`select * from usage where user_id = ${pgId(legacyId)}`)).rows[0];
 
   try {
     const alice = await seedUser(`usr_${nextId()}`);
@@ -102,7 +105,7 @@ const nextId = () => `r${RUN}${(n += 1)}`;
     ok(!!c1.body.id && c1.body.status === 'recording', 'create returns an id and status=recording');
     const rec1 = c1.body.id;
     const stored = (await db.execute(sql`select * from recordings where id = ${rec1}`)).rows[0];
-    ok(stored.user_id === alice, 'the row is owned by the caller');
+    ok(stored.user_id === pgId(alice), "the row is owned by the caller's POSTGRESQL identity");
     ok(stored.source_kind === 'extension' && stored.title === 'First', 'source and title are stored');
 
     ok((await api('POST', '/recordings', { body: { source: 'nope' }, as: alice })).status === 400,
@@ -250,7 +253,7 @@ const nextId = () => `r${RUN}${(n += 1)}`;
     const delRec = (await api('POST', '/recordings', { body: { title: 'ToDelete', source: 'extension' }, as: alice })).body.id;
     await db.execute(sql`update recordings set size_bytes = 1000, duration = 60 where id = ${delRec}`);
     await db.execute(sql`update usage set storage_retained_bytes = 5000, active_video_count = 3,
-      recording_seconds = 300 where user_id = ${alice}`);
+      recording_seconds = 300 where user_id = ${pgId(alice)}`);
 
     const before = await usageOf(alice);
     const del = await api('DELETE', `/recordings/${delRec}`, { as: alice });

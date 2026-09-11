@@ -9,9 +9,11 @@
 const { createUploadRouter, defaultEntitlements } = require('./uploads.router');
 const { createRecordingsRouter, defaultEntitlements: defaultRecordingEntitlements } = require('./recordings.router');
 const errors = require('./errors');
+const identity = require('./identity');
 
 module.exports = {
   createUploadRouter, defaultEntitlements,
   createRecordingsRouter, defaultRecordingEntitlements,
+  ...identity,
   ...errors,
 };

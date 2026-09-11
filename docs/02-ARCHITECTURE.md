@@ -561,6 +561,61 @@ upload) are neither CRUD nor buildable yet. No quota ledger or reservation
 (T-306), no legacy route change, no client change, no read cutover — the
 dashboard *can* render from v1 behind the flag, but nothing points at it yet.
 
+### 2.7.6 Legacy → PostgreSQL identity bridge (prerequisite for T-304)
+
+The legacy JWT carries the **legacy** user id. Every PostgreSQL row the T-104
+importer and the T-105 dual-write produced is keyed **`usr_<legacyId>`**. The v1
+routers were building their ownership scope from the raw legacy id, so every
+scoped query looked for a user that does not exist in PostgreSQL: a create
+failed on the `users` foreign key, and a scoped read simply found nothing.
+
+`api/src/identity.js` translates **once**, at the v1 router boundary:
+
+```
+requireAuth            → req.userId      (raw legacy id — UNCHANGED)
+createIdentityBridge   → req.legacyUserId = req.userId
+                         req.pgUserId    = idFor('usr', req.userId)
+scopeOf(req)           → { userId: req.pgUserId }
+```
+
+**Why not inside `requireAuth`.** That is the *same function instance* used by
+**59 legacy routes**, which read `req.userId` as the legacy id to reach the JSON
+stores and Cloudinary. Translating there would silently repoint all of them at
+ids the legacy system has never heard of. `req.userId` is therefore left exactly
+as it was, and the translated value lands on a separate property that only v1
+code reads.
+
+**Why a lookup, not just a string.** Deriving an id is not the same as the
+account existing. A user who signed up before dual-write was enabled has no
+PostgreSQL row at all; without the check, their first v1 call surfaces as a
+foreign-key violation — a `422` that reads like the client sent something wrong
+when in fact the server has not finished migrating them. The bridge answers
+**`503 account_not_migrated`** instead: the caller is legitimately authenticated
+and has done nothing wrong, and the condition is temporary by definition. During
+the staged rollout, "how many flagged users have no mirror yet" is exactly the
+number an operator needs, so it is logged.
+
+**The mapping is not invented here.** `idFor` is imported from
+`db/src/legacy-ids.js` — the same canonical function the importer, the dual-write
+mirror and the reconciler use. A test asserts the bridge holds *that exact
+function*, not a copy, so the two can never drift.
+
+**One place, enforced.** `scopeOf(req)` is the only way a v1 ownership scope is
+constructed, and it **throws** on an untranslated request rather than falling
+back to the legacy id — a silent fallback would reintroduce the very bug this
+exists to fix, invisibly. Tests assert no router performs its own translation
+and none scopes by `req.userId`.
+
+**Ownership is unchanged by the translation**: cross-user reads and writes are
+still 404, an unmirrored caller cannot distinguish a real recording from a
+missing one, and the derived identity is never disclosed in a response.
+
+**Deliberately not done:** no user is created or seeded at runtime, no additional
+dual-write record, no change to PostgreSQL user ids, and no change to the
+importer, reconciler or dual-write mapping. This bridge is a **compatibility
+shim for the migration window** — it disappears when T-1302 makes PostgreSQL the
+authentication source of truth and the ids become native.
+
 ### 2.8 CDN
 
 Cloudflare in front of R2 for derived media. Cache key includes the asset path, not the signature (use signed cookies or edge-verified tokens for public assets; for MVP, R2 presigned GETs with `Cache-Control` on public assets are acceptable — documented tradeoff in `12` §6).
