@@ -59,9 +59,11 @@ switches everyone onto the new path.
 
 **Staged rollout procedure.** `V1_UPLOAD_ROLLOUT_PERCENT`: `0 → 10 → 50 → 100`, one step
 at a time, restarting the API. Before each step, read `kpi_snapshot.cutover` (`19` §8)
-and require: `v1SuccessRatePct ≥ 99`, `v1Fallbacks` not trending up, and
-`accountNotMigrated` at zero (a non-zero value means the importer has not finished — fix
-that first rather than rolling forward over it). Hold each step long enough to cover a
+and require **all four** gates: `v1SuccessRatePct ≥ 99`; no worsening `v1Fallbacks`
+trend; `accountNotMigrated` **at zero** (a non-zero value means the importer has not
+finished — fix that first rather than rolling forward over it); and no material
+unexplained v1 failure pattern. A pattern nobody can explain is a reason to stop even
+when the three numeric gates pass. Hold each step long enough to cover a
 representative traffic day; the final step must hold for **two full weeks** before the
 acceptance criterion is met.
 
