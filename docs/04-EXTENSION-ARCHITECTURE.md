@@ -247,3 +247,14 @@ abort the server session best-effort; a take with no chunks is deleted rather
 than kept as a phantom. Below 500 MB of free storage the recorder refuses to
 start with a plain message; below 2 GB it warns. T-403 adds the launch scan
 and recovery card.
+
+### 5.3 Recovery (delivered by T-403)
+
+`extension/recovery.js` (UMD, global `VeoRecRecovery`) is the launch scan and
+the resume / download / discard flow of `05` §6, wired into the recorder
+window before auto-start (`03` §3.1): a live session elsewhere refuses to
+start; unfinished takes are listed newest-first in the `#recoveryCard` with
+Resume upload (own sessions only) / Download / Discard; the popup shows an
+"unsaved recordings" badge. Server view wins on resume; only chunks the server
+does not hold are uploaded; every recovery call is tagged
+`X-VeoRec-Recovery: 1` for the `19` §7 KPI. Details: `05` §6.3.

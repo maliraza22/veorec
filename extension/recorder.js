@@ -612,6 +612,146 @@ function discardLocalSession() {
   recStore.deleteSession(id).catch(() => {});
 }
 
+// ── T-403 recovery (docs/05 §6) ─────────────────────────────────────────────
+// Runs at launch before idle. A take interrupted by a crash is offered as
+// Resume upload / Download / Discard; a recording that is LIVE in another
+// window refuses this one; nothing is deleted except on server-confirmed
+// completion or an explicit Discard.
+
+const recoveryCard = document.getElementById('recoveryCard');
+
+async function currentUserId() {
+  try { const { sr_user } = await chrome.storage.local.get('sr_user'); return (sr_user && sr_user.id) || null; } catch (e) { return null; }
+}
+
+/** Publish the count for the popup badge (docs/05 §6.2). */
+function publishRecoverable(count) {
+  try { chrome.storage.local.set({ recoverable: { count, at: Date.now() } }); } catch (e) {}
+}
+
+/** @returns {{proceed:boolean}} whether auto-start may go ahead */
+async function runRecoveryScan() {
+  if (typeof VeoRecRecovery === 'undefined') return { proceed: true };
+  const store = await openLocalStore();
+  if (!store) return { proceed: true };
+  const me = await currentUserId();
+  const result = await VeoRecRecovery.scan({ store, currentUserId: me });
+  publishRecoverable(result.recoverable.length);
+
+  if (result.live) {
+    // docs/05 §3: a live heartbeat means another recorder window is recording.
+    showStartButton('A recording is already running in another VeoRec window. Finish it there, or wait 15 seconds if that window was closed.');
+    mainBtn.textContent = '↻ Check again';
+    mainBtn.onclick = null;
+    mainBtn.addEventListener('click', function again() {
+      mainBtn.removeEventListener('click', again);
+      mainBtn.textContent = '▶ Start Recording';
+      runRecoveryScan().then((v) => { if (v.proceed) beginRecording().catch(onStartError); });
+    }, { once: true });
+    return { proceed: false };
+  }
+  if (!result.recoverable.length) { hideRecoveryCard(); return { proceed: true }; }
+
+  await renderRecoveryCard(store, result.recoverable, me);
+  return { proceed: false };
+}
+
+function hideRecoveryCard() { if (recoveryCard) { recoveryCard.style.display = 'none'; recoveryCard.innerHTML = ''; } }
+
+const fmtBytes = (b) => b >= 1048576 ? `${(b / 1048576).toFixed(1)} MB` : `${Math.round(b / 1024)} KB`;
+const fmtWhen = (t) => { try { return new Date(t).toLocaleString(); } catch (e) { return ''; } };
+const fmtDur = (s) => `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, '0')}`;
+
+async function renderRecoveryCard(store, sessions, me) {
+  if (!recoveryCard) return;
+  recoveryCard.innerHTML = '';
+  const h = document.createElement('h4');
+  h.textContent = sessions.length === 1 ? 'An unfinished recording was found' : `${sessions.length} unfinished recordings were found`;
+  recoveryCard.appendChild(h);
+  for (const s of sessions) {
+    const d = await VeoRecRecovery.describe(store, s);
+    const row = document.createElement('div');
+    row.className = 'recovery-row';
+    row.dataset.sessionId = s.id;
+    const meta = document.createElement('div');
+    meta.className = 'recovery-meta';
+    meta.textContent = `${d.title} · ${fmtWhen(d.recordedAt)} · ~${fmtDur(d.durationSec)} · ${fmtBytes(d.sizeBytes)}`
+      + (d.totalParts ? ` · uploaded ${d.uploadedParts}/${d.totalParts} parts` : '')
+      + (d.ownedByCurrentUser ? '' : ' · recorded by another account');
+    row.appendChild(meta);
+    const msg = document.createElement('div'); msg.className = 'recovery-msg'; row.appendChild(msg);
+    const actions = document.createElement('div'); actions.className = 'recovery-actions';
+    const mk = (label, cls, fn) => { const b = document.createElement('button'); b.className = `btn ${cls}`; b.textContent = label; b.addEventListener('click', fn); actions.appendChild(b); return b; };
+    if (d.ownedByCurrentUser) mk('⬆ Resume upload', 'btn-start', () => recoveryResume(store, s, row, msg));
+    mk('⬇ Download', 'btn-pause', () => recoveryDownload(store, s, msg));
+    mk('🗑 Discard', 'btn-cancel', () => recoveryDiscard(store, s, row));
+    row.appendChild(actions);
+    recoveryCard.appendChild(row);
+  }
+  recoveryCard.style.display = '';
+  showStartButton('Recover your unfinished recording, or start a new one.');
+  mainBtn.textContent = '▶ Start a new recording';
+  mainBtn.addEventListener('click', () => { hideRecoveryCard(); mainBtn.textContent = '▶ Start Recording'; }, { once: true });
+}
+
+async function recoveryResume(store, s, row, msg) {
+  const { sr_token } = await chrome.storage.local.get('sr_token');
+  if (!sr_token) { msg.textContent = 'Sign in via the extension popup, then reopen this window to resume.'; return; }
+  row.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+  msg.textContent = 'Resuming upload…';
+  const me = await currentUserId();
+  const out = await VeoRecRecovery.resumeSession({
+    store, session: s, server: SERVER, token: sr_token, currentUserId: me,
+    createUploader: VeoRecUploader.createUploader, fetchImpl: fetch.bind(null),
+    onEvent: (e) => {
+      if (e.type === 'phase') msg.textContent = e.phase === 'reconciling' ? 'Checking what was already uploaded…' : e.phase === 'starting' ? 'Starting a fresh upload…' : 'Uploading…';
+      if (e.type === 'progress' && e.recordedBytes) msg.textContent = `Uploading… ${Math.round((e.uploadedBytes / e.recordedBytes) * 100)}%`;
+    },
+    log: (level, m, meta) => { try { console.log('[recovery]', m, meta || ''); } catch (e) {} },
+  }).catch((e) => ({ kind: 'failed', reason: (e && e.message) || 'error' }));
+
+  if (out.kind === 'saved' || out.kind === 'already_saved') {
+    msg.textContent = out.kind === 'saved' ? 'Saved ✓' : 'This recording was already saved ✓';
+    try { await chrome.storage.local.set({ lastRecording: { url: out.watchUrl, title: s.title || 'Screen recording', at: Date.now() } }); } catch (e) {}
+    try { chrome.runtime.sendMessage({ type: 'UPLOAD_DONE', url: out.watchUrl, title: s.title || 'Screen recording' }); } catch (e) {}
+    try { chrome.tabs.create({ url: out.watchUrl }); } catch (e) { try { window.open(out.watchUrl, '_blank'); } catch (e2) {} }
+    row.remove();
+    publishRecoverable(recoveryCard.querySelectorAll('.recovery-row').length);
+    if (!recoveryCard.querySelectorAll('.recovery-row').length) hideRecoveryCard();
+    return;
+  }
+  row.querySelectorAll('button').forEach((b) => { b.disabled = false; });
+  if (out.kind === 'auth_required') msg.textContent = 'Your sign-in has expired. Sign in via the extension popup, then resume — nothing was lost.';
+  else if (out.kind === 'quota') msg.textContent = (out.message || 'You have reached your plan limit.') + ' You can still download this recording, or delete a video and try again.';
+  else if (out.kind === 'cross_account') msg.textContent = 'This recording belongs to another account. You can download or discard it.';
+  else msg.textContent = 'Could not upload right now — your recording is kept. Try again later, or download it.';
+}
+
+async function recoveryDownload(store, s, msg) {
+  msg.textContent = 'Preparing download…';
+  try {
+    const out = await VeoRecRecovery.downloadSession({
+      store, session: s, fixWebmDuration: (typeof fixWebmDuration === 'function' ? fixWebmDuration : null),
+      saveAs: async (blob, name) => {
+        const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name;
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(() => { try { URL.revokeObjectURL(a.href); } catch (e) {} }, 60000);
+      },
+    });
+    msg.textContent = `Downloaded ${out.name} (${fmtBytes(out.size)}). The recording is still kept here until you discard it.`;
+  } catch (e) { msg.textContent = 'Download failed — please try again.'; }
+}
+
+async function recoveryDiscard(store, s, row) {
+  if (!window.confirm('Discard this unfinished recording? This cannot be undone.')) return;
+  const { sr_token } = await chrome.storage.local.get('sr_token');
+  await VeoRecRecovery.discardSession({ store, session: s, server: SERVER, token: sr_token || null, fetchImpl: fetch.bind(null) }).catch(() => {});
+  row.remove();
+  const left = recoveryCard.querySelectorAll('.recovery-row').length;
+  publishRecoverable(left);
+  if (!left) hideRecoveryCard();
+}
+
 /** Open a v1 upload session. Any failure leaves the legacy path untouched. */
 async function startStreamingUpload() {
   streamUploader = null; streamUploadReady = false;
@@ -834,7 +974,9 @@ function restartRecording() {
   beginRecording().catch(onStartError);
 }
 
-// On load: read options carried from popup, then try to auto-start.
+// On load: read options carried from popup, run the recovery scan (docs/05 §6,
+// docs/03 §3.1 — BEFORE anything else), then auto-start only when nothing
+// needs the user's attention.
 (async () => {
   try {
     const { recOptions } = await chrome.storage.local.get('recOptions');
@@ -842,5 +984,6 @@ function restartRecording() {
   } catch {}
   setStatus('Preparing your recording…');
   await loadPlanLimit();           // match the countdown to the user's plan
-  beginRecording().catch(onStartError);
+  const verdict = await runRecoveryScan().catch(() => ({ proceed: true }));
+  if (verdict.proceed) beginRecording().catch(onStartError);
 })();

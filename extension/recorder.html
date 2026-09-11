@@ -72,6 +72,14 @@
       animation:pop .9s ease-out;
     }
     @keyframes pop { 0%{transform:scale(.5);opacity:0;} 45%{transform:scale(1.08);opacity:1;} 100%{transform:scale(1);} }
+      .recovery-card{margin:10px 0;padding:10px;border:1px solid #2a2a3a;border-radius:10px;background:#15151f;text-align:left;font-size:13px}
+    .recovery-card h4{margin:0 0 6px;font-size:13px}
+    .recovery-row{display:flex;flex-direction:column;gap:6px;padding:8px 0;border-top:1px solid #23233a}
+    .recovery-row:first-of-type{border-top:0}
+    .recovery-meta{color:#9090a0;font-size:12px}
+    .recovery-actions{display:flex;gap:6px;flex-wrap:wrap}
+    .recovery-actions .btn{padding:6px 10px;font-size:12px;flex:0 0 auto}
+    .recovery-msg{font-size:12px;color:#c9c9d6}
   </style>
 </head>
 <body>
@@ -82,6 +90,8 @@
     <div class="timer" id="timer">00:00</div>
 
     <div class="preview-wrap" id="previewWrap"><canvas id="previewCanvas"></canvas></div>
+
+    <div class="recovery-card" id="recoveryCard" style="display:none"></div>
 
     <button class="btn btn-start" id="mainBtn" style="display:none"><span class="rdot"></span> Start Recording</button>
 
@@ -103,6 +113,7 @@
   <script src="fix-webm-duration.js"></script>
   <script src="recorderStore.js"></script>
   <script src="uploader.js"></script>
+  <script src="recovery.js"></script>
   <script src="recorder.js"></script>
 </body>
 </html>

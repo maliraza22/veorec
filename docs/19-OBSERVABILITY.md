@@ -66,7 +66,7 @@ Sentry (or GlitchTip): API + workers (release-tagged), web app (source maps, use
 ## 7. Production KPIs (reviewed weekly)
 
 - Recording success rate: recordings reaching `ready` / recordings started (target ≥ 99%).
-- Recovery effectiveness: recovered sessions uploaded / crash-interrupted sessions (target ≥ 90%).
+- Recovery effectiveness: recovered sessions uploaded / crash-interrupted sessions (target ≥ 90%). **As implemented (T-403):** the extension tags every resumed upload with `X-VeoRec-Recovery: 1`; the server counts `recoveryAttempt` / `recoverySuccess` / `recoveryFailure` from those upload lines (`recovery:true`) and reports `kpi_snapshot.recovery.effectivenessPct` = successes / attempts. The denominator in the definition above (crash-interrupted sessions found at launch) is client-side and not visible to the server; the recovery card publishes its count to the popup badge.
 - Time-to-ready p50/p95 (target: p50 < 60s for a 5-min recording).
 - Upload resume rate (resumes that succeed without re-uploading completed parts).
 - Player error rate per watch session (< 0.5%).

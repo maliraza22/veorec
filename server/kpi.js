@@ -105,6 +105,13 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
     // POST /api/recordings/:id/replace. This number is what decides whether
     // Phase 14 may remove the route — zero over a full observation window.
     legacyReplaceUsed: 0,
+    // T-403 recovery effectiveness (docs/19 §7): uploads the client tagged as a
+    // RESUMED crashed take. successes / attempts is the KPI; the client-side
+    // denominator (crash-interrupted sessions found at launch) is not visible
+    // to the server and is reported by the extension's recovery card.
+    recoveryAttempt: 0,
+    recoverySuccess: 0,
+    recoveryFailure: 0,
   };
   const durations = [];       // successful-upload handler durations (ms)
   const misses = new Map();   // recordingId -> { count, firstAt, lastAt }
@@ -131,10 +138,13 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
     const uploadMode = uploadPath === 'v1' ? (meta.mode === 'single' ? 'single' : 'multipart') : null;
     if (uploadPath === 'v1') counters.uploadV1Attempt++; else counters.uploadLegacyAttempt++;
     if (uploadMode === 'single') counters.uploadV1SingleAttempt++;
-    if (req) req._kpiUpload = { t0: Date.now(), done: false, store: meta.store || null, path: uploadPath, mode: uploadMode };
+    const recovery = meta.recovery === true;
+    if (recovery) counters.recoveryAttempt++;
+    if (req) req._kpiUpload = { t0: Date.now(), done: false, store: meta.store || null, path: uploadPath, mode: uploadMode, recovery };
     logOf(req).info({
       kpi: 'upload_started', store: meta.store || null, sizeBytes: meta.sizeBytes ?? null,
       upload_path: uploadPath, upload_mode: uploadMode, fallback_from: meta.fallbackFrom || null,
+      recovery,
     }, 'kpi: upload started');
   }
 
@@ -162,6 +172,8 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
     const fallbackFrom = meta.fallbackFrom || null;
     const uploadMode = uploadPath === 'v1'
       ? ((meta.mode || (mark && mark.mode)) === 'single' ? 'single' : 'multipart') : null;
+    const recovery = meta.recovery === true || !!(mark && mark.recovery);
+    if (recovery) { if (outcome === 'success') counters.recoverySuccess++; else counters.recoveryFailure++; }
     if (uploadPath === 'v1') {
       if (outcome === 'success') counters.uploadV1Success++; else counters.uploadV1Failure++;
       if (uploadMode === 'single') {
@@ -187,6 +199,7 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
       upload_path: uploadPath,
       upload_mode: uploadMode,
       fallback_from: fallbackFrom,
+      recovery,
     }, `kpi: upload ${outcome}`);
   }
 
@@ -323,6 +336,14 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
       // these staying at zero.
       deprecations: {
         legacyReplaceUsed: counters.legacyReplaceUsed,
+      },
+      // T-403: recovery effectiveness (docs/19 §7 — target ≥ 90%).
+      recovery: {
+        attempts: counters.recoveryAttempt,
+        successes: counters.recoverySuccess,
+        failures: counters.recoveryFailure,
+        effectivenessPct: counters.recoveryAttempt
+          ? +((counters.recoverySuccess / counters.recoveryAttempt) * 100).toFixed(2) : null,
       },
       r2Mirror: {
         attempts: counters.r2MirrorAttempt,

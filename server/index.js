@@ -373,9 +373,12 @@ if (process.env.V1_UPLOAD_API === 'true') {
       logger,
       quota,
       // T-304: the v1 path reports its own result, tagged path='v1'.
+      // T-403: recovery traffic (a crashed take being resumed) is tagged by the
+      // client with X-VeoRec-Recovery: 1 so the recovery-effectiveness KPI
+      // (docs/19 §7) can be read off the same upload lines.
       telemetry: {
-        uploadStarted: (r, meta) => kpi.uploadStarted(r, { ...meta, path: 'v1', store: 'r2' }),
-        uploadFinished: (r, outcome, meta) => kpi.uploadFinished(r, outcome, { ...meta, path: 'v1', store: 'r2' }),
+        uploadStarted: (r, meta) => kpi.uploadStarted(r, { ...meta, path: 'v1', store: 'r2', recovery: r.get('X-VeoRec-Recovery') === '1' }),
+        uploadFinished: (r, outcome, meta) => kpi.uploadFinished(r, outcome, { ...meta, path: 'v1', store: 'r2', recovery: r.get('X-VeoRec-Recovery') === '1' }),
       },
     }));
     // T-306: the caller's own dual quota meters (docs/16 §4.5).

@@ -332,7 +332,30 @@ chrome.runtime.onMessage.addListener((msg) => {
 (async () => {
   const loggedIn = await refreshAuthUI();
   if (!loggedIn) return;
-  const data = await chrome.storage.local.get(['recording', 'startTime', 'lastRecording']);
+  const data = await chrome.storage.local.get(['recording', 'startTime', 'lastRecording', 'recoverable']);
   if (data.recording) { isRecording = true; elapsed = Math.floor((Date.now() - data.startTime) / 1000); showRecordingUI(); }
   if (data.lastRecording) showLatest(data.lastRecording);
+  // T-403: "recovered recordings" badge (docs/05 §6.2) — a take interrupted by a
+  // crash is found here even if the user never reopens the recorder on their own.
+  showRecoverableBadge(data.recoverable);
 })();
+
+function showRecoverableBadge(recoverable) {
+  const count = recoverable && Number(recoverable.count) || 0;
+  let el = document.getElementById('recoverBadge');
+  if (!count) { if (el) el.remove(); return; }
+  if (!el) {
+    el = document.createElement('button');
+    el.id = 'recoverBadge';
+    el.style.cssText = 'display:block;width:100%;margin:0 0 10px;padding:9px 12px;border:1px solid #5b5bf6;border-radius:10px;background:#1a1a2e;color:#e6e6ff;font-size:13px;cursor:pointer;text-align:left';
+    el.addEventListener('click', () => {
+      chrome.windows.create({ url: chrome.runtime.getURL('recorder.html?recover=1'), type: 'popup', width: 420, height: 560 });
+      window.close();
+    });
+    document.body.insertBefore(el, document.body.firstChild);
+  }
+  el.textContent = count === 1 ? '⚠ 1 unsaved recording — open to recover' : `⚠ ${count} unsaved recordings — open to recover`;
+}
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes.recoverable) showRecoverableBadge(changes.recoverable.newValue);
+});
