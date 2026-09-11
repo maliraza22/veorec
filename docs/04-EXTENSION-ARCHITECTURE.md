@@ -146,3 +146,73 @@ Draw canvas + click-ripples stay as-is (`overlay.js:139-254`) with two hardening
 - `npm run build:extension` → `dist/extension/` (esbuild, ts, copies static assets). Version stamped from one place.
 - Store zips are build artifacts, **not committed** (today 16 zips/crx/pem live in the repo root — `.gitignore` already covers them; delete the tracked ones).
 - Compatibility rule: the shipped extension must work against both current and next API for one release window (Chrome review delays) — hence `/api/v1` versioning and additive-only changes within a window.
+
+---
+
+### 5.1 Streaming uploader (delivered by T-303)
+
+`extension/uploader.js` uploads a recording to object storage **in parts, while
+it is still being recorded**. By the time the user hits Stop, usually only the
+final part and the completion call remain.
+
+That is the reliability win. Today the whole file is POSTed through the server
+*after* recording ends, so a 40-minute take is one 500 MB request that a flaky
+connection can lose completely — and the user only finds out at the end.
+
+**File name.** The plan names this `uploader.ts`. The extension is plain MV3
+JavaScript with no TypeScript toolchain and no build step; introducing one would
+change how every other extension file ships. Same module, JSDoc types.
+
+**Wiring — alongside, never instead of.** Behind the `newUpload` flag
+(`chrome.storage.local`, default OFF — only the literal `true` enables it):
+
+- `ondataavailable` still pushes every chunk into the legacy `chunks` array, so
+  the save-to-device fallback and the legacy POST remain fully available;
+- the same chunk is additionally fed to the uploader, wrapped so an uploader
+  fault can never interrupt the recording;
+- at Stop, if the streaming upload finished, the legacy POST is skipped; if it
+  did not, the recorder falls through to the legacy POST with the blob it still
+  holds.
+
+**A take is therefore never lost to the new path** — the worst case is the
+behaviour users have today.
+
+**Part buffering.** Chunks accumulate until `partSize` (8 MiB), then seal —
+including the chunk that crosses the boundary, because `06` §5 seals at
+**≥** partSize. Stopping short would make a non-final part smaller than
+partSize and risk S3's 5 MiB floor. The final part may be any size.
+
+**Concurrency** is 2 parallel PUTs while recording — leaving bandwidth for the
+meeting being recorded — and 4 after Stop.
+
+**Retry classifier.** The distinctions decide whether a recording survives a bad
+network:
+
+| Signal | Outcome |
+|---|---|
+| network error, timeout, 5xx, 429 | **retry** with exponential full jitter, 8 attempts |
+| 403 with an *expired signature* | **re-mint the URL** — not a data attempt |
+| any other 4xx | **fatal** — a verdict retrying cannot change |
+| 8 attempts exhausted | **stalled**, not failed: session and bytes survive, whole drain retried every 60s |
+
+A fatal verdict is never downgraded to `stalled`; `stalled` means "we will
+retry", and masking one as the other would make the UI retry a plan rejection
+forever.
+
+**Byte ceiling.** The recorder is warned at 90% and told to stop at
+`ceiling − 16 MiB`, so the final part still fits. A presign refused for
+exceeding the ceiling is fatal, not retried.
+
+**Resume diff** (`06` §10). `GET /uploads/:id` is the source of truth and the
+**server wins**: a part it already has is *adopted* rather than re-sent, so no
+completed byte is uploaded twice; a part it lacks is re-queued.
+
+**Checksums.** CRC32C (Castagnoli) per part, sent with the part record.
+Storage-side verification additionally needs the presign to carry
+`x-amz-checksum-crc32c`, which is a T-301 addition and is **not** done here.
+
+**Deliberately not T-303:** no IndexedDB durability (Phase 4 / `05`), no
+recorder state-machine rewrite, no web upload path (T-305), no cutover flag
+plumbing or telemetry (T-304), no legacy route change. The flag is off and no
+client ships it enabled.
+

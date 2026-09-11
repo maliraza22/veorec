@@ -8,8 +8,9 @@
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "test": "node ../tests/fixwebm.test.js && node ../tests/observability.test.js && node ../tests/kpi.test.js && node ../tests/r2mirror.test.js",
-    "test:r2mirror": "node ../tests/r2mirror.test.js"
+    "test": "node ../tests/fixwebm.test.js && node ../tests/observability.test.js && node ../tests/kpi.test.js && node ../tests/r2mirror.test.js && node ../tests/uploader.test.js",
+    "test:r2mirror": "node ../tests/r2mirror.test.js",
+    "test:uploader": "node ../tests/uploader.test.js"
   },
   "dependencies": {
     "@sentry/node": "^10.73.0",

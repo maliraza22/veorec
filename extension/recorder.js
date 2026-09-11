@@ -18,6 +18,12 @@ const countdownNum = document.getElementById('countdownNum');
 
 let mediaRecorder = null;
 let chunks = [];
+// T-303 streaming uploader. Runs ALONGSIDE the legacy path behind the
+// `newUpload` flag: chunks are still accumulated in `chunks`, so the
+// save-to-device fallback and the legacy POST stay available even if the
+// streaming upload fails. A take is never lost to the new path.
+let streamUploader = null;
+let streamUploadReady = false;
 let lastBlob = null;       // last recorded blob — kept so a failed upload can be saved locally
 let startTime = null;
 let pausedAccum = 0;       // total paused ms
@@ -266,6 +272,12 @@ async function beginRecording() {
   mediaRecorder = new MediaRecorder(finalStream, { mimeType, videoBitsPerSecond: bitsPerSecond });
   mediaRecorder.ondataavailable = e => {
     if (e.data.size > 0) chunks.push(e.data);
+    // T-303: stream the same chunk to storage while recording continues.
+    // Wrapped so an uploader fault can never interrupt the recording itself —
+    // the legacy path still holds every chunk.
+    if (streamUploadReady && e.data.size > 0) {
+      try { streamUploader.addChunk(e.data); } catch (err) { streamUploadReady = false; }
+    }
     // PRIMARY limit enforcement — driven by the ENCODER clock (fires ~1/s via the
     // timeslice), so the cap trips even when the window's timers are throttled
     // because the recorder window sits behind a focused meeting.
@@ -276,6 +288,12 @@ async function beginRecording() {
     }
   };
   mediaRecorder.onstop = handleStop;
+
+  // T-303: open an upload session so parts can stream while recording. Behind
+  // the `newUpload` flag and deliberately NOT awaited — the recording must
+  // start immediately, and a failure here simply leaves the legacy path in
+  // charge.
+  startStreamingUpload().catch(() => { streamUploadReady = false; });
   mediaRecorder.start(1000);
 
   // Wall-clock backstop. A single setTimeout still fires when an occluded window
@@ -458,6 +476,54 @@ function resetRecordingState() {
   try { chrome.runtime.sendMessage({ type: 'RECORDING_RESET' }); } catch (e) {}
 }
 
+// ── T-303 streaming upload (flag: newUpload) ─────────────────────────────────
+
+/** Open a v1 upload session. Any failure leaves the legacy path untouched. */
+async function startStreamingUpload() {
+  streamUploader = null; streamUploadReady = false;
+  const { newUpload, sr_token } = await chrome.storage.local.get(["newUpload", "sr_token"]);
+  if (newUpload !== true || !sr_token) return;            // OFF unless explicitly true
+  if (typeof VeoRecUploader === "undefined") return;
+
+  // The recording row must exist before a session can bind to it.
+  const res = await fetch(`${SERVER}/api/v1/recordings`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${sr_token}` },
+    body: JSON.stringify({ title: "Screen recording", source: "extension" }),
+  });
+  if (!res.ok) return;
+  const rec = await res.json();
+
+  const up = VeoRecUploader.createUploader({
+    server: SERVER, token: sr_token,
+    onEvent: (e) => {
+      if (e.type === "ceiling-warning") setStatus("Approaching your size limit — wrapping up soon…", "uploading");
+      if (e.type === "ceiling-reached") { try { stopRecording(); } catch (err) {} }
+    },
+  });
+  const session = await up.begin({ recordingId: rec.id, mimeType: "video/webm" });
+  if (!session) return;
+  streamUploader = up;
+  streamUploadReady = true;
+}
+
+/**
+ * Finish the streaming upload. Returns a share URL on success, or null so the
+ * caller falls back to the legacy POST — which still has every chunk.
+ */
+async function finishStreamingUpload(duration) {
+  if (!streamUploader || !streamUploadReady) return null;
+  try {
+    const out = await streamUploader.finalize({ clientDuration: duration });
+    if (!out || !out.ok) return null;
+    return `https://veorec.com/watch/${out.body.recordingId}`;
+  } catch (err) {
+    return null;
+  } finally {
+    streamUploadReady = false;
+  }
+}
+
 async function handleStop() {
   let duration = elapsedSeconds();
   // The plan cap is enforced by auto-stop; clamp the reported duration to the
@@ -492,6 +558,23 @@ async function handleStop() {
     setStatus(`Uploading… (${sizeMB} MB)`, 'uploading');
 
     const title = 'Screen recording';
+
+    // T-303: if the streaming upload finished, the bytes are already in
+    // storage — skip the legacy POST entirely. Otherwise fall through to it
+    // with the blob we still hold, so a failed streaming upload costs the user
+    // nothing.
+    const streamedUrl = await finishStreamingUpload(duration);
+    if (streamedUrl) {
+      await chrome.storage.local.set({
+        shareLink: streamedUrl, recording: false, recState: { recording: false },
+        lastRecording: { url: streamedUrl, title, at: Date.now() },
+      });
+      chrome.runtime.sendMessage({ type: 'UPLOAD_DONE', url: streamedUrl, title });
+      setStatus('Saved ✓  Opening your video…', 'done');
+      try { chrome.tabs.create({ url: streamedUrl }); } catch (e) { try { window.open(streamedUrl, '_blank'); } catch (e2) {} }
+      return;
+    }
+
     const form = new FormData();
     form.append('video', blob, 'recording.webm');
     form.append('title', title);
