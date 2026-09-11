@@ -8,7 +8,7 @@
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "test": "node ../tests/fixwebm.test.js && node ../tests/observability.test.js && node ../tests/kpi.test.js && node ../tests/r2mirror.test.js && node ../tests/uploader.test.js && node ../tests/rollout.test.js && node ../tests/web-upload.test.js && node ../tests/recorder-store.test.js && node ../tests/recorder-wiring.test.js && node ../tests/recovery.test.js && node ../tests/quota-ux.test.js && node ../tests/coverage-machine.js",
+    "test": "node ../tests/fixwebm.test.js && node ../tests/observability.test.js && node ../tests/kpi.test.js && node ../tests/r2mirror.test.js && node ../tests/uploader.test.js && node ../tests/rollout.test.js && node ../tests/web-upload.test.js && node ../tests/recorder-store.test.js && node ../tests/recorder-wiring.test.js && node ../tests/recovery.test.js && node ../tests/quota-ux.test.js && node ../tests/coverage-machine.js && node ../tests/capture.test.js",
     "test:r2mirror": "node ../tests/r2mirror.test.js",
     "test:uploader": "node ../tests/uploader.test.js",
     "test:rollout": "node ../tests/rollout.test.js",
@@ -18,7 +18,8 @@
     "test:recovery": "node ../tests/recovery.test.js",
     "test:quota-ux": "node ../tests/quota-ux.test.js",
     "test:machine": "node ../tests/machine.test.js",
-    "coverage:machine": "node ../tests/coverage-machine.js"
+    "coverage:machine": "node ../tests/coverage-machine.js",
+    "test:capture": "node ../tests/capture.test.js"
   },
   "dependencies": {
     "@sentry/node": "^10.73.0",

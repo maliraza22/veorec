@@ -266,3 +266,11 @@ of `03` §2 with injected effects, the disposer registry (`03` §10) and the
 overlay projection (`03` §11, legacy keys mirrored). Not wired yet: T-502
 provides the CaptureManager effects and T-503 makes `recorder.js` a renderer
 of its projections. Details: `03` §2.1.
+
+### 5.5 CaptureManager (delivered by T-502)
+
+`extension/capture.js` (UMD, global `VeoRecCapture`) is the acquisition, mixer,
+warnings and interruption-watcher module of `03` §4–§6, §9 — the effect side
+of the machine. Every browser dependency is injectable. Not wired yet: T-503
+supplies it as the machine's `acquire` effect and renders its warnings.
+Details: `03` §4.1.
