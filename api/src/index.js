@@ -7,6 +7,11 @@
 'use strict';
 
 const { createUploadRouter, defaultEntitlements } = require('./uploads.router');
+const { createRecordingsRouter, defaultEntitlements: defaultRecordingEntitlements } = require('./recordings.router');
 const errors = require('./errors');
 
-module.exports = { createUploadRouter, defaultEntitlements, ...errors };
+module.exports = {
+  createUploadRouter, defaultEntitlements,
+  createRecordingsRouter, defaultRecordingEntitlements,
+  ...errors,
+};

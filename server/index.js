@@ -286,7 +286,7 @@ app.post('/api/auth/reset', resetLimiter, async (req, res) => {
 // every current client uses.
 if (process.env.V1_UPLOAD_API === 'true') {
   try {
-    const { createUploadRouter } = require('../api/src/index.js');
+    const { createUploadRouter, createRecordingsRouter } = require('../api/src/index.js');
     const { repositories, withTransaction } = require('../db/src/index.js');
     const storagePkg = require('../storage/src/index.js');
     app.use('/api/v1', createUploadRouter({
@@ -296,7 +296,16 @@ if (process.env.V1_UPLOAD_API === 'true') {
       requireAuth,
       logger,
     }));
-    logger.info({ v1UploadApi: true }, '/api/v1 upload session API ENABLED (legacy upload route unchanged)');
+    // T-302: recordings CRUD, served from PostgreSQL. Same flag, same
+    // rollback: the legacy /api/recordings routes are untouched and remain what
+    // every current client uses.
+    app.use('/api/v1', createRecordingsRouter({
+      repositories, withTransaction,
+      storage: storagePkg.storageProvider(),
+      requireAuth,
+      logger,
+    }));
+    logger.info({ v1UploadApi: true }, '/api/v1 upload session + recordings API ENABLED (legacy routes unchanged)');
   } catch (e) {
     // A misconfigured new stack must never stop the legacy server booting.
     logger.error({ err: { message: String(e && e.message).slice(0, 300) } },

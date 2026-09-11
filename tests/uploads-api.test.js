@@ -540,7 +540,9 @@ const nextId = () => `u${RUN}${(n += 1)}`;
       method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
     });
     ok(unauth.status === 401, 'the mounted v1 route requires authentication');
-    ok(/v1 upload session API ENABLED/.test(out), 'the mount is logged');
+    // The message gained '+ recordings' when T-302 mounted its router on the same
+    // flag; assert the stable part rather than the exact sentence.
+    ok(/upload session.*ENABLED/.test(out), 'the mount is logged');
     // The legacy upload route must be completely unaffected.
     const legacy = await fetch('http://127.0.0.1:3271/api/upload', { method: 'POST' });
     ok(legacy.status === 401 || legacy.status === 400,

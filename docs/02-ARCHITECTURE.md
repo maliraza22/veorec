@@ -492,6 +492,75 @@ a pluggable check T-306 replaces. Also not here: the client uploader, the
 expiry job, the probe relay and workers (T-601), any legacy route change, and
 any read cutover. The legacy `POST /api/upload` is untouched.
 
+### 2.7.5 `/api/v1/recordings` — recordings CRUD (delivered by T-302)
+
+The dashboard's read path, served from PostgreSQL. Today the library page needs
+a JSON-store read **plus** a Cloudinary listing to render; `GET /recordings`
+here is **one indexed query** — that is what "list from DB!" in the plan is
+about, and it removes the dual fetch entirely.
+
+Same package and same flag as T-301 (`V1_UPLOAD_API`, default **OFF**). The
+legacy `/api/recordings` routes are untouched and remain what every current
+client uses.
+
+| Method & path | Behaviour |
+|---|---|
+| `POST /recordings` | create; `Idempotency-Key` supported; entitlement advisory only |
+| `GET /recordings` | scoped list with cursor pagination, folder/archived filters |
+| `GET /recordings/:id` | detail: assets summary, capability flags, signed playback URL |
+| `PATCH /recordings/:id` | title, 1–200 after trim |
+| `PATCH /recordings/:id/meta` | the documented metadata set; Pro fields are paywalls |
+| `DELETE /recordings/:id` | soft delete + usage ledger, one transaction, idempotent |
+
+**Ownership.** Every call is a *scoped* repository call, so knowing a recording
+id is never sufficient. A recording belonging to someone else is reported
+**404 — identical to one that does not exist**, because distinguishing them
+would confirm the id to an attacker. `DELETE` answers 200 for both "already
+deleted" and "not visible to you", which keeps it idempotent without leaking
+existence either.
+
+**Create idempotency without a new column.** The id is *derived* from
+`sha256(userId : Idempotency-Key)`, so a replayed create collides on the primary
+key and returns the same row. The user id is inside the hash, so two users'
+identical keys can never collide, and a guessed id still fails the scoped read.
+
+**Soft delete is a ledger transaction.** In one transaction the usage row is
+locked **first** with `getForUpdate` (which refuses to run outside a
+transaction, so it cannot be bypassed), the recording is re-read *inside* the
+lock, soft-deleted, and the ledger adjusted: retained bytes down, pending-
+deletion bytes up, active video count and recorded seconds down. Quota is freed
+immediately and the bytes sit in pending-deletion until the 30-day purge drains
+them (`16`, Q15).
+
+Three properties make that safe, and each is tested:
+
+- **Re-read inside the lock.** Two concurrent deletes of one recording would
+  otherwise both see it live and both decrement — corrupting the user's quota
+  permanently. Three simultaneous deletes decrement exactly once.
+- **Clamped deltas.** A ledger that was never incremented (a recording predating
+  it) cannot be driven negative into the non-negative CHECK constraints.
+- **All or nothing.** An injected ledger failure rolls the soft delete back with
+  it; the recording stays intact rather than vanishing with its quota unreturned.
+
+This is ledger **maintenance on delete**, not quota enforcement: the atomic
+reservation that gates uploads is **T-306** and is deliberately absent here.
+
+**Pro-gated fields are paywalls, not silent drops.** `password` and
+`removeBranding` answer `403 feature_locked` with `upgradeRequired` when the
+feature is off. Silently ignoring the field would tell a user their password was
+set when it was not. Passwords are hashed before storage and never echoed back;
+the response reports `passwordProtected`, never the hash.
+
+**No storage key ever leaves the API.** Detail returns a short-lived signed
+playback URL minted *after* the scoped read proved ownership, and the assets
+summary carries ids and sizes only.
+
+**Deliberately not T-302:** `POST /:id/duplicate` (enqueues a server-side copy
+job — needs the T-601 worker pipeline) and `POST /:id/thumbnail` (a Pro image
+upload) are neither CRUD nor buildable yet. No quota ledger or reservation
+(T-306), no legacy route change, no client change, no read cutover — the
+dashboard *can* render from v1 behind the flag, but nothing points at it yet.
+
 ### 2.8 CDN
 
 Cloudflare in front of R2 for derived media. Cache key includes the asset path, not the signature (use signed cookies or edge-verified tokens for public assets; for MVP, R2 presigned GETs with `Cache-Control` on public assets are acceptable — documented tradeoff in `12` §6).
