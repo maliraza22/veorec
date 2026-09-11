@@ -258,3 +258,11 @@ Resume upload (own sessions only) / Download / Discard; the popup shows an
 "unsaved recordings" badge. Server view wins on resume; only chunks the server
 does not hold are uploaded; every recovery call is tagged
 `X-VeoRec-Recovery: 1` for the `19` §7 KPI. Details: `05` §6.3.
+
+### 5.4 RecorderMachine (delivered by T-501)
+
+`extension/machine.js` (UMD, global `VeoRecMachine`) is the pure state machine
+of `03` §2 with injected effects, the disposer registry (`03` §10) and the
+overlay projection (`03` §11, legacy keys mirrored). Not wired yet: T-502
+provides the CaptureManager effects and T-503 makes `recorder.js` a renderer
+of its projections. Details: `03` §2.1.
