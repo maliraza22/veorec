@@ -11,9 +11,10 @@
   "scripts": {
     "start": "node src/main.js",
     "worker": "node src/main.js",
-    "test": "node ../tests/job-queue.test.js && node ../tests/outbox.test.js",
+    "test": "node ../tests/job-queue.test.js && node ../tests/outbox.test.js && node ../tests/maintenance-jobs.test.js",
     "test:queue": "node ../tests/job-queue.test.js",
-    "test:outbox": "node ../tests/outbox.test.js"
+    "test:outbox": "node ../tests/outbox.test.js",
+    "test:maintenance": "node ../tests/maintenance-jobs.test.js"
   },
   "dependencies": {
     "bullmq": "^6.3.4",

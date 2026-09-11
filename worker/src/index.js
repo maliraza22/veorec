@@ -17,7 +17,9 @@ const { createRegistry } = require('./registry');
 const { createJobRunner } = require('./run-job');
 const { createOutboxRelay } = require('./outbox');
 const { createWorkerApp, createChildRegistry } = require('./app');
-const { createDefaultRegistry } = require('./processors');
+const { createDefaultRegistry, registerMaintenanceProcessors } = require('./processors');
+const { createScheduler, DEFAULT_SCHEDULES, bucketKey, isoWeek, HOUR, DAY, WEEK } = require('./scheduler');
+const { createPlanResolver } = require('./plan-limits');
 
 module.exports = {
   ...catalog,
@@ -28,4 +30,6 @@ module.exports = {
   createRegistry, createDefaultRegistry,
   createJobRunner, createOutboxRelay,
   createWorkerApp, createChildRegistry,
+  // T-602: repeatable maintenance schedules + plan limits for verification.
+  registerMaintenanceProcessors, createScheduler, DEFAULT_SCHEDULES, bucketKey, isoWeek, HOUR, DAY, WEEK, createPlanResolver,
 };

@@ -7,6 +7,7 @@
 const { QUEUE_CONCURRENCY } = require('./catalog');
 const { createJobRunner } = require('./run-job');
 const { createOutboxRelay } = require('./outbox');
+const { createScheduler } = require('./scheduler');
 const { assertJobQueue } = require('./queue/job-queue');
 const { silentLogger } = require('./logger');
 
@@ -41,7 +42,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * @param {object} o.registry         processor registry
  * @param {object} [o.deps]           extra dependencies handed to processors
  */
-function createWorkerApp({ config, logger = silentLogger(), repositories, withTransaction = null, storage = null, jobQueue, registry, deps = {} }) {
+function createWorkerApp({ config, logger = silentLogger(), repositories, withTransaction = null, storage = null, jobQueue, registry, deps = {}, schedules = undefined }) {
   if (!config) throw new Error('createWorkerApp: config is required');
   assertJobQueue(jobQueue);
   const children = createChildRegistry();
@@ -54,23 +55,35 @@ function createWorkerApp({ config, logger = silentLogger(), repositories, withTr
     intervalMs: config.outboxIntervalMs, reconcileIntervalMs: config.reconcileIntervalMs,
     minAgeMs: config.reconcileMinAgeMs, batch: config.outboxBatch,
   });
+  // T-602: repeatable maintenance schedules. Only a worker that can RUN the
+  // maintenance types installs the ticker (a tick for a type nobody runs would
+  // only create rows that wait); config.scheduler / `schedules:false` disables.
+  const wantScheduler = schedules === undefined ? config.scheduler !== false : !!schedules;
+  const scheduler = wantScheduler && registry.has('usage_sync') && typeof jobQueue.upsertSchedule === 'function'
+    ? createScheduler({ jobQueue, repositories, logger })
+    : null;
   const subscriptions = [];
   let state = 'created';
+
+  // A queue delivery is either a schedule tick (no row yet — the tick creates
+  // it) or a real job (row exists — the runner owns its lifecycle).
+  const dispatch = (job) => (job.type === 'tick' && scheduler ? scheduler.tick(job.payload || {}) : runner.runJob(job));
 
   async function start() {
     if (state !== 'created') throw new Error(`worker app cannot start from state "${state}"`);
     state = 'starting';
     for (const queue of registry.queues()) {
-      const sub = jobQueue.subscribe(queue, runner.runJob, {
+      const sub = jobQueue.subscribe(queue, dispatch, {
         concurrency: QUEUE_CONCURRENCY[queue] || config.concurrency,
         onFailed: runner.onTransportFailed,
       });
       if (sub.ready) await sub.ready();
       subscriptions.push(sub);
     }
+    if (scheduler) await scheduler.install();
     relay.start();
     state = 'running';
-    logger.info({ queues: registry.queues(), types: registry.types(), missing_types: registry.missing(), transport: jobQueue.kind }, 'worker started');
+    logger.info({ queues: registry.queues(), types: registry.types(), missing_types: registry.missing(), transport: jobQueue.kind, scheduler: !!scheduler }, 'worker started');
   }
 
   async function stop({ timeoutMs = config.shutdownTimeoutMs } = {}) {
@@ -100,10 +113,10 @@ function createWorkerApp({ config, logger = silentLogger(), repositories, withTr
   }
 
   function status() {
-    return { state, transport: jobQueue.kind, queues: registry.queues(), types: registry.types(), inflight: runner.inflightCount(), relay: { ...relay.stats, running: relay.isRunning() }, children: children.size() };
+    return { state, transport: jobQueue.kind, queues: registry.queues(), types: registry.types(), inflight: runner.inflightCount(), relay: { ...relay.stats, running: relay.isRunning() }, children: children.size(), scheduler: scheduler ? scheduler.schedules.map((s) => s.id) : null };
   }
 
-  return { start, stop, status, runner, relay, children, registry, jobQueue };
+  return { start, stop, status, runner, relay, scheduler, children, registry, jobQueue };
 }
 
 module.exports = { createWorkerApp, createChildRegistry };

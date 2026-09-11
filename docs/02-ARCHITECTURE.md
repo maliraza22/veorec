@@ -66,7 +66,7 @@ flowchart TB
 
 - Owns: authentication/sessions, all REST endpoints (`08-API-SPECIFICATION.md`), authorization (`12`), entitlement enforcement (ported `permissions.service`), upload-session orchestration (`06`), signed playback URL minting, webhook ingestion (Paddle), enqueueing jobs.
 - Must NOT: run FFmpeg/FFprobe, hold long-running work in request handlers (hard cap: any handler doing >2s of compute or third-party fan-out becomes a job), receive file uploads other than small images (custom thumbnails ≤ 5MB).
-- Stateless: no in-process cron, no in-memory rate limiting (Redis), no local files. Horizontally scalable.
+- Stateless: no in-process cron, no in-memory rate limiting (Redis), no local files. Horizontally scalable. *(Migration window: the legacy server still runs `server/cron.js` for the three legacy-JSON-store jobs only — every PostgreSQL-side maintenance job moved to the worker in T-602.)*
 
 ### 2.2 Workers (`apps/worker`)
 

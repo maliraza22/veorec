@@ -59,10 +59,17 @@ function createInlineJobQueue({ logger = silentLogger() } = {}) {
   /** Await every job handed over so far (tests). */
   async function drain() { while (pending.size) await Promise.all(Array.from(pending.values())); }
 
-  async function close() { closed = true; await drain(); handlers.clear(); }
-  async function obliterate() { pending.clear(); runs.length = 0; }
+  // Schedules (T-602): recorded, never fired — inline mode has no ticker; run
+  // maintenance by hand (db/src/cli/maintenance.js) or via scheduler.tickAll().
+  const schedules = new Map();
+  async function upsertSchedule(queueName, id, repeat, template) { schedules.set(`${queueName}:${id}`, { queueName, id, repeat, template }); return { id }; }
+  async function listSchedules(queueName) { return Array.from(schedules.values()).filter((s) => s.queueName === queueName); }
+  async function removeSchedule(queueName, id) { return schedules.delete(`${queueName}:${id}`); }
 
-  return { kind: 'inline', enqueue, has, subscribe, drain, close, obliterate, runs };
+  async function close() { closed = true; await drain(); handlers.clear(); }
+  async function obliterate() { pending.clear(); runs.length = 0; schedules.clear(); }
+
+  return { kind: 'inline', enqueue, has, subscribe, upsertSchedule, listSchedules, removeSchedule, drain, close, obliterate, runs };
 }
 
 module.exports = { createInlineJobQueue };

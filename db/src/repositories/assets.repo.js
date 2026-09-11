@@ -9,7 +9,7 @@
 // therefore *System methods.
 'use strict';
 
-const { and, eq, isNull } = require('drizzle-orm');
+const { and, eq, isNull, inArray } = require('drizzle-orm');
 const { videoAssets, recordings } = require('../schema');
 const { newId } = require('../ids');
 const { exec, NotFoundError } = require('./errors');
@@ -132,6 +132,15 @@ module.exports = function assetsRepo(db) {
       requireSystemReason(reason);
       return exec('video_asset', () =>
         db.select().from(videoAssets).where(eq(videoAssets.recordingId, recordingId)));
+    },
+
+    /** Orphan scan (T-602 cleanup): which of these storage keys have a row. */
+    async existingKeysSystem(keys, reason) {
+      requireSystemReason(reason);
+      if (!Array.isArray(keys) || keys.length === 0) return new Set();
+      const rows = await exec('video_asset', () => db.select({ storageKey: videoAssets.storageKey })
+        .from(videoAssets).where(inArray(videoAssets.storageKey, keys)));
+      return new Set(rows.map((r) => r.storageKey));
     },
 
     /** Playback resolution, after the caller has authorised the recording. */

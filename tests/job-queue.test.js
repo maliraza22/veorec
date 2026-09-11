@@ -118,8 +118,10 @@ function fakeRepos() {
     ok(reg.queues().sort().join() === 'media,stt' && reg.types().join() === 'probe,transcribe', 'queues() is derived from the registered types');
     ok(reg.missing().includes('transcode') && !reg.missing().includes('probe'), 'missing() lists the catalog types without a processor');
     off(); ok(!reg.has('probe') && reg.queues().join() === 'stt', 'unregistering removes the type and its queue');
-    const empty = W.createDefaultRegistry({ logger: silent });
-    ok(empty.types().length === 0 && empty.queues().length === 0, 'T-601 ships the default registry EMPTY (processors are T-602/T-603/T-701+)');
+    const shipped = W.createDefaultRegistry({ logger: silent });
+    ok(shipped.types().sort().join() === 'cleanup,upload_expiry,usage_sync' && shipped.queues().join() === 'maintenance', 'the shipped registry carries the T-602 maintenance processors only (T-603/T-701+ add the rest)');
+    const bare = W.createDefaultRegistry({ logger: silent, maintenance: false });
+    ok(bare.types().length === 0 && bare.queues().length === 0, 'maintenance:false yields the empty T-601 registry');
   }
 
   // ── E. Runner against an in-memory repository ──────────────────────────────

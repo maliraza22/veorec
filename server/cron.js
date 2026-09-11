@@ -1,9 +1,16 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// CRON  —  lightweight in-process daily jobs (no extra infra / no scheduler bill).
+// CRON  —  lightweight in-process daily jobs for the LEGACY stores only.
 //
-//   dailyUsageSync()          recompute storage/usage from the real source
-//   dailySubscriptionSync()   reconcile each subscription with Paddle
-//   dailyStorageVerification() flag accounts over their storage limit
+//   dailyUsageSync()          recompute the legacy usage store from Cloudinary/JSON
+//   dailySubscriptionSync()   reconcile each subscription with Paddle (writes the
+//                             legacy JSON subscription store)
+//   dailyStorageVerification() flag accounts over their storage limit (legacy stores)
+//
+// These three read and write the JSON stores that only THIS process may write,
+// so they stay here until billing/usage live in PostgreSQL (docs/23 Phase 9–13)
+// and this file is deleted in Phase 14. Every PostgreSQL-side maintenance job
+// (usage_sync, upload_expiry, cleanup, storage verification) runs in the worker
+// as a queue job since T-602 (docs/10 §3) — nothing v1 is scheduled here.
 //
 // Runs on a 24h interval after a short startup delay. Safe to no-op when billing
 // or Cloudinary isn't configured. For multi-instance deploys, gate with a lock
@@ -55,33 +62,6 @@ function start(deps) {
     return flagged;
   }
 
-  // ── T-306: PostgreSQL ledger maintenance (docs/10 §3) ─────────────────────
-  // Present only when the v1 stack is mounted (deps.maintenance). Hourly
-  // upload_expiry heals abandoned sessions and returns their reservations;
-  // daily usage_sync re-derives the ledger counters from the rows and logs
-  // drift. Both are plain functions from @veorec/db — the Phase 6 queue takes
-  // them over without change. Never blocks the legacy jobs: each runs in its
-  // own try, and a failure is logged, not thrown.
-  const maintenance = deps.maintenance || null;
-  async function hourlyUploadExpiry() {
-    if (!maintenance) return null;
-    try {
-      const { uploadExpiry } = require('../db/src/maintenance/upload-expiry');
-      const r = await uploadExpiry(maintenance);
-      console.log(`[cron] uploadExpiry: expired ${r.expired}, released ${r.released}`);
-      return r;
-    } catch (e) { console.error('[cron] uploadExpiry error:', e.message); return null; }
-  }
-  async function dailyLedgerSync() {
-    if (!maintenance) return null;
-    try {
-      const { usageSync } = require('../db/src/maintenance/usage-sync');
-      const r = await usageSync(maintenance);
-      console.log(`[cron] ledgerSync: synced ${r.synced} users, ${r.drifted} drifted`);
-      return r;
-    } catch (e) { console.error('[cron] ledgerSync error:', e.message); return null; }
-  }
-
   async function runAll(tag = 'scheduled') {
     try {
       await dailyUsageSync();
@@ -90,19 +70,14 @@ function start(deps) {
     } catch (e) {
       console.error(`[cron:${tag}] error:`, e.message);
     }
-    await hourlyUploadExpiry();
-    await dailyLedgerSync();
   }
 
-  // first run shortly after boot, then every 24h; upload expiry hourly
+  // first run shortly after boot, then every 24h
   const startupTimer = setTimeout(() => runAll('startup'), 60 * 1000);
   const interval = setInterval(() => runAll('daily'), DAY);
-  const hourly = setInterval(() => hourlyUploadExpiry(), 60 * 60 * 1000);
-  if (hourly.unref) hourly.unref();
 
   return { dailyUsageSync, dailySubscriptionSync, dailyStorageVerification, runAll,
-    hourlyUploadExpiry, dailyLedgerSync,
-    stop() { clearTimeout(startupTimer); clearInterval(interval); clearInterval(hourly); } };
+    stop() { clearTimeout(startupTimer); clearInterval(interval); } };
 }
 
 module.exports = { start };

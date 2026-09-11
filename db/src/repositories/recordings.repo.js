@@ -150,6 +150,14 @@ module.exports = function recordingsRepo(db) {
         .limit(limit));
     },
 
+    /** Cleanup job (T-602): `rejected_limit` rows past their grace window (docs/09 §10). */
+    async listRejectedSystem({ before, limit = 100 }, reason) {
+      requireSystemReason(reason);
+      return exec('recording', () => db.select().from(recordings)
+        .where(and(eq(recordings.status, 'rejected_limit'), isNull(recordings.deletedAt), lt(recordings.createdAt, before)))
+        .limit(limit));
+    },
+
     async hardDeleteSystem(id, reason) {
       requireSystemReason(reason);
       const rows = await exec('recording', () =>

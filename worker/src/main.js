@@ -16,9 +16,12 @@ const { createBullJobQueue } = require('./queue/bullmq');
 const { createInlineJobQueue } = require('./queue/inline');
 const { createWorkerApp } = require('./app');
 const { createDefaultRegistry } = require('./processors');
+const { createPlanResolver } = require('./plan-limits');
 
 const DB_DIR = path.join(__dirname, '..', '..', 'db', 'src');
 const STORAGE_DIR = path.join(__dirname, '..', '..', 'storage', 'src');
+// The ONE plan catalog (server/plans.js: limitsFor honours QUOTA_ENFORCEMENT_V2).
+const PLANS_PATH = path.join(__dirname, '..', '..', 'server', 'plans.js');
 
 async function main() {
   const logger = createLogger();
@@ -41,7 +44,11 @@ async function main() {
     ? createInlineJobQueue({ logger })
     : createBullJobQueue({ redisUrl: config.redisUrl, prefix: config.prefix, logger, stalledIntervalMs: config.stalledIntervalMs, lockDurationMs: config.lockDurationMs });
   const registry = createDefaultRegistry({ logger });
-  const app = createWorkerApp({ config, logger, repositories, withTransaction: tx, storage, jobQueue, registry });
+  // T-602: plan limits for the storage-verification report, from the one catalog.
+  let resolveLimits = null;
+  try { resolveLimits = createPlanResolver({ plans: require(PLANS_PATH) }); }
+  catch (e) { logger.warn({ err: { message: e.message } }, 'plan catalog unavailable — storage verification will be skipped'); }
+  const app = createWorkerApp({ config, logger, repositories, withTransaction: tx, storage, jobQueue, registry, deps: { resolveLimits } });
 
   logger.info({ app_env: config.appEnv, redis: config.inline ? 'inline' : redactRedisUrl(config.redisUrl), prefix: config.prefix }, 'worker booting');
   await app.start();

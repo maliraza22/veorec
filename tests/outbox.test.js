@@ -218,7 +218,7 @@ const REASON = 'T-601 outbox test';
     await app7.start();
     const j = await insert('transcribe', 'j');
     ok(await until(async () => !!(await rowOf(j.id)).enqueuedAt, 3000) && (await q.has(j.id, 'transcribe')), 'a default worker relays outbox rows into the transport where they wait for a consumer');
-    ok(app7.status().queues.length === 0 && (await rowOf(j.id)).status === 'queued', 'it consumes nothing — the row stays queued');
+    ok(app7.status().queues.join() === 'maintenance' && (await rowOf(j.id)).status === 'queued', 'it consumes only the maintenance queue (T-602) — an stt row stays queued for a worker that has the processor');
     await app7.stop();
   } finally {
     await q.obliterate().catch(() => {});

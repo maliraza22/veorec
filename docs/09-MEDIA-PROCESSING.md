@@ -102,7 +102,7 @@ Render jobs (trim/splice/silence-cut) are specified in `14` §5 — they run in 
 
 - Soft-deleted recordings: hard purge after 30 days — delete R2 objects listed from `video_assets`, then rows.
 - `rejected_limit` sources: purge after 7-day grace.
-- Orphan scan (weekly): list R2 prefixes vs `video_assets`; objects with no row and age > 7d → delete (report first run, delete after manual confirmation during migration).
+- Orphan scan (weekly): list R2 prefixes vs `video_assets`; objects with no row and age > 7d → delete (report first run, delete after manual confirmation during migration). *(T-602: implemented report-only in `maintenance.cleanup` — `cleanup:orphans:<ISO week>` job, result carries counts + a 50-key sample; deletion stays manual until confirmed.)*
 - Scratch + incomplete multiparts as in `06` §11.
 
 ## 11. What Cloudinary did that we must not forget to replace

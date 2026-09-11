@@ -99,6 +99,17 @@ function createBullJobQueue({
     };
   }
 
+  // ── Repeatable schedules (T-602): BullMQ job schedulers on a queue ────────
+  async function upsertSchedule(queueName, id, repeat, template) {
+    return queueFor(queueName).upsertJobScheduler(id, repeat, template);
+  }
+  async function listSchedules(queueName) {
+    return queueFor(queueName).getJobSchedulers(0, 1000, true);
+  }
+  async function removeSchedule(queueName, id) {
+    return queueFor(queueName).removeJobScheduler(id);
+  }
+
   async function obliterate() {
     for (const q of queues.values()) await q.obliterate({ force: true });
   }
@@ -113,7 +124,7 @@ function createBullJobQueue({
     if (!connection) { try { await conn.quit(); } catch { conn.disconnect(); } }
   }
 
-  return { kind: 'bullmq', prefix, enqueue, has, subscribe, obliterate, close, connection: conn };
+  return { kind: 'bullmq', prefix, enqueue, has, subscribe, upsertSchedule, listSchedules, removeSchedule, obliterate, close, connection: conn };
 }
 
 module.exports = { createBullJobQueue, LIVE_STATES };

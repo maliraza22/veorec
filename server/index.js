@@ -336,10 +336,6 @@ app.get('/api/client-config', requireAuth, async (req, res) => {
   res.json(rollout.clientConfigBody(decision, web));
 });
 
-// T-306: set when the v1 stack mounts; the scheduler runs the maintenance
-// jobs only then (there is no PostgreSQL ledger to maintain otherwise).
-let maintenanceDeps = null;
-
 // ── /api/v1 upload sessions (T-301) ─────────────────────────────────────────
 // OFF unless V1_UPLOAD_API is exactly "true". When off, none of the new
 // packages are loaded and the legacy app is byte-identical to before, so
@@ -391,9 +387,9 @@ if (process.env.V1_UPLOAD_API === 'true') {
       repositories, requireAuth, logger,
       isAdmin: (req) => isAdmin(users.findById(req.userId)),
     }));
-    // T-306: maintenance jobs in the existing in-process scheduler until the
-    // Phase 6 queue owns them — hourly upload_expiry, daily usage_sync.
-    maintenanceDeps = { repositories, withTransaction, storage: storagePkg.storageProvider(), logger };
+    // T-602: the PostgreSQL maintenance jobs (usage_sync, upload_expiry,
+    // cleanup) run in the worker as repeatable queue jobs — nothing v1 is
+    // scheduled in this process any more (docs/10 §3).
     // T-302: recordings CRUD, served from PostgreSQL. Same flag, same
     // rollback: the legacy /api/recordings routes are untouched and remain what
     // every current client uses.
@@ -2246,7 +2242,7 @@ async function listUserVideos(userId) {
   } catch { return []; }
 }
 
-cron.start({ listUsers: loadAllUsers, listVideos: listUserVideos, maintenance: maintenanceDeps });
+cron.start({ listUsers: loadAllUsers, listVideos: listUserVideos });
 
 // ── Serve client build ────────────────────────────────────────────────────────
 const clientDist = path.join(__dirname, '../client/dist');

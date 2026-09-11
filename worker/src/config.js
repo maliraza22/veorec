@@ -55,6 +55,9 @@ function loadWorkerConfig(env = process.env, overrides = {}) {
     // A delivery this worker has no processor for goes back to the transport
     // after this delay (rolling deploys with mixed worker versions).
     deferMs: int(env.WORKER_DEFER_MS, 5000, { min: 50 }),
+    // T-602: install the repeatable maintenance schedules. ON unless exactly
+    // "false" (an operator running a media-only fleet can opt out).
+    scheduler: env.WORKER_SCHEDULER !== 'false',
   };
 }
 
