@@ -1,0 +1,26 @@
+{
+  "name": "@veorec/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "description": "VeoRec background workers: JobQueue (BullMQ) + transactional outbox relay + processors (T-601). PostgreSQL via @veorec/db, storage via @veorec/storage.",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/main.js",
+    "worker": "node src/main.js",
+    "test": "node ../tests/job-queue.test.js && node ../tests/outbox.test.js",
+    "test:queue": "node ../tests/job-queue.test.js",
+    "test:outbox": "node ../tests/outbox.test.js"
+  },
+  "dependencies": {
+    "bullmq": "^6.3.4",
+    "ioredis": "^5.11.1",
+    "pino": "^10.3.1"
+  },
+  "devDependencies": {
+    "pino-pretty": "^13.1.3"
+  }
+}

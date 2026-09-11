@@ -56,7 +56,7 @@ const nextId = () => `r${RUN}${(n += 1)}`;
   const app = express();
   app.use('/api/v1', createRecordingsRouter({
     repositories: () => createRepositories(db),
-    withTransaction: rawTx,
+    withTransaction: (fn) => rawTx(fn, db),   // bound to this test database
     storage: null,                      // signed-URL minting is exercised in T-301
     requireAuth: (req, res, next) => {
       if (!currentUser) return res.status(401).json({ error: { code: 'unauthorized', message: 'no' } });
@@ -317,7 +317,7 @@ const nextId = () => `r${RUN}${(n += 1)}`;
       repositories: () => createRepositories(db),
       withTransaction: (fn) => rawTx(async (tx) => fn({
         ...tx, usage: { ...tx.usage, applyDelta: async () => { throw new Error('injected ledger failure'); } },
-      })),
+      }), db),
       storage: null,
       requireAuth: (req, _res, next) => { req.userId = alice; req.id = 'req_t'; next(); },
       logger: { info() {}, warn() {}, error() {}, debug() {} },

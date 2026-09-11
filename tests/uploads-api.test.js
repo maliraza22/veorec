@@ -72,7 +72,9 @@ const nextId = () => `u${RUN}${(n += 1)}`;
   // ── Harness: mount the real router with substitutable dependencies. ───────
   let currentUser = null;                    // who the fake auth reports
   let repoFactory = () => createRepositories(db);
-  let txRunner = rawTx;
+  // Bound to THIS test database: withTransaction(fn) without a client falls
+  // back to the process pool, which resolves through APP_ENV/DATABASE_URL.
+  let txRunner = (fn) => rawTx(fn, db);
 
   const app = express();
   app.use('/api/v1', createUploadRouter({
@@ -378,10 +380,10 @@ const nextId = () => `u${RUN}${(n += 1)}`;
     txRunner = (fn) => rawTx(async (tx) => {
       const wrapped = { ...tx, jobs: { ...tx.jobs, enqueue: async () => { throw new Error('injected outbox failure'); } } };
       return fn(wrapped);
-    });
+    }, db);
     const failed = await api('POST', `/uploads/${s6}/complete`,
       { body: { parts: [{ partNumber: 1, etag: u6.etag, size: b6.length }] }, as: alice });
-    txRunner = rawTx;
+    txRunner = (fn) => rawTx(fn, db);
     ok(failed.status >= 500, `an injected transaction failure surfaces as a server error (got ${failed.status})`);
     ok(failed.body && failed.body.error && !/injected outbox failure/.test(JSON.stringify(failed.body)),
       'the internal failure detail is NOT leaked to the caller');
@@ -408,7 +410,7 @@ const nextId = () => `u${RUN}${(n += 1)}`;
       createMultipartUpload: async () => { const e = new Error('down'); e.code = 'provider_unavailable'; e.retryable = true; throw e; },
     };
     brokenApp.use('/api/v1', createUploadRouter({
-      repositories: () => createRepositories(db), withTransaction: rawTx,
+      repositories: () => createRepositories(db), withTransaction: (fn) => rawTx(fn, db),
       storage: brokenProvider, keys: storagePkg.keys,
       requireAuth: (req, _res, next) => { req.userId = alice; req.id = 'req_t'; next(); },
       logger: { info() {}, warn() {}, error() {}, debug() {} },
@@ -430,7 +432,7 @@ const nextId = () => `u${RUN}${(n += 1)}`;
     const rec8 = await seedRecording(alice, `rec_${nextId()}`);
     const entApp = express();
     entApp.use('/api/v1', createUploadRouter({
-      repositories: () => createRepositories(db), withTransaction: rawTx,
+      repositories: () => createRepositories(db), withTransaction: (fn) => rawTx(fn, db),
       storage: provider, keys: storagePkg.keys,
       requireAuth: (req, _res, next) => { req.userId = alice; req.id = 'req_t'; next(); },
       entitlements: {

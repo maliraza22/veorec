@@ -23,7 +23,7 @@ Rule: any log line about a recording/upload/job includes its id as a structured 
 - Redaction paths enforced (`17` §10): authorization headers, tokens, presigned query strings, emails outside owner scope, raw IPs.
 - Levels: `error` = actionable defect; `warn` = degraded/fallback taken (e.g. whisper.cpp fallback, poster placeholder); `info` = domain events (recording ready, upload completed, job finished w/ duration); `debug` = dev only.
 - API access log: one line per request (method, path template, status, duration, user_id) — path templates, not raw paths (no ids in metric labels).
-- Worker: job start/finish/fail lines with attempt number, duration, and for ffmpeg failures the stderr tail (≤2KB).
+- Worker: job start/finish/fail lines with attempt number, duration, and for ffmpeg failures the stderr tail (≤2KB). *(T-601: `service=worker`; `job started` / `job completed` / `job failed (terminal)` (error) / `job failed — will retry with backoff` (warn) carry `job_id`, `queue`, `recording_id`, `attempt`, `max_attempts`, `duration_ms`, `code`; the relay logs `job relayed to transport` and the reconciler warns `queued job missing from transport — re-enqueued` / `active job lost by transport — returned to queued`; the stderr tail lands in `processing_jobs.last_error`. Same redaction paths as the API logger.)*
 - Extension: ring buffer (last 500 events) in the recorder window; attached to error reports and exportable from a debug panel ("Copy diagnostics") — crucial for remote-debugging recorder issues.
 
 ## 3. Metrics (Prometheus-style; hosted equivalent fine)

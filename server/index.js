@@ -352,7 +352,7 @@ let maintenanceDeps = null;
 // every current client uses.
 if (process.env.V1_UPLOAD_API === 'true') {
   try {
-    const { createUploadRouter, createRecordingsRouter, createMeRouter, createQuota } = require('../api/src/index.js');
+    const { createUploadRouter, createRecordingsRouter, createMeRouter, createAdminJobsRouter, createQuota } = require('../api/src/index.js');
     const { repositories, withTransaction } = require('../db/src/index.js');
     const storagePkg = require('../storage/src/index.js');
     // T-306: the quota ledger. Limits come from the ONE plan catalog
@@ -383,6 +383,14 @@ if (process.env.V1_UPLOAD_API === 'true') {
     }));
     // T-306: the caller's own dual quota meters (docs/16 §4.5).
     app.use('/api/v1', createMeRouter({ repositories, requireAuth, quota, logger }));
+    // T-601: processing-job triage — GET /admin/jobs?status=failed, POST
+    // /admin/jobs/:id/retry. Same admin allowlist as the legacy admin routes;
+    // the API never touches Redis (a retry resets the row, the worker's outbox
+    // relay hands it to the transport).
+    app.use('/api/v1', createAdminJobsRouter({
+      repositories, requireAuth, logger,
+      isAdmin: (req) => isAdmin(users.findById(req.userId)),
+    }));
     // T-306: maintenance jobs in the existing in-process scheduler until the
     // Phase 6 queue owns them — hourly upload_expiry, daily usage_sync.
     maintenanceDeps = { repositories, withTransaction, storage: storagePkg.storageProvider(), logger };

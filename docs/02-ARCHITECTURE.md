@@ -71,7 +71,7 @@ flowchart TB
 ### 2.2 Workers (`apps/worker`)
 
 - One deployable running BullMQ processors for every queue in `10-JOBS-AND-QUEUES.md`. Contains FFmpeg/FFprobe binaries (Docker image) and the transcription/AI logic relocated from `server/transcription.js` / `server/ai.js`.
-- Every processor is **idempotent** (safe to run twice) and **crash-safe** (BullMQ stalled-job recovery re-runs it). Progress and results are written to Postgres (`processing_jobs`, `video_assets`, `transcripts`), never only to queue state.
+- Every processor is **idempotent** (safe to run twice) and **crash-safe** (BullMQ stalled-job recovery re-runs it). Progress and results are written to Postgres (`processing_jobs`, `video_assets`, `transcripts`), never only to queue state. *(T-601 delivered the worker as `worker/` — `@veorec/worker`: JobQueue over BullMQ/Redis, outbox relay + reconciler, runner, graceful shutdown; details `10` §2.1.)*
 - Scheduled/repeatable jobs (usage reconciliation, subscription sync, upload-session expiry, orphan cleanup) replace `server/cron.js`.
 - **CPU-first; GPU as a worker variant, not an architecture change.** All ordinary Loom-style operations (probe, transcode, HLS, thumbnails, trim/cut/compose, audio extraction) run on CPU FFmpeg workers, horizontally scaled (`worker-1..n`). If/when a workload genuinely benefits from GPU (GPU encoding, heavy compositing, AI video, background removal, high-res exports), it becomes a separate BullMQ queue (`render-gpu`) consumed by an on-demand GPU worker (RunPod-class) implementing the **same job contract** — the API that enqueues exports never knows or cares which fleet renders (`10` §2). No permanent GPU server; no RunPod-specific logic in core code.
 

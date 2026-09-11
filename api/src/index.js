@@ -9,6 +9,7 @@
 const { createUploadRouter, defaultEntitlements } = require('./uploads.router');
 const { createRecordingsRouter, defaultEntitlements: defaultRecordingEntitlements } = require('./recordings.router');
 const { createMeRouter } = require('./me.router');
+const { createAdminJobsRouter } = require('./admin-jobs.router');
 const quota = require('./quota');
 const errors = require('./errors');
 const identity = require('./identity');
@@ -18,6 +19,8 @@ module.exports = {
   createRecordingsRouter, defaultRecordingEntitlements,
   // T-306: the quota ledger and the caller's own meters.
   createMeRouter, ...quota,
+  // T-601: processing-job triage (the failed rows are the dead-letter queue).
+  createAdminJobsRouter,
   ...identity,
   ...errors,
 };

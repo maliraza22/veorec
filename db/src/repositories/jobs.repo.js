@@ -5,7 +5,7 @@
 // enqueueing idempotent: the same logical job can never be queued twice.
 'use strict';
 
-const { and, eq, isNull, inArray, asc, sql } = require('drizzle-orm');
+const { and, eq, isNull, isNotNull, lte, inArray, asc, desc, sql } = require('drizzle-orm');
 const { processingJobs, recordings } = require('../schema');
 const { newId } = require('../ids');
 const { exec, NotFoundError } = require('./errors');
@@ -109,6 +109,50 @@ module.exports = function jobsRepo(db) {
       requireSystemReason(reason);
       return exec('processing_job', () => db.select().from(processingJobs)
         .where(inArray(processingJobs.status, statuses)).limit(limit));
+    },
+
+    // ── T-601: outbox reconciler + admin triage ─────────────────────────────
+
+    /** Stamped `queued` rows older than `before` — candidates the transport may have lost. */
+    async listStaleQueuedSystem({ before, limit = 100 }, reason) {
+      requireSystemReason(reason);
+      return exec('processing_job', () => db.select().from(processingJobs)
+        .where(and(eq(processingJobs.status, 'queued'), isNotNull(processingJobs.enqueuedAt), lte(processingJobs.enqueuedAt, before)))
+        .orderBy(asc(processingJobs.enqueuedAt)).limit(limit));
+    },
+
+    /** `active` rows started before `before` — a worker may have died holding them. */
+    async listStaleActiveSystem({ before, limit = 100 }, reason) {
+      requireSystemReason(reason);
+      return exec('processing_job', () => db.select().from(processingJobs)
+        .where(and(eq(processingJobs.status, 'active'), isNotNull(processingJobs.startedAt), lte(processingJobs.startedAt, before)))
+        .orderBy(asc(processingJobs.startedAt)).limit(limit));
+    },
+
+    /**
+     * Put a job back in front of the relay: status 'queued', enqueued_at /
+     * started_at / finished_at cleared, attempts optionally reset (admin retry,
+     * docs/10 §5). Guarded by `fromStatuses` so a concurrent state change makes
+     * this a no-op (returns null) rather than a clobber.
+     */
+    async requeueSystem(id, reason, { resetAttempts = false, fromStatuses = ['failed', 'active'] } = {}) {
+      requireSystemReason(reason);
+      const set = { status: 'queued', enqueuedAt: null, startedAt: null, finishedAt: null };
+      if (resetAttempts) set.attempts = 0;
+      const [row] = await exec('processing_job', () => db.update(processingJobs).set(set)
+        .where(and(eq(processingJobs.id, id), inArray(processingJobs.status, fromStatuses))).returning());
+      return row || null;
+    },
+
+    /** Admin listing by status (and optionally job type), newest first. */
+    async listSystem({ status = null, queue = null, limit = 100 } = {}, reason) {
+      requireSystemReason(reason);
+      const conds = [];
+      if (status) conds.push(eq(processingJobs.status, status));
+      if (queue) conds.push(eq(processingJobs.queue, queue));
+      const base = db.select().from(processingJobs);
+      return exec('processing_job', () => (conds.length ? base.where(and(...conds)) : base)
+        .orderBy(desc(processingJobs.createdAt)).limit(limit));
     },
   };
 };

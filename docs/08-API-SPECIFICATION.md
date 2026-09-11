@@ -212,7 +212,7 @@ client cannot opt into the rollout.
 | DELETE `/admin/users/:id` | soft delete; cannot delete self/admins |
 | GET `/admin/plans`, PATCH `/admin/plans/:slug`, DELETE `/admin/plans/:slug/override` | plan overrides (whitelisted fields as `plans.js` OVERRIDABLE) |
 | GET `/admin/contacts`, PATCH `/admin/contacts/:id` | contact inbox |
-| GET `/admin/jobs?status=failed` , POST `/admin/jobs/:id/retry` | **new**: processing-job triage |
+| GET `/admin/jobs?status=failed` , POST `/admin/jobs/:id/retry` | **new**: processing-job triage — **delivered by T-601** on `/api/v1` behind `V1_UPLOAD_API` + the `ADMIN_EMAILS` allowlist (`403 admin_only` otherwise): `GET` takes `status` (default `failed`), `queue`, `limit` (≤ 500) → `{jobs:[{id,queue,recordingId,dedupeKey,status,attempts,maxAttempts,lastError,result,enqueuedAt,startedAt,finishedAt,createdAt,updatedAt}],status,count}` — never the payload; `POST /:id/retry` → `404 job_not_found` / `409 invalid_state` unless `failed` / `{ok,job}` with the row reset to `queued`, `attempts 0`, unstamped (the worker's outbox relay re-enqueues it; the API never touches Redis) |
 
 ## 16. Deprecated / removed vs current API
 
