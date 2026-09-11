@@ -3,7 +3,12 @@ import { Link, useNavigate, useParams } from 'react-router-dom';
 import { Play, Pause, Scissors, RotateCcw, ArrowLeft, Save, SkipBack, SkipForward, Plus, Upload, Film, X } from 'lucide-react';
 import { useAuth } from '../AuthContext';
 import API from '../api';
+import { fetchClientConfig, webUploadIsV1, preflightSingle, uploadSingle, measureDuration, V1UploadError } from '../lib/v1Upload';
 import s from './Editor.module.css';
+
+// T-305: shown when a timeline holds a clip uploaded through the new storage.
+// Composition of such a clip waits for the processing/render pipeline.
+const NOT_COMPOSABLE_MSG = 'One of these clips was uploaded to the new storage and cannot be combined with other videos yet. You can still play it here — combining will be available once the new processing pipeline ships.';
 
 function fmt(t) {
   if (!isFinite(t)) t = 0;
@@ -174,8 +179,8 @@ export default function Editor() {
       .then((d) => setPicker((p) => p && { ...p, videos: Array.isArray(d) ? d.filter((v) => v.id !== id) : [] }))
       .catch(() => setPicker((p) => p && { ...p, videos: [] }));
   }
-  function addClip(vid, src, title, dur) {
-    setClips((cs) => [...cs, { key: mkKey(), id: vid, src, title, dur: dur || 0, in: 0, out: dur || 0 }]);
+  function addClip(vid, src, title, dur, extra = {}) {
+    setClips((cs) => [...cs, { key: mkKey(), id: vid, src, title, dur: dur || 0, in: 0, out: dur || 0, ...extra }]);
     setPicker(null);
   }
   function addFromGallery(v) { addClip(v.id, v.filename, v.title, v.duration || 0); }
@@ -184,6 +189,32 @@ export default function Editor() {
     setPicker((p) => p && { ...p, uploading: true });
     try {
       const name = (file.name || 'Uploaded clip').replace(/\.[^.]+$/, '').slice(0, 60) || 'Uploaded clip';
+
+      // T-305: the SERVER decides whether this editor uses the v1 single-PUT
+      // path (a gate separate from the extension rollout). Only an explicit
+      // "v1" answer changes anything; everything else is the legacy path below,
+      // exactly as before.
+      const cfg = await fetchClientConfig({ API, authFetch });
+      if (webUploadIsV1(cfg) && preflightSingle(file).ok) {
+        try {
+          const r = await uploadSingle({ API, authFetch, file, title: name });
+          const dur = await measureDuration(file);
+          // Marked v1: it plays from a signed URL, and it cannot be composed
+          // by the current Cloudinary pipeline (see saveCompose).
+          addClip(r.recordingId, r.playbackUrl || '', name, dur, { v1: true });
+          return;
+        } catch (e) {
+          // Fallback to legacy is allowed ONLY before a v1 session existed.
+          // After that, falling back would upload the same file twice.
+          if (!(e instanceof V1UploadError) || !e.fallbackAllowed) {
+            alert((e && e.userMessage) || 'Upload failed — please try again.');
+            setPicker((p) => p && { ...p, uploading: false });
+            return;
+          }
+          // Nothing was established on v1 — continue on the legacy path.
+        }
+      }
+
       const form = new FormData();
       form.append('video', file, file.name || 'clip.mp4');
       form.append('title', name); form.append('duration', '0');
@@ -207,6 +238,9 @@ export default function Editor() {
   function doSave(mode) { setChooser(false); if (hasOther) saveCompose(mode); else saveTrim(mode); }
   async function saveCompose(mode) {
     if (rec.canStitch === false) { if (window.confirm('Adding clips is a Pro feature. Upgrade?')) navigate('/pricing'); return; }
+    // T-305: a v1-uploaded clip cannot be composed by the current pipeline.
+    // Say so plainly here rather than sending a request that will be refused.
+    if (clips.some((c) => c.v1)) { alert(NOT_COMPOSABLE_MSG); return; }
     try { videoRef.current && videoRef.current.pause(); } catch (e) {}
     setExporting(true); setIndeterminate(true); setProgress(0);
     setExportMsg(mode === 'copy' ? 'Building your video into a new copy…' : 'Building your video on our servers…');
@@ -218,6 +252,8 @@ export default function Editor() {
       const d = await res.json().catch(() => ({}));
       if (res.ok) { setIndeterminate(false); setProgress(1); setExportMsg('Saved ✓ Your video is ready.'); setTimeout(() => navigate(d.id ? `/watch/${d.id}` : '/'), 1100); return; }
       if (res.status === 403 && d.code === 'feature_locked') { setExporting(false); if (window.confirm('Adding clips is a Pro feature. Upgrade?')) navigate('/pricing'); return; }
+      // T-305: the server's own refusal for a v1 clip — a plain explanation, never a generic failure.
+      if (res.status === 409 && d.code === 'clip_not_composable') { setExporting(false); alert(NOT_COMPOSABLE_MSG); return; }
       throw new Error(d.error || 'Save failed');
     } catch (e) { setIndeterminate(false); setExportMsg('Could not save: ' + (e.message || 'error')); setTimeout(() => setExporting(false), 2800); }
   }

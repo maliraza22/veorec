@@ -126,3 +126,26 @@ observed over two consecutive weeks at a non-zero rollout percentage. Local, sta
 synthetic runs verify that the mechanism works; they do **not** and cannot satisfy it,
 however many assertions pass. Until that production window exists and has been read off
 real snapshots, the correct status is *production observation pending*.
+### 8.3 Web upload gate and deprecation signals (T-305)
+
+**`web_upload_decision`** — one line per `/client-config` lookup, for the web editor's
+gate. Its own line and its own counters (`webUploadV1Selected`, `webUploadLegacySelected`,
+`webUploadAccountNotMigrated`) — never mixed into the extension's `rollout_decision`
+numbers, which have their own acceptance criterion. `decision` is one of
+`web_legacy_disabled` (gate off — includes every rollback), `web_v1_enabled`, or
+`account_not_migrated`. No user identifier; there is no bucket to report.
+
+**`upload_mode`** — added to `upload_started` / `upload_finished`: `single` (web, T-305),
+`multipart` (extension, T-303) or `null` (legacy). Web single-PUT uploads are counted in
+the pooled v1 counters **and** in their own slice (`uploadV1SingleAttempt/Success/Failure`),
+surfaced as `kpi_snapshot.cutover.web` with `singleSuccessRatePct`, so the extension
+gate is never judged on web traffic and the overall v1 rate stays a true total. A web
+upload rescued onto legacy carries `fallback_from:"v1"` and counts as a v1 failure, as in
+§8.1 — the client permits that rescue **only before** a v1 session exists.
+
+**`deprecated_replace_used`** — a `warn`-level line each time the memory-multer
+`POST /api/recordings/:id/replace` is used, with `deprecated:true`, the replacement
+(`v1 single-PUT upload`) and the removal phase (`Phase 14`). Counter `legacyReplaceUsed`,
+surfaced as `kpi_snapshot.deprecations.legacyReplaceUsed`. **This number is the Phase 14
+gate**: the route may be deleted only once it has stayed at zero over a full observation
+window. Sizes and the mode are recorded; never bytes, never identity.

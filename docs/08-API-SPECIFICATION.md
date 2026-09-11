@@ -68,6 +68,10 @@ Error (every non-2xx):
 | POST `/uploads/:id/complete` | ⚿ owner | idempotent (completed → replay canonical result); tx per `06` §7; enqueues probe |
 | DELETE `/uploads/:id` | ⚿ owner | abort; idempotent; releases the quota reservation exactly once |
 
+**Single-PUT mode (T-305, `06` §12).** `POST /uploads` with `{recordingId, mimeType, mode:'single', sizeBytes}` returns `201 {uploadSessionId, mode:'single', uploadUrl, uploadUrlExpiresAt, uploadHeaders:{'Content-Type','Content-Length'}, byteCeiling, expiresAt, status}`; the browser PUTs the whole file to `uploadUrl`, then `POST /uploads/:id/complete` with `{parts:[]}`. `sizeBytes` is required (`400 invalid_request`), capped at 33,554,432 (`400`, use multipart) and at the plan ceiling (`403 storage_limit`, `upgradeRequired`). Part endpoints answer `409 invalid_state`; completing before the PUT answers `409 upload_object_missing`. The web editor's "Add video → Upload" uses this when `GET /client-config` answers `webUpload.path:"v1"` (§14a); the application server never receives the bytes.
+
+**Deprecated (T-305): `POST /recordings/:id/replace`** (memory-multer). Kept functional and unchanged; every use is logged as `deprecated_replace_used` and counted (`19` §8.3). Removed in Phase 14 once that count stays at zero over a full observation window. Do not add callers.
+
 ## 6. Processing & assets
 
 | Method & path | Auth | Response |
@@ -167,8 +171,19 @@ client obeys it and never computes eligibility for itself, so a modified or repl
 client cannot opt into the rollout.
 
 ```json
-{ "upload": { "path": "legacy" | "v1", "v1Enabled": false }, "refreshAfterSeconds": 300 }
+{ "upload":    { "path": "legacy" | "v1", "v1Enabled": false },
+  "webUpload": { "path": "legacy" | "v1", "v1Enabled": false },
+  "refreshAfterSeconds": 300 }
 ```
+
+- `upload` — the **extension's** decision (T-304 percentage rollout, per-user bucket).
+- `webUpload` — the **web editor's** decision (T-305). A separate, plain on/off gate,
+  `V1_WEB_UPLOAD`, enabled only by the exact string `true` **and** only while the v1 API
+  is mounted. It has no percentage and no bucket; enabling it moves no extension user,
+  and the extension percentage cannot enable it. The same mirror rule applies: an
+  account with no PostgreSQL row is answered `legacy` and recorded as
+  `account_not_migrated` on its own `web_upload_decision` line. Rollback is unsetting the
+  variable and restarting — clients re-fetch this on every upload.
 
 - `path` — the only field the client acts on. `v1Enabled` is the same fact restated
   for readability; they can never disagree.

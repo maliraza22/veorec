@@ -14,6 +14,15 @@
 // There is no SQL here and no storage SDK here. A handler that needed either
 // would mean the boundary had failed.
 //
+// ── SINGLE-PUT MODE (T-305, docs/06 §12) ────────────────────────────────────
+// Files ≤ 32 MiB may use `mode:'single'`: one presigned PUT instead of a
+// multipart upload. Same session row, same idempotency, same completion
+// transaction — the only differences are that no multipart upload is opened,
+// the PUT URL is signed with the EXACT Content-Length the client declared (so
+// the provider itself refuses any other size), and completion HEADs the object
+// instead of assembling parts. The declared size lives in `partSize`: a single
+// session has exactly one "part", the whole object.
+//
 // ── OWNERSHIP ───────────────────────────────────────────────────────────────
 // Every lookup goes through a SCOPED repository call, so knowing a valid
 // upload-session id is never sufficient. A session belonging to someone else is
@@ -42,6 +51,10 @@ const MAX_PARTS = 10_000;                        // S3 limit
 const SESSION_TTL_MS = 48 * 60 * 60 * 1000;     // 48h
 const MAX_PRESIGN_BATCH = 20;                   // docs/06 §4
 const PART_URL_TTL_SECONDS = 3600;              // 1h
+// docs/06 §12 — single-PUT mode
+const SINGLE_MAX_BYTES = 32 * 1024 * 1024;      // 33,554,432: the single-mode ceiling
+const SINGLE_URL_TTL_SECONDS = 3600;            // 1h, same as a part URL
+const MODES = new Set(['multipart', 'single']);
 
 // A hint only — FFprobe is the arbiter (invariants #11/#12).
 const ALLOWED_MIME = new Set(['video/webm', 'video/mp4', 'video/quicktime']);
@@ -85,7 +98,8 @@ function createUploadRouter(deps) {
   router.post('/uploads', asyncRoute(async (req, res) => {
     const scope = scopeOf(req);
     const repos = repositories();
-    const { recordingId, mimeType } = req.body || {};
+    const { recordingId, mimeType, sizeBytes } = req.body || {};
+    const mode = (req.body && req.body.mode) || 'multipart';
     const idempotencyKey = req.get('Idempotency-Key');
 
     if (!idempotencyKey || typeof idempotencyKey !== 'string' || idempotencyKey.length > 200) {
@@ -99,11 +113,26 @@ function createUploadRouter(deps) {
       throw badRequest('unsupported_media_type',
         `mimeType must be one of ${[...ALLOWED_MIME].join(', ')}.`);
     }
+    if (!MODES.has(mode)) {
+      throw badRequest('invalid_request', `mode must be one of ${[...MODES].join(', ')}.`);
+    }
+    // Single mode signs the PUT with an exact Content-Length, so the size must
+    // be declared up front — and it must fit under the single-mode ceiling.
+    if (mode === 'single') {
+      if (!Number.isInteger(sizeBytes) || sizeBytes < 1) {
+        throw badRequest('invalid_request', 'sizeBytes (a positive integer) is required for mode "single".');
+      }
+      if (sizeBytes > SINGLE_MAX_BYTES) {
+        throw badRequest('invalid_request',
+          `Single-PUT uploads are limited to ${SINGLE_MAX_BYTES} bytes; use multipart for larger files.`,
+          { meta: { singleMaxBytes: SINGLE_MAX_BYTES, sizeBytes } });
+      }
+    }
 
     // Retry of the same request returns the same session — checked FIRST so a
     // replay never reaches the storage provider or creates a second multipart.
     const replay = await repos.uploads.findByIdempotencyKey(scope, idempotencyKey);
-    if (replay) return res.status(200).json(sessionCreatedBody(replay));
+    if (replay) return res.status(200).json(await sessionBody(storage, replay));
 
     // Ownership: a scoped read. A recording belonging to another user is simply
     // not found, which is also what makes id-guessing useless.
@@ -117,12 +146,43 @@ function createUploadRouter(deps) {
     // One live session per recording: return the existing one rather than
     // opening a second multipart upload against the same key (docs/06 §2).
     const open = await repos.uploads.findOpenForRecording(scope, recordingId);
-    if (open) return res.status(200).json(sessionCreatedBody(open));
+    if (open) return res.status(200).json(await sessionBody(storage, open));
 
     const container = MIME_CONTAINER[mimeType];
     const storageKey = keys.source(recordingId, container);
-    const byteCeiling = await entitlements.byteCeiling({ repos, scope, recording });
+    const planCeiling = await entitlements.byteCeiling({ repos, scope, recording });
 
+    if (mode === 'single') {
+      // docs/06 §12: the single-mode ceiling is the byte ceiling — never more
+      // than the plan allows, never more than 32 MiB. The declared size must
+      // already fit, or the PUT we are about to sign could never succeed.
+      const byteCeiling = Math.min(planCeiling, SINGLE_MAX_BYTES);
+      if (sizeBytes > byteCeiling) {
+        throw forbidden('storage_limit',
+          'This upload would exceed the size limit reserved for the recording.',
+          { upgradeRequired: true, meta: { byteCeiling, sizeBytes } });
+      }
+      // No multipart upload to open: the row is the only thing created here.
+      let session;
+      try {
+        session = await repos.uploads.createSession(scope, {
+          recordingId, storageKey, storageUploadId: null, mode: 'single',
+          partSize: sizeBytes, byteCeiling, clientMime: mimeType,
+          idempotencyKey, expiresAt: new Date(Date.now() + SESSION_TTL_MS),
+        });
+      } catch (err) {
+        if (err && err.code === 'conflict') {
+          const existing = await repos.uploads.findByIdempotencyKey(scope, idempotencyKey)
+            || await repos.uploads.findOpenForRecording(scope, recordingId);
+          if (existing) return res.status(200).json(await sessionBody(storage, existing));
+        }
+        throw err;
+      }
+      telemetry.uploadStarted(req, { sizeBytes, mode: 'single' });
+      return res.status(201).json(await sessionBody(storage, session));
+    }
+
+    const byteCeiling = planCeiling;
     // The multipart upload is created BEFORE the row, so a row never claims a
     // storage upload that does not exist. The reverse would leave a session the
     // client could presign against with no upload behind it.
@@ -145,13 +205,13 @@ function createUploadRouter(deps) {
       if (err && err.code === 'conflict') {
         const existing = await repos.uploads.findByIdempotencyKey(scope, idempotencyKey)
           || await repos.uploads.findOpenForRecording(scope, recordingId);
-        if (existing) return res.status(200).json(sessionCreatedBody(existing));
+        if (existing) return res.status(200).json(await sessionBody(storage, existing));
       }
       throw err;
     }
 
-    telemetry.uploadStarted(req, { sizeBytes: null });
-    return res.status(201).json(sessionCreatedBody(session));
+    telemetry.uploadStarted(req, { sizeBytes: null, mode: 'multipart' });
+    return res.status(201).json(await sessionBody(storage, session));
   }));
 
   // ── GET /uploads/:id — status + parts, the resume source of truth ─────────
@@ -176,6 +236,7 @@ function createUploadRouter(deps) {
       uploadSessionId: session.id,
       recordingId: session.recordingId,
       status: session.status,
+      mode: session.mode,
       partSize: session.partSize,
       minPartSize: MIN_PART_SIZE,
       maxParts: MAX_PARTS,
@@ -194,6 +255,7 @@ function createUploadRouter(deps) {
     const session = await mustGetSession(repos, scope, req.params.id);
     assertUsable(session);
 
+    assertMultipart(session);
     const requested = normalisePartRequest(req.body, session.partSize);
 
     // Byte-ceiling enforcement (docs/06 §4). A hostile client holding valid
@@ -235,6 +297,7 @@ function createUploadRouter(deps) {
     const session = await mustGetSession(repos, scope, req.params.id);
     assertUsable(session);
 
+    assertMultipart(session);
     const partNumber = Number(req.params.n);
     if (!Number.isInteger(partNumber) || partNumber < 1 || partNumber > MAX_PARTS) {
       throw badRequest('invalid_request', `partNumber must be an integer in [1, ${MAX_PARTS}].`);
@@ -266,31 +329,61 @@ function createUploadRouter(deps) {
       throw conflict('invalid_state', `This upload session is ${session.status}.`);
     }
 
-    // 2. Validate the manifest BEFORE touching storage.
-    const manifest = normaliseManifest(req.body, session);
-    const total = manifest.reduce((sum, p) => sum + p.size, 0);
-    const ceiling = Number(session.byteCeiling);
-    if (total > ceiling) {
-      // Over the ceiling: abort the multipart so the parts do not linger, and
-      // refuse. No application state is created.
-      await storage.abortMultipartUpload(session.storageKey, session.storageUploadId).catch(() => {});
-      await repos.uploads.setSessionStatus(scope, session.id, 'aborted');
-      throw unprocessable('upload_manifest_invalid',
-        'The upload is larger than the limit reserved for this recording.',
-        { meta: { byteCeiling: ceiling, declaredBytes: total } });
-    }
+    let stored;
+    if (session.mode === 'single') {
+      // docs/06 §12: complete is the same endpoint with `parts:[]`, and the
+      // server HEADs the object. There is nothing to assemble — the PUT either
+      // landed the whole object or it did not.
+      const parts = req.body && req.body.parts;
+      if (parts !== undefined && !(Array.isArray(parts) && parts.length === 0)) {
+        throw unprocessable('upload_manifest_invalid',
+          'A single-PUT session completes with an empty parts list.');
+      }
+      stored = await storage.headObject(session.storageKey).catch((err) => {
+        if (err && err.code === 'object_not_found') return null;
+        throw err;
+      });
+      if (!stored) {
+        // The client says it finished but the object is not there. Nothing is
+        // changed: the session stays usable so the client can PUT and retry.
+        throw new ApiError(409, 'upload_object_missing',
+          'The uploaded file was not found in storage. Upload it, then complete again.');
+      }
+      const declared = Number(session.partSize);
+      if (stored.contentLength !== declared) {
+        // The signed Content-Length should make this impossible; if it happens
+        // the bytes are suspect and nothing is finalised. Not deleted either.
+        throw new ApiError(500, 'upload_size_mismatch',
+          'The stored object size does not match the declared size. Please retry.',
+          { meta: { storedBytes: stored.contentLength, declaredBytes: declared } });
+      }
+    } else {
+      // 2. Validate the manifest BEFORE touching storage.
+      const manifest = normaliseManifest(req.body, session);
+      const total = manifest.reduce((sum, p) => sum + p.size, 0);
+      const ceiling = Number(session.byteCeiling);
+      if (total > ceiling) {
+        // Over the ceiling: abort the multipart so the parts do not linger, and
+        // refuse. No application state is created.
+        await storage.abortMultipartUpload(session.storageKey, session.storageUploadId).catch(() => {});
+        await repos.uploads.setSessionStatus(scope, session.id, 'aborted');
+        throw unprocessable('upload_manifest_invalid',
+          'The upload is larger than the limit reserved for this recording.',
+          { meta: { byteCeiling: ceiling, declaredBytes: total } });
+      }
 
-    // 3+4. Finalise in storage and confirm the object. Deliberately OUTSIDE the
-    // database transaction: CompleteMultipartUpload is a network call, and
-    // holding a transaction across it would pin a connection for its duration.
-    // Safe because step 3's own rule makes a crash here recoverable — a retry
-    // finds the upload gone but the object present and treats that as success.
-    const stored = await finaliseInStorage(storage, session, manifest);
-    if (stored.contentLength !== total) {
-      // Do NOT delete anything: the bytes may be fine and the manifest wrong.
-      throw new ApiError(500, 'upload_size_mismatch',
-        'The stored object size does not match the uploaded parts. Please retry.',
-        { meta: { storedBytes: stored.contentLength, declaredBytes: total } });
+      // 3+4. Finalise in storage and confirm the object. Deliberately OUTSIDE the
+      // database transaction: CompleteMultipartUpload is a network call, and
+      // holding a transaction across it would pin a connection for its duration.
+      // Safe because step 3's own rule makes a crash here recoverable — a retry
+      // finds the upload gone but the object present and treats that as success.
+      stored = await finaliseInStorage(storage, session, manifest);
+      if (stored.contentLength !== total) {
+        // Do NOT delete anything: the bytes may be fine and the manifest wrong.
+        throw new ApiError(500, 'upload_size_mismatch',
+          'The stored object size does not match the uploaded parts. Please retry.',
+          { meta: { storedBytes: stored.contentLength, declaredBytes: total } });
+      }
     }
 
     // Entitlement at completion (docs/06 §7 step 5): re-checked with the REAL
@@ -304,7 +397,7 @@ function createUploadRouter(deps) {
       await repos.recordings.updateSystem(session.recordingId, { status: 'rejected_limit' },
         'T-301: entitlement rejected the upload at completion');
       await repos.uploads.setSessionStatus(scope, session.id, 'aborted');
-      telemetry.uploadFinished(req, 'rejected_limit', { code: verdict.code || 'storage_limit' });
+      telemetry.uploadFinished(req, 'rejected_limit', { code: verdict.code || 'storage_limit', mode: session.mode });
       throw forbidden(verdict.code || 'storage_limit', verdict.message
         || 'This upload exceeds your plan.', { upgradeRequired: true, meta: verdict.meta });
     }
@@ -333,7 +426,7 @@ function createUploadRouter(deps) {
       return tx.uploads.getSession(scope, session.id);
     });
 
-    telemetry.uploadFinished(req, 'success', { sizeBytes: stored.contentLength });
+    telemetry.uploadFinished(req, 'success', { sizeBytes: stored.contentLength, mode: session.mode });
     return res.json(completedBody(result || session));
   }));
 
@@ -361,6 +454,15 @@ function createUploadRouter(deps) {
           logger.warn && logger.warn({ code: err && err.code },
             'v1 upload abort: storage abort failed; marking the session aborted anyway');
         });
+    } else if (session.mode === 'single') {
+      // A single-PUT session may already have landed its object. Discarding
+      // an INCOMPLETE upload is the user's explicit action and is the same
+      // thing abort does to multipart parts; a completed session was refused
+      // above, so a finished recording can never be deleted through here.
+      await storage.deleteObject(session.storageKey).catch((err) => {
+        logger.warn && logger.warn({ code: err && err.code },
+          'v1 upload abort: single-PUT object delete failed; marking the session aborted anyway');
+      });
     }
     await repos.uploads.setSessionStatus(scope, session.id, 'aborted');
     return res.json({ uploadSessionId: session.id, status: 'aborted' });
@@ -476,16 +578,43 @@ function mergePartsStorageWins(recorded, live) {
   return [...merged.values()].sort((a, b) => a.partNumber - b.partNumber);
 }
 
-const sessionCreatedBody = (s) => ({
-  uploadSessionId: s.id,
-  recordingId: s.recordingId,
-  partSize: s.partSize,
-  minPartSize: MIN_PART_SIZE,
-  maxParts: MAX_PARTS,
-  byteCeiling: Number(s.byteCeiling),
-  expiresAt: s.expiresAt,
-  status: s.status,
-});
+/** Presign and record refuse a single-PUT session: it has no parts. */
+function assertMultipart(session) {
+  if (session.mode === 'single') {
+    throw conflict('invalid_state',
+      'This is a single-PUT session; upload the whole file to its uploadUrl and then complete.');
+  }
+}
+
+/**
+ * The create/replay body. For a single-PUT session this MINTS the PUT URL on
+ * every call — presigned URLs are bearer credentials and are never stored, so
+ * a replay gets a fresh one for the same key, signed with the same exact size.
+ */
+async function sessionBody(storage, s) {
+  const body = {
+    uploadSessionId: s.id,
+    recordingId: s.recordingId,
+    mode: s.mode || 'multipart',
+    partSize: s.partSize,
+    minPartSize: MIN_PART_SIZE,
+    maxParts: MAX_PARTS,
+    byteCeiling: Number(s.byteCeiling),
+    expiresAt: s.expiresAt,
+    status: s.status,
+  };
+  if (s.mode === 'single' && (s.status === 'pending' || s.status === 'active')) {
+    const declared = Number(s.partSize);
+    body.uploadUrl = await storage.getSignedUploadUrl(s.storageKey, {
+      expiresIn: SINGLE_URL_TTL_SECONDS,
+      contentLength: declared,                 // signed: the provider enforces it
+      contentType: s.clientMime || undefined,  // signed: the client must send it
+    });
+    body.uploadUrlExpiresAt = new Date(Date.now() + SINGLE_URL_TTL_SECONDS * 1000).toISOString();
+    body.uploadHeaders = { 'Content-Type': s.clientMime, 'Content-Length': declared };
+  }
+  return body;
+}
 
 const completedBody = (s) => ({
   recordingId: s.recordingId,
@@ -525,5 +654,6 @@ function defaultEntitlements() {
 module.exports = {
   createUploadRouter, defaultEntitlements,
   DEFAULT_PART_SIZE, MIN_PART_SIZE, MAX_PARTS, MAX_PRESIGN_BATCH, SESSION_TTL_MS,
+  SINGLE_MAX_BYTES, SINGLE_URL_TTL_SECONDS,
   ALLOWED_MIME, normaliseManifest, mergePartsStorageWins,
 };

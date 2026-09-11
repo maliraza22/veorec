@@ -91,6 +91,20 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
     rolloutAccountNotMigrated: 0,
     rolloutV1Selected: 0,
     rolloutLegacySelected: 0,
+    // T-305 web single-PUT uploads. Kept SEPARATE from the pooled v1 counters
+    // above so the extension's T-304 acceptance number is not moved by a
+    // different client with a different risk profile. (They are also counted in
+    // the pooled v1 counters, so the overall v1 rate stays a true total.)
+    uploadV1SingleAttempt: 0,
+    uploadV1SingleSuccess: 0,
+    uploadV1SingleFailure: 0,
+    webUploadV1Selected: 0,
+    webUploadLegacySelected: 0,
+    webUploadAccountNotMigrated: 0,
+    // T-305 deprecation signal: each use of the legacy memory-multer
+    // POST /api/recordings/:id/replace. This number is what decides whether
+    // Phase 14 may remove the route — zero over a full observation window.
+    legacyReplaceUsed: 0,
   };
   const durations = [];       // successful-upload handler durations (ms)
   const misses = new Map();   // recordingId -> { count, firstAt, lastAt }
@@ -113,11 +127,14 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
     // 'legacy' | 'v1'. Recorded on the attempt AND re-stated on the result, so
     // a take that changes path mid-flight is still attributed correctly.
     const uploadPath = meta.path === 'v1' ? 'v1' : 'legacy';
+    // 'single' (T-305 web) | 'multipart' (T-303 extension) | null (legacy).
+    const uploadMode = uploadPath === 'v1' ? (meta.mode === 'single' ? 'single' : 'multipart') : null;
     if (uploadPath === 'v1') counters.uploadV1Attempt++; else counters.uploadLegacyAttempt++;
-    if (req) req._kpiUpload = { t0: Date.now(), done: false, store: meta.store || null, path: uploadPath };
+    if (uploadMode === 'single') counters.uploadV1SingleAttempt++;
+    if (req) req._kpiUpload = { t0: Date.now(), done: false, store: meta.store || null, path: uploadPath, mode: uploadMode };
     logOf(req).info({
       kpi: 'upload_started', store: meta.store || null, sizeBytes: meta.sizeBytes ?? null,
-      upload_path: uploadPath, fallback_from: meta.fallbackFrom || null,
+      upload_path: uploadPath, upload_mode: uploadMode, fallback_from: meta.fallbackFrom || null,
     }, 'kpi: upload started');
   }
 
@@ -143,8 +160,13 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
     // success just because that is how it started.
     const uploadPath = meta.path || (mark && mark.path) || 'legacy';
     const fallbackFrom = meta.fallbackFrom || null;
+    const uploadMode = uploadPath === 'v1'
+      ? ((meta.mode || (mark && mark.mode)) === 'single' ? 'single' : 'multipart') : null;
     if (uploadPath === 'v1') {
       if (outcome === 'success') counters.uploadV1Success++; else counters.uploadV1Failure++;
+      if (uploadMode === 'single') {
+        if (outcome === 'success') counters.uploadV1SingleSuccess++; else counters.uploadV1SingleFailure++;
+      }
     } else {
       if (outcome === 'success') counters.uploadLegacySuccess++; else counters.uploadLegacyFailure++;
       // Landing on legacy after starting on v1 is a v1 FAILURE the user was
@@ -163,6 +185,7 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
       durationMs,
       store: (mark && mark.store) || meta.store || null,
       upload_path: uploadPath,
+      upload_mode: uploadMode,
       fallback_from: fallbackFrom,
     }, `kpi: upload ${outcome}`);
   }
@@ -183,6 +206,41 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
       bucket: decision.bucket,
       percent: decision.percent,
     }, `kpi: rollout ${decision.decision}`);
+  }
+
+  /**
+   * T-305: one WEB upload gate decision. Its own line and its own counters —
+   * never mixed into the extension rollout numbers, which have their own
+   * acceptance criterion. No user identifier, no bucket (there is none).
+   */
+  function webUploadDecision(req, decision) {
+    if (decision.path === 'v1') counters.webUploadV1Selected++;
+    else counters.webUploadLegacySelected++;
+    if (decision.decision === 'account_not_migrated') counters.webUploadAccountNotMigrated++;
+    logOf(req).info({
+      kpi: 'web_upload_decision',
+      upload_path: decision.path,
+      decision: decision.decision,
+    }, `kpi: web upload ${decision.decision}`);
+  }
+
+  /**
+   * T-305: the legacy memory-multer replace route was used. DEPRECATED, not
+   * removed — this counter and this line are how remaining traffic is
+   * measured, and Phase 14 may delete the route only once they stay at zero
+   * over a full observation window. Only sizes and the mode are recorded.
+   */
+  function legacyReplaceUsed(req, meta = {}) {
+    counters.legacyReplaceUsed++;
+    logOf(req).warn({
+      kpi: 'deprecated_replace_used',
+      deprecated: true,
+      route: 'POST /api/recordings/:id/replace',
+      replacement: 'v1 single-PUT upload (docs/06 §12)',
+      removal: 'Phase 14',
+      sizeBytes: meta.sizeBytes ?? null,
+      mode: meta.mode || null,
+    }, 'kpi: DEPRECATED memory-multer replace route used');
   }
 
   // ── Watch page (Cloudinary index-lag detector) ─────────────────────────────
@@ -249,6 +307,22 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
         legacySuccesses: counters.uploadLegacySuccess,
         legacyFailures: counters.uploadLegacyFailure,
         accountNotMigrated: counters.rolloutAccountNotMigrated,
+        // T-305: the web single-PUT slice of the v1 numbers above, reported
+        // separately so the extension gate is not judged on web traffic.
+        web: {
+          enabled: process.env.V1_WEB_UPLOAD === 'true',
+          singleAttempts: counters.uploadV1SingleAttempt,
+          singleSuccesses: counters.uploadV1SingleSuccess,
+          singleFailures: counters.uploadV1SingleFailure,
+          singleSuccessRatePct: counters.uploadV1SingleAttempt
+            ? +((counters.uploadV1SingleSuccess / counters.uploadV1SingleAttempt) * 100).toFixed(2) : null,
+          accountNotMigrated: counters.webUploadAccountNotMigrated,
+        },
+      },
+      // T-305: deprecated routes still in use. Phase 14 removal is gated on
+      // these staying at zero.
+      deprecations: {
+        legacyReplaceUsed: counters.legacyReplaceUsed,
       },
       r2Mirror: {
         attempts: counters.r2MirrorAttempt,
@@ -278,7 +352,8 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
   }
 
   return {
-    uploadStarted, uploadFinished, rolloutDecision, watchMiss, watchHit, requestError, snapshot,
+    uploadStarted, uploadFinished, rolloutDecision, webUploadDecision, legacyReplaceUsed,
+    watchMiss, watchHit, requestError, snapshot,
     counters,                                  // mutated by the dual-write mirror
     _counters: counters,                       // test introspection only
     _stop() { if (interval) clearInterval(interval); },

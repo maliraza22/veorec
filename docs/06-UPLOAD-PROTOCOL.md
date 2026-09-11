@@ -115,7 +115,13 @@ Then complete as normal. **Missing-part detection is therefore server-authoritat
 
 ## 12. Small-file path (web uploads, editor "add clip")
 
-Files ≤ 32 MiB may use a single presigned `PUT` (`POST /api/v1/uploads` with `mode:'single'` → one URL; complete is the same endpoint with `parts:[]`, server HEADs the object). Same session bookkeeping, same idempotency, same atomic quota reservation (reservation = byte ceiling = 33,554,432 bytes for single mode, enforced by signed Content-Length + HEAD at complete). The editor's current 500MB memory-multer `replace` path (`index.js:61`, `1023-1086`) is **deleted** — renders happen server-side from source assets (`14`), and user file uploads use this protocol.
+Files ≤ 32 MiB may use a single presigned `PUT` (`POST /api/v1/uploads` with `mode:'single'` → one URL; complete is the same endpoint with `parts:[]`, server HEADs the object). Same session bookkeeping, same idempotency, same atomic quota reservation (reservation = byte ceiling = 33,554,432 bytes for single mode, enforced by signed Content-Length + HEAD at complete).
+
+**As implemented (T-305).** `sizeBytes` is required at create and is signed into the URL as the exact `Content-Length`, so storage itself refuses any other size; the ceiling is `min(plan ceiling, 33,554,432)` and a declared size above it is refused at create as `403 storage_limit` (a paywall, not a protocol error). The create body carries `uploadUrl` and the `uploadHeaders` the PUT must send; a replayed create returns the same session with a freshly minted URL (presigned URLs are never stored). The declared size lives in `partSize` — a single session has exactly one "part", the whole object. The part endpoints answer `409 invalid_state`; completing before the PUT answers `409 upload_object_missing` and leaves the session usable; a size that differs from the declared size is `500 upload_size_mismatch` and nothing is finalised or deleted. Abort of an incomplete single session removes its orphaned object; a completed session cannot be aborted. Completion runs the same transaction as multipart — session, recording, source asset and the probe outbox row commit together.
+
+**The editor's memory-multer `replace` path — lifecycle.** `POST /api/recordings/:id/replace` buffers the whole file in RAM on the application server, which is exactly what this protocol exists to avoid.
+- **T-305 — deprecated and measured.** The route is kept functional and unchanged; a code-level deprecation marker sits on it; every use emits a `deprecated_replace_used` log event and increments `kpi.legacyReplaceUsed` (surfaced as `deprecations.legacyReplaceUsed` in the snapshot, `19` §8.3). Nothing is removed.
+- **Phase 14 — removed**, once that counter has stayed at zero over a full observation window and renders happen server-side from source assets (`14`). Until then it is not deleted, and it must not gain new callers.
 
 ## 13. API examples
 

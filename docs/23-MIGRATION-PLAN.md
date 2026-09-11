@@ -84,6 +84,53 @@ procedure:
 **Acceptance.** ≥99% v1 upload success over two weeks of **production** traffic, read off
 `kpi_snapshot.cutover`. Local and staging verification does not satisfy this (`19` §8.2).
 
+### Phase 3 web upload path (T-305)
+
+**Architecture.** browser/editor → `POST /api/v1/recordings` → `POST /api/v1/uploads`
+(`mode:'single'`, exact `sizeBytes`) → presigned single PUT → **browser → object
+storage** → `POST /api/v1/uploads/:id/complete` (`parts:[]`, server HEADs) → recording
+persisted through the repositories → signed `playbackUrl` from `GET /api/v1/recordings/:id`.
+The application server never receives the bytes; no multer, no memory buffering, no
+storage SDK or credential in the browser. Files > 32 MiB, or with a container outside
+`webm/mp4/mov`, do not use single mode and take the legacy path — decided before
+anything is created.
+
+**Gate.** `V1_WEB_UPLOAD` — a plain on/off switch, separate from the extension rollout.
+Enabled only by the exact string `true` and only while `V1_UPLOAD_API` is `true`
+(neither flag implies the other). Default OFF. No percentage, no bucket: enabling it
+moves no extension user, and the extension percentage cannot enable it. Surfaced as
+`webUpload` on `GET /api/client-config`; the client obeys and never decides for itself.
+
+**Fallback boundary — exactly session creation.** The editor may use the legacy
+`POST /api/upload` only while nothing exists on the v1 side: a failed config fetch, a
+pre-flight refusal, a failed recording create, or a failed session create (the recording
+row created for it is deleted first, so no empty duplicate is left behind). Once a v1
+session exists there is **no** fallback — a storage PUT or completion failure is shown
+to the user, because a second upload onto the legacy path would duplicate the file and
+the recording. A rescue that does happen is recorded as `fallback_from:"v1"` and counts
+as a v1 failure (`19` §8.3).
+
+**Rollback.** Unset `V1_WEB_UPLOAD` and restart. Configuration only; the extension
+rollout percentage is untouched; the next editor upload takes the legacy path. Drilled
+on a live server: the same account answered `webUpload:"v1"` then `webUpload:"legacy"`
+with `web_legacy_disabled` recorded, extension decision unchanged.
+
+**Composition of a v1 clip is deferred.** The editor's save for a multi-clip timeline
+(`POST /api/recordings/:id/compose`) is a Cloudinary-only splice; a clip uploaded through
+this path exists in PostgreSQL + R2 and cannot be spliced by it, and making it so would
+require either writing into Cloudinary (never) or the Phase 7 / Phase 12 processing and
+render pipeline. So: upload and playback are supported; **composing/saving a timeline
+that contains a v1 clip is not**, until that pipeline exists. The route answers a
+specific `409 clip_not_composable` for such a clip (never a generic 404) and the editor
+explains it in plain words before sending anything. Nothing is copied into Cloudinary,
+nothing is rendered. **The production gate stays OFF until Phase 7/12 delivers that
+capability.**
+
+**Memory-multer `replace` path.** Deprecated and measured in T-305 (`06` §12,
+`19` §8.3); removed in Phase 14 once `deprecations.legacyReplaceUsed` stays at zero
+over a full observation window. It currently has no caller in the client or the
+extension — the counter is what turns that observation into evidence.
+
 ## Phase 4 — Local recovery (IndexedDB)
 - **Goal:** `05` fully: chunk persistence, sessions, recovery UI.
 - **Files:** extension `store/recorderStore.ts`, recovery card in recorder + popup badge.

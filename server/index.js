@@ -310,7 +310,30 @@ app.get('/api/client-config', requireAuth, async (req, res) => {
     decision = { path: 'legacy', decision: rollout.DECISION.legacyDisabled, bucket: null, percent: 0 };
   }
   kpi.rolloutDecision(req, decision);
-  res.json(rollout.clientConfigBody(decision));
+
+  // T-305: the WEB editor's decision — a separate on/off gate, decided here
+  // with the same mirror rule, and never derived from the extension bucket
+  // above. Any failure resolves to legacy.
+  let web;
+  try {
+    if (rollout.webUploadEnabled()) {
+      let hasMirror = null;
+      try {
+        const { repositories } = require('../db/src/index.js');
+        const { idFor } = require('../db/src/legacy-ids.js');
+        hasMirror = !!(await repositories().users.findById(idFor('usr', req.userId)));
+      } catch (e) {
+        hasMirror = false;
+      }
+      web = rollout.decideWeb({ hasPostgresMirror: hasMirror });
+    } else {
+      web = rollout.decideWeb();
+    }
+  } catch (e) {
+    web = { path: 'legacy', decision: rollout.WEB_DECISION.legacyDisabled };
+  }
+  kpi.webUploadDecision(req, web);
+  res.json(rollout.clientConfigBody(decision, web));
 });
 
 // ── /api/v1 upload sessions (T-301) ─────────────────────────────────────────
@@ -807,6 +830,22 @@ async function userOwns(userId, id) {
   return r.resources.length > 0;
 }
 
+// T-305: does this id name a v1 (PostgreSQL-backed) recording owned by the
+// caller? Read through the same scoped repository the v1 API uses, with the
+// canonical legacy→PostgreSQL identity mapping — never a raw query. Only
+// possible when the v1 API is mounted; any failure means "no".
+async function isV1Recording(legacyUserId, id) {
+  if (process.env.V1_UPLOAD_API !== 'true') return false;
+  try {
+    const { repositories } = require('../db/src/index.js');
+    const { idFor } = require('../db/src/legacy-ids.js');
+    const row = await repositories().recordings.get({ userId: idFor('usr', legacyUserId) }, id);
+    return !!row;
+  } catch (e) {
+    return false;
+  }
+}
+
 function viewerFromAuth(req) {
   const auth = req.headers.authorization;
   if (auth && auth.startsWith('Bearer ')) {
@@ -1193,7 +1232,17 @@ app.patch('/api/recordings/:id/meta', requireAuth, async (req, res) => {
 });
 
 // ── Replace a recording's file with an edited (physically trimmed) version ────
+//
+// ⚠ DEPRECATED (T-305, docs/06 §12). This is the memory-multer path: the whole
+// file is buffered in RAM on the application server, which is exactly what the
+// direct-to-storage protocol exists to avoid. It is kept FUNCTIONAL and
+// UNCHANGED so any remaining caller keeps working, and every use is counted
+// (`kpi.legacyReplaceUsed` → `deprecated_replace_used` log line and the
+// `deprecations.legacyReplaceUsed` snapshot field). Removal is Phase 14 work
+// (docs/23) and is gated on that counter staying at zero over a full
+// observation window. Do not add callers. Do not extend.
 app.post('/api/recordings/:id/replace', requireAuth, memUpload.single('video'), async (req, res) => {
+  kpi.legacyReplaceUsed(req, { sizeBytes: req.file?.size || 0, mode: req.body?.mode === 'copy' ? 'copy' : 'overwrite' });
   if (!(await userOwns(req.userId, req.params.id))) return res.status(404).json({ error: 'Not found' });
   const duration = parseInt(req.body.duration) || 0;
   const sizeBytes = req.file?.size || req.file?.buffer?.length || 0;
@@ -1348,6 +1397,31 @@ app.post('/api/recordings/:id/trim', requireAuth, async (req, res) => {
 // Cloudinary "splice" render. Powers the editor's "add a clip" flow. Pro feature.
 app.post('/api/recordings/:id/compose', requireAuth, async (req, res) => {
   if (!(await userOwns(req.userId, req.params.id))) return res.status(404).json({ error: 'Not found' });
+
+  // T-305 protective check. This pipeline composes CLOUDINARY assets only. A
+  // clip uploaded through the v1 single-PUT path exists in PostgreSQL + R2 and
+  // cannot be spliced here until the Phase 7/12 processing + render pipeline
+  // exists. Answer with a specific, intentional 409 rather than the generic
+  // 404 the ownership loop below would give — the clip is real and owned, it
+  // just cannot be composed yet. Checked BEFORE the backend/plan checks so the
+  // answer is the same regardless of which storage backend is configured.
+  // Nothing is copied into Cloudinary and nothing is rendered.
+  {
+    const ids = Array.isArray(req.body.clips)
+      ? req.body.clips.map((c) => c && c.id).filter((v) => typeof v === 'string')
+      : (Array.isArray(req.body.appendIds) ? req.body.appendIds.filter((v) => typeof v === 'string') : []);
+    for (const vid of [...new Set(ids)]) {
+      if (vid === req.params.id) continue;
+      if (await userOwns(req.userId, vid)) continue;            // a legacy clip: unchanged path
+      if (await isV1Recording(req.userId, vid)) {
+        return res.status(409).json({
+          error: 'This clip was uploaded to the new storage and cannot be combined with other videos yet. It can still be played, and combining will be available once the new processing pipeline ships.',
+          code: 'clip_not_composable', clipId: vid,
+        });
+      }
+    }
+  }
+
   if (!USE_CLOUDINARY) return res.status(501).json({ error: 'Composing needs Cloudinary.' });
   const cCheck = permissions.canStitchClips(users.findById(req.userId));
   if (!cCheck.allowed) return res.status(403).json({ error: cCheck.reason, upgradeRequired: true, code: 'feature_locked', feature: 'clipStitch' });

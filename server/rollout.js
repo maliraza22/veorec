@@ -116,13 +116,48 @@ function decide({ userId, env = process.env, hasPostgresMirror = null }) {
   return { path: 'v1', decision: DECISION.v1Rollout, bucket, percent };
 }
 
+// ── WEB UPLOAD GATE (T-305) ─────────────────────────────────────────────────
+// A separate, plain on/off switch for the web editor's upload path. It is
+// deliberately NOT the extension rollout: no percentage, no bucket, no salt.
+// Enabling it does not move a single extension user, and the extension
+// percentage cannot enable it. The two surfaces have different clients and
+// different risk profiles, and coupling them would make each impossible to
+// roll back on its own.
+//
+// It also cannot turn the v1 API on: if the routers are not mounted, a "v1"
+// answer would only send the browser to a 404, so the truthful — and safe —
+// answer is legacy. Neither flag implies the other.
+const WEB_DECISION = {
+  legacyDisabled: 'web_legacy_disabled',
+  v1Enabled: 'web_v1_enabled',
+  accountNotMigrated: 'account_not_migrated',
+};
+
+/** Only the literal 'true' enables the web path. Anything else is OFF. */
+function webUploadEnabled(env = process.env) {
+  return env.V1_WEB_UPLOAD === 'true' && v1ApiEnabled(env);
+}
+
+function decideWeb({ env = process.env, hasPostgresMirror = null } = {}) {
+  if (!webUploadEnabled(env)) return { path: 'legacy', decision: WEB_DECISION.legacyDisabled };
+  // Same rule as the extension: an account with no PostgreSQL mirror cannot be
+  // served by v1, and the reason is recorded rather than hidden.
+  if (hasPostgresMirror === false) return { path: 'legacy', decision: WEB_DECISION.accountNotMigrated };
+  return { path: 'v1', decision: WEB_DECISION.v1Enabled };
+}
+
 /** The wire body for GET /api/client-config. Contains no identifiers. */
-function clientConfigBody(decision) {
+function clientConfigBody(decision, webDecision = { path: 'legacy' }) {
   return {
     upload: {
       // The client obeys this; it never computes eligibility itself.
       path: decision.path,
       v1Enabled: decision.path === 'v1',
+    },
+    // T-305: the web editor's decision, independent of `upload` above.
+    webUpload: {
+      path: webDecision.path,
+      v1Enabled: webDecision.path === 'v1',
     },
     // Advisory only — a client may refresh sooner. Short, so a rollback reaches
     // clients quickly rather than waiting out a long cache.
@@ -132,5 +167,6 @@ function clientConfigBody(decision) {
 
 module.exports = {
   decide, bucketFor, resolvePercent, clientConfigBody, v1ApiEnabled,
+  decideWeb, webUploadEnabled, WEB_DECISION,
   DECISION, SALT, BUCKETS,
 };

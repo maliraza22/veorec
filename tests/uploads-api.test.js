@@ -514,6 +514,151 @@ const nextId = () => `u${RUN}${(n += 1)}`;
       && typeof shape.body.error.message === 'string',
       'errors use the nested /api/v1 contract { error: { code, message, requestId } }');
     ok(typeof shape.body.error !== 'string', 'the v1 shape is not the flat legacy shape');
+
+    // ── S. Single-PUT mode (T-305, docs/06 §12) ──────────────────────────────
+    // Its own block: the names below are local to this section.
+    {
+    console.log('\nS. Single-PUT mode');
+    const { SINGLE_MAX_BYTES } = require(path.join(API_DIR, 'src', 'uploads.router.js'));
+    ok(SINGLE_MAX_BYTES === 33554432, 'the single-mode ceiling is exactly 33,554,432 bytes (docs/06 §12)');
+    const sBytes = crypto.randomBytes(1_234_567);          // well under the 5 MiB part floor: single mode only
+    const sRec = await seedRecording(alice, `rec_${nextId()}`);
+    const sKey = `single-${nextId()}`;
+
+    // Validation before anything is created.
+    let sr = await api('POST', '/uploads', { as: alice, headers: { 'Idempotency-Key': `${sKey}-nosize` },
+      body: { recordingId: sRec, mimeType: 'video/webm', mode: 'single' } });
+    ok(sr.status === 400 && sr.body.error.code === 'invalid_request', 'single mode requires sizeBytes');
+    sr = await api('POST', '/uploads', { as: alice, headers: { 'Idempotency-Key': `${sKey}-big` },
+      body: { recordingId: sRec, mimeType: 'video/webm', mode: 'single', sizeBytes: SINGLE_MAX_BYTES + 1 } });
+    ok(sr.status === 400 && /multipart/.test(sr.body.error.message), 'a file over 32 MiB is refused for single mode');
+    sr = await api('POST', '/uploads', { as: alice, headers: { 'Idempotency-Key': `${sKey}-mode` },
+      body: { recordingId: sRec, mimeType: 'video/webm', mode: 'chunked', sizeBytes: 10 } });
+    ok(sr.status === 400, 'an unknown mode is refused');
+    let openBefore = (await db.execute(sql`select count(*)::int n from upload_sessions where recording_id = ${sRec}`)).rows[0].n;
+    ok(openBefore === 0, 'refused creates left no session row behind');
+
+    // Create.
+    const created = await api('POST', '/uploads', { as: alice, headers: { 'Idempotency-Key': sKey },
+      body: { recordingId: sRec, mimeType: 'video/webm', mode: 'single', sizeBytes: sBytes.length } });
+    ok(created.status === 201 && created.body.mode === 'single', 'a single-PUT session is created');
+    ok(typeof created.body.uploadUrl === 'string' && /^http/.test(created.body.uploadUrl),
+      'the create response carries ONE presigned PUT URL');
+    ok(!/uploadUrl/.test(JSON.stringify(created.body.parts || null)), 'no part URLs are involved');
+    ok(created.body.byteCeiling === sBytes.length || created.body.byteCeiling === SINGLE_MAX_BYTES
+      || created.body.byteCeiling <= SINGLE_MAX_BYTES, 'the byte ceiling never exceeds the single-mode ceiling');
+    ok(created.body.uploadHeaders && created.body.uploadHeaders['Content-Type'] === 'video/webm'
+      && created.body.uploadHeaders['Content-Length'] === sBytes.length, 'the headers the PUT must send are stated');
+    const sRow = (await db.execute(sql`select storage_upload_id, mode, part_size from upload_sessions where id = ${created.body.uploadSessionId}`)).rows[0];
+    ok(sRow.storage_upload_id === null, 'NO multipart upload id — nothing multipart was opened');
+    ok(sRow.mode === 'single' && Number(sRow.part_size) === sBytes.length, 'the declared size is the single "part"');
+    const sId = created.body.uploadSessionId;
+
+    // Replay returns the same session with a freshly minted URL.
+    const replay = await api('POST', '/uploads', { as: alice, headers: { 'Idempotency-Key': sKey },
+      body: { recordingId: sRec, mimeType: 'video/webm', mode: 'single', sizeBytes: sBytes.length } });
+    ok(replay.status === 200 && replay.body.uploadSessionId === sId && typeof replay.body.uploadUrl === 'string',
+      'a replayed create returns the SAME session and a usable URL');
+
+    // Part endpoints refuse a single session.
+    sr = await api('POST', `/uploads/${sId}/parts`, { as: alice, body: { parts: [1] } });
+    ok(sr.status === 409 && sr.body.error.code === 'invalid_state', 'presigning parts on a single session is refused');
+    sr = await api('PUT', `/uploads/${sId}/parts/1`, { as: alice, body: { etag: 'x', size: 1 } });
+    ok(sr.status === 409, 'recording a part on a single session is refused');
+
+    // Ownership: another user cannot see it.
+    sr = await api('GET', `/uploads/${sId}`, { as: bob });
+    ok(sr.status === 404, 'another user cannot see the single session');
+    sr = await api('GET', `/uploads/${sId}`, { as: alice });
+    ok(sr.status === 200 && sr.body.mode === 'single', 'the owner sees mode:"single" on GET');
+
+    // Completing before the PUT: nothing there, nothing changed, session still usable.
+    sr = await api('POST', `/uploads/${sId}/complete`, { as: alice, body: { parts: [] } });
+    ok(sr.status === 409 && sr.body.error.code === 'upload_object_missing', 'completing before the PUT is refused');
+    sr = await api('GET', `/uploads/${sId}`, { as: alice });
+    ok(sr.status === 200 && (sr.body.status === 'pending' || sr.body.status === 'active'), 'the session survives that refusal');
+    sr = await api('POST', `/uploads/${sId}/complete`, { as: alice, body: { parts: [{ partNumber: 1, etag: 'x', size: 1 }] } });
+    ok(sr.status === 422 && sr.body.error.code === 'upload_manifest_invalid', 'a non-empty manifest is refused for single mode');
+
+    // The signed Content-Length is ENFORCED BY STORAGE: a different size is refused.
+    const putWrong = await fetch(created.body.uploadUrl, { method: 'PUT',
+      headers: { 'Content-Type': 'video/webm' }, body: sBytes.subarray(0, sBytes.length - 1) });
+    ok(putWrong.status === 403 || putWrong.status === 400,
+      `storage refuses a PUT whose size differs from the signed Content-Length (${putWrong.status})`);
+    ok(!(await provider.headObject(`sources/${sRec}/source.webm`).catch(() => null)),
+      'and nothing was stored');
+    // The exact size succeeds — browser-direct, never through the API.
+    const putOk = await fetch(created.body.uploadUrl, { method: 'PUT',
+      headers: { 'Content-Type': 'video/webm' }, body: sBytes });
+    ok(putOk.status === 200, 'the exact-size PUT succeeds');
+    const head = await provider.headObject(`sources/${sRec}/source.webm`);
+    ok(head.contentLength === sBytes.length, 'the object is present at the exact size');
+
+    // Complete: HEAD-verified, one transaction, same outbox row as multipart.
+    const done = await api('POST', `/uploads/${sId}/complete`, { as: alice, body: { parts: [] } });
+    ok(done.status === 200 && done.body.status === 'uploaded' && done.body.recordingId === sRec,
+      'completion finalises the recording');
+    const recRow = (await db.execute(sql`select status, size_bytes from recordings where id = ${sRec}`)).rows[0];
+    ok(recRow.status === 'uploaded' && Number(recRow.size_bytes) === sBytes.length, 'the recording row is uploaded with the real size');
+    const assetRows = (await db.execute(sql`select kind, status, size_bytes from video_assets where recording_id = ${sRec}`)).rows;
+    ok(assetRows.length === 1 && assetRows[0].kind === 'source' && assetRows[0].status === 'ready'
+      && Number(assetRows[0].size_bytes) === sBytes.length, 'exactly one READY source asset row');
+    const jobRows = (await db.execute(sql`select queue from processing_jobs where recording_id = ${sRec}`)).rows;
+    ok(jobRows.length === 1 && jobRows[0].queue === 'probe', 'the probe job is in the outbox, same as multipart');
+    const again = await api('POST', `/uploads/${sId}/complete`, { as: alice, body: { parts: [] } });
+    ok(again.status === 200 && again.body.status === 'uploaded', 'a replayed completion is idempotent');
+    ok((await db.execute(sql`select count(*)::int n from video_assets where recording_id = ${sRec}`)).rows[0].n === 1,
+      'and creates no second asset');
+
+    // The resulting object is playable through a signed GET (what T-302 mints as playbackUrl).
+    const playUrl = await provider.getSignedDownloadUrl(`sources/${sRec}/source.webm`, { expiresIn: 60 });
+    const played = await fetch(playUrl);
+    const playedBytes = Buffer.from(await played.arrayBuffer());
+    ok(played.status === 200 && playedBytes.equals(sBytes), 'the stored bytes are byte-identical and retrievable via a signed URL');
+
+    // Abort of an INCOMPLETE single session removes its object; a completed one cannot be aborted.
+    sr = await api('DELETE', `/uploads/${sId}`, { as: alice });
+    ok(sr.status === 409, 'a completed single session cannot be aborted (the recording is safe)');
+    const aRec = await seedRecording(alice, `rec_${nextId()}`);
+    const aSes = await api('POST', '/uploads', { as: alice, headers: { 'Idempotency-Key': `${sKey}-abort` },
+      body: { recordingId: aRec, mimeType: 'video/mp4', mode: 'single', sizeBytes: 100 } });
+    await fetch(aSes.body.uploadUrl, { method: 'PUT', headers: { 'Content-Type': 'video/mp4' }, body: crypto.randomBytes(100) });
+    ok(!!(await provider.headObject(`sources/${aRec}/source.mp4`).catch(() => null)), 'an object landed for the session to be aborted');
+    sr = await api('DELETE', `/uploads/${aSes.body.uploadSessionId}`, { as: alice });
+    ok(sr.status === 200 && sr.body.status === 'aborted', 'the incomplete single session aborts');
+    ok(!(await provider.headObject(`sources/${aRec}/source.mp4`).catch(() => null)), 'and its orphaned object is removed');
+
+    // Plan ceiling below 32 MiB is respected (entitlement, not the protocol constant).
+    {
+      const tight = express();
+      tight.use('/api/v1', createUploadRouter({
+        repositories: (...a) => repoFactory(...a), withTransaction: (fn) => txRunner(fn),
+        storage: provider, keys: storagePkg.keys,
+        requireAuth: (req, res, next) => { req.userId = alice; req.id = 'req_t'; next(); },
+        entitlements: { async byteCeiling() { return 1024; }, async checkAtComplete() { return { allowed: true }; } },
+        logger: { info() {}, warn() {}, error() {}, debug() {} },
+      }));
+      const ts = await new Promise((resolve) => { const s2 = tight.listen(0, '127.0.0.1', () => resolve(s2)); });
+      const tRec = await seedRecording(alice, `rec_${nextId()}`);
+      const tr = await fetch(`http://127.0.0.1:${ts.address().port}/api/v1/uploads`, { method: 'POST',
+        headers: { 'content-type': 'application/json', 'Idempotency-Key': `${sKey}-tight` },
+        body: JSON.stringify({ recordingId: tRec, mimeType: 'video/webm', mode: 'single', sizeBytes: 2048 }) });
+      const tb = await tr.json();
+      ok(tr.status === 403 && tb.error.code === 'storage_limit' && tb.error.upgradeRequired === true,
+        'a declared size above the PLAN ceiling is refused at create, as a paywall');
+      ts.close();
+    }
+
+    // Multipart is untouched: a default-mode create still opens a multipart upload.
+    const mpRec = await seedRecording(alice, `rec_${nextId()}`);
+    const mp = await api('POST', '/uploads', { as: alice, headers: { 'Idempotency-Key': `${sKey}-mp` },
+      body: { recordingId: mpRec, mimeType: 'video/webm' } });
+    const mpRow = (await db.execute(sql`select storage_upload_id, mode from upload_sessions where id = ${mp.body.uploadSessionId}`)).rows[0];
+    ok(mp.status === 201 && mp.body.mode === 'multipart' && typeof mpRow.storage_upload_id === 'string' && mpRow.mode === 'multipart',
+      'multipart mode still opens a real multipart upload and is the default');
+    ok(mp.body.uploadUrl === undefined, 'a multipart session carries no single PUT URL');
+    await api('DELETE', `/uploads/${mp.body.uploadSessionId}`, { as: alice });
+    }
   } finally {
     server.close();
   }
