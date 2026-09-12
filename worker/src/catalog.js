@@ -34,6 +34,11 @@ const QUEUES = Object.freeze(['media', 'render', 'stt', 'ai', 'maintenance', 'em
 // docs/10 §3: the stt queue runs one job at a time (Groq shared budget).
 const QUEUE_CONCURRENCY = Object.freeze({ stt: 1 });
 
+// docs/09 §9: CPU-bound types run one at a time PER WORKER PROCESS (an
+// in-process semaphore in the runner); probe/thumbnail/audio share the media
+// queue's concurrency. Scale transcoding by adding worker replicas.
+const TYPE_CONCURRENCY = Object.freeze({ transcode: 1, hls: 1, render: 1 });
+
 const STATUSES = Object.freeze(['queued', 'active', 'completed', 'failed', 'cancelled']);
 
 function specFor(type) {
@@ -62,4 +67,4 @@ function backoffMs(attempt, random = Math.random) {
   return Math.floor(random() * ceiling);
 }
 
-module.exports = { JOB_TYPES, QUEUES, QUEUE_CONCURRENCY, STATUSES, specFor, backoffMs, BACKOFF_BASE_MS, BACKOFF_FACTOR, BACKOFF_CAP_MS };
+module.exports = { JOB_TYPES, QUEUES, QUEUE_CONCURRENCY, TYPE_CONCURRENCY, STATUSES, specFor, backoffMs, BACKOFF_BASE_MS, BACKOFF_FACTOR, BACKOFF_CAP_MS };

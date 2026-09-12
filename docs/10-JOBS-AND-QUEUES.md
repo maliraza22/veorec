@@ -42,6 +42,8 @@ For each: **input** (payload), **output**, **retry**, **timeout**, **idempotency
 - Out: `video_assets(kind='mp4', status='ready')`; flips recording → `ready` when poster also ready (a tiny `maybe_mark_ready` check runs at the end of both jobs, in a tx, so whichever finishes second promotes).
 - Retry 3× / timeout max(10m, 3×duration). Fail: recording `failed(transcode_failed)`; **source remains** — retryable from admin/user.
 
+> **As implemented (T-702):** `09` §3.1 — check-before-do skip, asset-id-scoped output, progress on the row, verification before publish, publish + `maybe_mark_ready` in one transaction, `transcode_failed` only from the runner's post-settlement hook once attempts are exhausted; `transcode`/`hls`/`render` serialised per process by the runner (`TYPE_CONCURRENCY`).
+
 ### `media.thumbnail`
 - In: `{recordingId}`; dedupe `thumb:{recordingId}`. Out: poster/thumb/preview assets. Retry 3× / 3m. Fail: non-fatal — a placeholder poster is served; job flagged for triage (does NOT block `ready` if the MP4 is done and poster generation failed 3× → promote with `poster:'placeholder'`; pragmatism over purity, logged loudly).
 

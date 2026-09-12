@@ -12,7 +12,7 @@
 const { and, eq, isNull, desc, lt, inArray, isNotNull, sql } = require('drizzle-orm');
 const { recordings, folders } = require('../schema');
 const { newId } = require('../ids');
-const { exec, NotFoundError } = require('./errors');
+const { exec, NotFoundError, InvalidStateError } = require('./errors');
 const { requireScope, requireSystemReason } = require('./scope');
 
 // Owner-editable metadata. Lifecycle (`status`), verified media facts
@@ -128,6 +128,21 @@ module.exports = function recordingsRepo(db) {
       requireSystemReason(reason);
       const [row] = await exec('recording', () =>
         db.select().from(recordings).where(eq(recordings.id, id)).limit(1));
+      return row || null;
+    },
+
+    /**
+     * SELECT … FOR UPDATE on one recording (T-702 maybe_mark_ready, docs/10 §6):
+     * serialises the lifecycle transition. Refuses to run outside a transaction
+     * — a lock on a plain connection is released before the caller can use it.
+     */
+    async getForUpdateSystem(id, reason) {
+      requireSystemReason(reason);
+      if (typeof db.rollback !== 'function') {
+        throw new InvalidStateError('recording', 'getForUpdateSystem must run inside withTransaction() — the row lock is the point');
+      }
+      const [row] = await exec('recording', () =>
+        db.select().from(recordings).where(eq(recordings.id, id)).for('update').limit(1));
       return row || null;
     },
 

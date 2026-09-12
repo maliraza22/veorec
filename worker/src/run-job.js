@@ -28,6 +28,19 @@ function createJobRunner({ repositories, registry, logger = silentLogger(), deps
 
   const inflight = new Map();   // job id → AbortController (shutdown aborts them)
 
+  // Per-type in-process semaphore (docs/09 §9): CPU-bound types run one at a
+  // time per worker; a job past the limit waits (the transport lock renews).
+  const slots = new Map();   // type → { active, waiters[] }
+  async function acquireSlot(proc) {
+    if (!proc.concurrency) return () => {};
+    const s = slots.get(proc.type) || { active: 0, waiters: [] };
+    slots.set(proc.type, s);
+    if (s.active >= proc.concurrency) await new Promise((resolve) => s.waiters.push(resolve));
+    s.active += 1;
+    let released = false;
+    return () => { if (released) return; released = true; s.active -= 1; const next = s.waiters.shift(); if (next) next(); };
+  }
+
   // Post-settlement hook (registry opts.onSettled): runs after the row is
   // marked completed/failed, never throws into the lifecycle.
   async function settle(proc, ctx) {
@@ -59,8 +72,10 @@ function createJobRunner({ repositories, registry, logger = silentLogger(), deps
       throw new DeferredError('no_processor', `no processor for "${type}" in this worker`, { deferMs });
     }
 
+    const release = await acquireSlot(proc);
     const active = await repos.jobs.markActiveSystem(id, REASON);
     if (active.attempts > active.maxAttempts) {
+      release();
       await repos.jobs.markFailedSystem(id, `attempts exhausted (${active.attempts} runs > max ${active.maxAttempts})`, REASON, { terminal: true });
       jobLogger.error({ attempts: active.attempts, max_attempts: active.maxAttempts }, 'job failed (terminal): attempts exhausted');
       const err = new Error('attempts exhausted'); err.unrecoverable = true; throw err;
@@ -84,6 +99,7 @@ function createJobRunner({ repositories, registry, logger = silentLogger(), deps
       ]);
       clearTimeout(timer);
       inflight.delete(id);
+      release();
       await repos.jobs.markCompletedSystem(id, result === undefined ? null : result, REASON);
       jobLogger.info({ attempt: active.attempts, duration_ms: now() - started }, 'job completed');
       await settle(proc, { status: 'completed', job: active, result, repositories, deps, logger: jobLogger });
@@ -91,6 +107,7 @@ function createJobRunner({ repositories, registry, logger = silentLogger(), deps
     } catch (err) {
       clearTimeout(timer);
       inflight.delete(id);
+      release();
       const terminal = isTerminal(err) || active.attempts >= active.maxAttempts;
       await repos.jobs.markFailedSystem(id, formatError(err), REASON, { terminal });
       const fields = { attempt: active.attempts, max_attempts: active.maxAttempts, duration_ms: now() - started, code: err && err.code, err: { message: err && err.message }, terminal };

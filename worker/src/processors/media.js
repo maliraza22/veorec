@@ -10,6 +10,8 @@ const os = require('os');
 const path = require('path');
 const { pipeline } = require('stream/promises');
 const { TransientError, TerminalError } = require('../errors');
+const { maybeMarkReady } = require('../media/ready');
+const { newId } = require(path.join(__dirname, '..', '..', '..', 'db', 'src', 'ids.js'));
 
 const REASON = 'T-701 media worker: probe facts, post-probe entitlement, fan-out';
 const DURATION_GRACE_SEC = 30;                 // docs/16 §3 "+30 s server grace"
@@ -144,6 +146,105 @@ function registerMediaProcessors(registry) {
       videoCodec: facts.video.codec, audioCodec: facts.audio ? facts.audio.codec : null, sizeBytes: facts.sizeBytes,
       durationSource: facts.durationSource, hls: wantHls, fanout: enqueued,
     };
+  });
+
+  // ── media.transcode (T-702, docs/09 §3) ──────────────────────────────────
+  const T_REASON = 'T-702 media worker: transcode MP4 + maybe_mark_ready';
+  const NOT_PROCESSABLE = new Set(['failed', 'rejected_limit', 'recording', 'uploading']);
+  registry.register('transcode', async ({ payload, job, signal, logger, deps, repositories }) => {
+    const repos = repositories();
+    const { storage, withTransaction, transcoder, prober, keys } = deps;
+    if (!transcoder || !prober) throw new TransientError('transcoder_unavailable', 'No transcoder (ffmpeg) configured on this worker.');
+    if (!storage || !keys) throw new TransientError('storage_unavailable', 'No storage provider / key builder configured on this worker.');
+    const recordingId = job.recordingId || (payload && payload.recordingId);
+    if (!recordingId) throw new TerminalError('invalid_payload', 'transcode needs a recordingId');
+    const recording = await repos.recordings.getSystem(recordingId, T_REASON);
+    if (!recording || recording.deletedAt) throw new TerminalError('recording_gone', 'The recording no longer exists.');
+    if (NOT_PROCESSABLE.has(recording.status)) throw new TerminalError('recording_not_processable', `The recording is ${recording.status}.`);
+    const assets = await repos.assets.listByRecordingSystem(recordingId, T_REASON);
+    const source = assets.find((a) => a.kind === 'source' && a.status === 'ready');
+    if (!source) throw new TerminalError('no_source', 'The recording has no ready source asset.');
+    if (recording.duration == null || !source.codecVideo) throw new TerminalError('probe_required', 'The source has not been probed yet (facts missing).');
+
+    // Check-before-do (docs/10 §1): a ready MP4 whose object exists is done.
+    let mp4 = assets.find((a) => a.kind === 'mp4' && a.variant === 'main');
+    if (mp4 && mp4.status === 'ready' && !(payload && payload.force)) {
+      const exists = await storage.objectExists(mp4.storageKey).catch(() => false);
+      if (exists) {
+        const ready = await withTransaction((tx) => maybeMarkReady({ tx, recordingId, logger }));
+        logger.info({ recording_id: recordingId, asset_id: mp4.id, promoted: ready.promoted }, 'transcode: MP4 already ready — skipped');
+        return { skipped: 'already_ready', assetId: mp4.id, ready };
+      }
+    }
+    // The asset row owns the output key (asset-id-scoped: a re-run overwrites its own output).
+    if (!mp4) {
+      const id = newId('asset');
+      mp4 = await repos.assets.createSystem({
+        id, recordingId, kind: 'mp4', variant: 'main', storageKey: keys.derivedVideo(recordingId, id),
+        status: 'pending', immutable: false, countsTowardQuota: false, createdByJobId: job.id, container: 'mp4',
+      }, T_REASON);
+    } else if (mp4.status !== 'pending') {
+      await repos.assets.updateSystem(mp4.id, { status: 'pending', createdByJobId: job.id }, T_REASON);
+    }
+
+    const dir = scratchDir(job.id);
+    const inPath = path.join(dir, `source${path.extname(source.storageKey) || ''}`);
+    const outPath = path.join(dir, 'video.mp4');
+    let verified, uploaded;
+    try {
+      let head;
+      try { head = await storage.headObject(source.storageKey); }
+      catch (e) { if (e && e.code === 'object_not_found') throw new TerminalError('source_missing', 'The source object is missing from storage.'); throw new TransientError('storage_unavailable', `head failed: ${e.message}`); }
+      if (!scratchHasRoom(dir, Number(head.contentLength || 0))) throw new TransientError('scratch_full', 'not enough scratch space (need 2× source size)');
+      await download(storage, source.storageKey, inPath);
+      const sourceFacts = { durationSec: Number(recording.duration), audio: source.codecAudio ? { codec: source.codecAudio } : null, video: { codec: source.codecVideo, width: source.width, height: source.height } };
+      const timeoutMs = Math.max(10 * 60 * 1000, 3 * Number(recording.duration) * 1000);
+      let lastPersisted = -1;
+      verified = await transcoder.transcodeToMp4(inPath, outPath, {
+        sourceFacts, signal, timeoutMs,
+        onProgress: (pct) => { if (pct - lastPersisted >= 5 || pct === 100) { lastPersisted = pct; repos.jobs.setProgressSystem(job.id, pct, T_REASON).catch(() => {}); } },
+      });
+      const size = fs.statSync(outPath).size;
+      try {
+        uploaded = await storage.putObject(mp4.storageKey, fs.createReadStream(outPath), { contentType: 'video/mp4', contentLength: size });
+      } catch (e) { throw new TransientError('storage_unavailable', `upload failed: ${e.message}`); }
+      uploaded.size = size;
+    } catch (e) {
+      if (e && e.code === 'aborted') throw new TransientError('aborted', 'transcode aborted');
+      if (e && e.code === 'timeout') throw new TransientError('transcode_timeout', e.message);
+      if (e && e.code === 'ENOENT') throw new TransientError('ffmpeg_missing', `ffmpeg not found (${e.message})`);
+      if (e && e.code === 'tool_failed') throw new TransientError('ffmpeg_failed', e.message, { stderrTail: e.stderrTail });
+      if (e && e.code === 'output_invalid') throw new TransientError('output_invalid', e.message);
+      throw e;
+    } finally {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* scratch */ }
+    }
+
+    // Publish + promote in ONE transaction (docs/10 §6): the row flips ready
+    // only after verification and upload; maybe_mark_ready runs under the lock.
+    const f = verified.facts;
+    const ready = await withTransaction(async (tx) => {
+      await tx.assets.updateSystem(mp4.id, {
+        status: 'ready', sizeBytes: uploaded.size, width: f.video.width, height: f.video.height, duration: String(f.durationSec),
+        codecVideo: 'h264', codecAudio: f.audio ? f.audio.codec : null, container: 'mp4', checksum: uploaded.etag || null, createdByJobId: job.id,
+      }, T_REASON);
+      return maybeMarkReady({ tx, recordingId, logger });
+    });
+    logger.info({ recording_id: recordingId, asset_id: mp4.id, size_bytes: uploaded.size, width: f.video.width, height: f.video.height, duration_sec: f.durationSec, promoted: ready.promoted, ready_reason: ready.reason }, 'transcode: MP4 published');
+    return { assetId: mp4.id, storageKey: mp4.storageKey, sizeBytes: uploaded.size, width: f.video.width, height: f.video.height, duration: f.durationSec, audio: !!f.audio, progress: 100, ready };
+  }, {
+    // Attempts exhausted → the recording is failed(transcode_failed); the
+    // source remains, so an admin/user retry (reprocess) can try again.
+    async onSettled({ status, job, repositories, logger }) {
+      if (status !== 'failed') return;
+      const repos = repositories();
+      const recordingId = job.recordingId || (job.payload && job.payload.recordingId);
+      if (!recordingId) return;
+      const r = await repos.recordings.getSystem(recordingId, T_REASON);
+      if (!r || r.deletedAt || r.status === 'ready' || r.status === 'rejected_limit') return;
+      await repos.recordings.updateSystem(recordingId, { status: 'failed', failureCode: 'transcode_failed' }, T_REASON);
+      if (logger) logger.error({ recording_id: recordingId, job_id: job.id }, 'transcode: attempts exhausted — recording failed(transcode_failed), source kept');
+    },
   });
 
   return registry;

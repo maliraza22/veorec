@@ -173,7 +173,7 @@ const near = (a, b, tol) => Math.abs(Number(a) - Number(b)) <= tol;
         ok(res.valid === true && res.fanout.length === 3 && res.videoCodec === 'vp9' && res.durationSource === 'format' && res.hls === false, 'the job result summarises the facts and the fan-out');
         // The derived rows are in the transport, waiting for T-702+ workers (deferred by this media-only worker, never failed).
         await sleep(400);
-        ok((await rowOf(`transcode:${A}:mp4`)).status === 'queued' && (await rowOf(`transcode:${A}:mp4`)).attempts === 0, 'a media-queue job this worker cannot run yet is deferred, not consumed (no attempt burnt)');
+        ok((await rowOf(`audio:${A}`)).status === 'queued' && (await rowOf(`audio:${A}`)).attempts === 0, 'a media-queue job this worker cannot run yet (audio_extract, T-704) is deferred, not consumed (no attempt burnt)');
         await app.stop();
         const qq = W.createBullJobQueue({ redisUrl: REDIS_URL, prefix, logger: silent }); await qq.obliterate(); await qq.close();
 
@@ -253,7 +253,7 @@ const near = (a, b, tol) => Math.abs(Number(a) - Number(b)) <= tol;
   console.log('\nD. Wiring');
   const reg = W.createDefaultRegistry();
   ok(reg.has('probe') && reg.get('probe').queue === 'media' && reg.get('probe').timeoutMs === 5 * 60 * 1000, 'the shipped registry runs probe on the media queue with the 5-minute timeout');
-  ok(!reg.has('transcode') && !reg.has('thumbnail') && !reg.has('hls'), 'transcode/thumbnail/hls are T-702+ (not registered yet)');
+  ok(reg.has('transcode') && !reg.has('thumbnail') && !reg.has('hls'), 'transcode is registered (T-702); thumbnail/hls are T-703+ (not registered yet)');
   const main = fs.readFileSync(path.join(ROOT, 'worker', 'src', 'main.js'), 'utf8');
   ok(/createProber\(/.test(main) && /resolveBinaries\(/.test(main), 'main.js builds the prober from the resolved binaries');
 

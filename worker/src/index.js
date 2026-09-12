@@ -20,6 +20,8 @@ const { createWorkerApp, createChildRegistry } = require('./app');
 const { createDefaultRegistry, registerMaintenanceProcessors, registerSttProcessors, registerMediaProcessors } = require('./processors');
 const mediaExec = require('./media/exec');
 const probe = require('./media/probe');
+const transcode = require('./media/transcode');
+const ready = require('./media/ready');
 const mediaProcessors = require('./processors/media');
 const transcription = require('./stt/transcription');
 const { createAi } = require('./stt/ai');
@@ -49,4 +51,7 @@ module.exports = {
   registerMediaProcessors, createProber: probe.createProber, containerOf: probe.containerOf, parseDecodedDuration: probe.parseDecodedDuration,
   resolveBinaries: mediaExec.resolveBinaries, runTool: mediaExec.run,
   scratchDir: mediaProcessors.scratchDir, DURATION_GRACE_SEC: mediaProcessors.DURATION_GRACE_SEC, HLS_MIN_DURATION_SEC: mediaProcessors.HLS_MIN_DURATION_SEC,
+  // T-702: transcode + maybe_mark_ready.
+  createTranscoder: transcode.createTranscoder, buildTranscodeArgs: transcode.buildArgs, parseProgress: transcode.parseProgress, hasFaststart: transcode.hasFaststart,
+  maybeMarkReady: ready.maybeMarkReady,
 };

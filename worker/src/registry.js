@@ -4,7 +4,7 @@
 // re-enqueued by the reconciler if the transport loses it) rather than failing.
 'use strict';
 
-const { JOB_TYPES, specFor } = require('./catalog');
+const { JOB_TYPES, TYPE_CONCURRENCY, specFor } = require('./catalog');
 
 function createRegistry() {
   const processors = new Map();
@@ -22,7 +22,11 @@ function createRegistry() {
     if (typeof handler !== 'function') throw new Error(`register(${type}): handler must be a function`);
     if (processors.has(type)) throw new Error(`register(${type}): already registered`);
     if (opts.onSettled !== undefined && typeof opts.onSettled !== 'function') throw new Error(`register(${type}): onSettled must be a function`);
-    processors.set(type, { type, handler, timeoutMs: opts.timeoutMs || spec.timeoutMs, queue: spec.queue, onSettled: opts.onSettled || null });
+    processors.set(type, {
+      type, handler, timeoutMs: opts.timeoutMs || spec.timeoutMs, queue: spec.queue, onSettled: opts.onSettled || null,
+      // docs/09 §9: CPU-bound types are serialised per process by the runner.
+      concurrency: opts.concurrency || TYPE_CONCURRENCY[type] || null,
+    });
     return () => processors.delete(type);
   }
 

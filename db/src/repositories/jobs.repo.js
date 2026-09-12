@@ -144,6 +144,16 @@ module.exports = function jobsRepo(db) {
       return row || null;
     },
 
+    /** Progress mid-run (T-702, docs/09 §3): merged into `result.progress` (0–100) without touching status. */
+    async setProgressSystem(id, progress, reason) {
+      requireSystemReason(reason);
+      const pct = Math.max(0, Math.min(100, Math.round(Number(progress) || 0)));
+      const [row] = await exec('processing_job', () => db.update(processingJobs)
+        .set({ result: sql`coalesce(${processingJobs.result}, '{}'::jsonb) || jsonb_build_object('progress', ${pct}::int)` })
+        .where(and(eq(processingJobs.id, id), eq(processingJobs.status, 'active'))).returning());
+      return row || null;
+    },
+
     /** Worker-side pipeline view (T-603 ai_status aggregate): every job of a recording. */
     async listByRecordingSystem(recordingId, reason) {
       requireSystemReason(reason);
