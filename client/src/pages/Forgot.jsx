@@ -1,30 +1,30 @@
 import React, { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import API from '../api';
+import { useAuthClient } from '../hooks/useAuthClient';
 import styles from './Auth.module.css';
 
 export default function Forgot() {
+  const authClient = useAuthClient();
   const [email, setEmail] = useState('');
   const [sent, setSent] = useState(false);
   const [loading, setLoading] = useState(false);
   const [emailEnabled, setEmailEnabled] = useState(null); // null = unknown until /config loads
 
   useEffect(() => {
-    fetch(`${API}/api/auth/config`)
-      .then((r) => r.json())
+    if (!authClient) return;
+    authClient.config()
       .then((d) => setEmailEnabled(!!d.emailEnabled))
       .catch(() => setEmailEnabled(false));
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authClient]);
 
   async function submit(e) {
     e.preventDefault();
     setLoading(true);
     try {
-      const r = await fetch(`${API}/api/auth/forgot`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email }),
-      });
-      if (r.ok) setSent(true);
+      const r = await authClient.forgot(email);
+      if (!r.error) setSent(true);
     } catch { /* keep the form so the user can retry */ } finally { setLoading(false); }
   }
 

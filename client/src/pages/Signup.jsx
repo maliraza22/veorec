@@ -3,11 +3,13 @@ import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../AuthContext';
 import API from '../api';
 import GoogleButton from '../components/GoogleButton';
+import { useAuthClient } from '../hooks/useAuthClient';
 import styles from './Auth.module.css';
 
 export default function Signup() {
   const { login } = useAuth();
   const navigate = useNavigate();
+  const authClient = useAuthClient();
   const [form, setForm] = useState({ name: '', email: '', password: '' });
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
@@ -16,13 +18,8 @@ export default function Signup() {
     e.preventDefault();
     setError(''); setLoading(true);
     try {
-      const res = await fetch(`${API}/api/auth/signup`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(form),
-      });
-      const data = await res.json();
-      if (!res.ok) { setError(data.error); return; }
+      const data = await authClient.signup(form);
+      if (data.error) { setError(data.error); return; }
       login(data.token, data.user);
       navigate('/');
     } catch {

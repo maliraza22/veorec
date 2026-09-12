@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import API from './api';
+import { createAuthClient, isSessionToken } from './lib/authApi.mjs';
 
 const AuthContext = createContext(null);
 
@@ -23,6 +24,8 @@ export function AuthProvider({ children }) {
   }
 
   function logout() {
+    // T-1302: a v1 session token is revoked server-side (best effort); a legacy JWT simply expires.
+    if (isSessionToken(token)) createAuthClient({ API, useV1: true }).logout(token).catch(() => {});
     localStorage.removeItem('sr_token');
     setToken(null);
     setUser(null);

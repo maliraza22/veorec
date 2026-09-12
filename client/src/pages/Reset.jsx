@@ -2,11 +2,13 @@ import React, { useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../AuthContext';
 import API from '../api';
+import { useAuthClient } from '../hooks/useAuthClient';
 import styles from './Auth.module.css';
 
 export default function Reset() {
   const { login } = useAuth();
   const navigate = useNavigate();
+  const authClient = useAuthClient();
   const [params] = useSearchParams();
   const token = params.get('token');
   const email = params.get('email');
@@ -18,12 +20,8 @@ export default function Reset() {
     e.preventDefault();
     setError(''); setLoading(true);
     try {
-      const res = await fetch(`${API}/api/auth/reset`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, token, password }),
-      });
-      const data = await res.json();
-      if (!res.ok) { setError(data.error || 'Could not reset password'); return; }
+      const data = await authClient.reset({ email, token, password });
+      if (data.error) { setError(data.error || 'Could not reset password'); return; }
       login(data.token, data.user);
       navigate('/');
     } catch { setError('Network error'); } finally { setLoading(false); }

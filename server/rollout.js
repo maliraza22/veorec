@@ -207,10 +207,29 @@ function decideEditor({ env = process.env, hasPostgresMirror = null } = {}) {
   return { path: 'v1', decision: EDITOR_DECISION.v1Enabled };
 }
 
+// ── T-1302: the AUTH gate ───────────────────────────────────────────────────
+// A visitor signing in has no token, so this is a per-deployment gate on the
+// PUBLIC config: 'v1' → /api/v1/auth (revocable sessions on PostgreSQL),
+// otherwise the legacy JWT routes. Only the literal 'true' while the v1 API is on.
+const AUTH_DECISION = {
+  legacyDisabled: 'auth_legacy_disabled',
+  v1Enabled: 'auth_v1_enabled',
+};
+function authEnabled(env = process.env) {
+  return env.V1_AUTH === 'true' && v1ApiEnabled(env);
+}
+function decideAuth({ env = process.env } = {}) {
+  return authEnabled(env)
+    ? { path: 'v1', decision: AUTH_DECISION.v1Enabled }
+    : { path: 'legacy', decision: AUTH_DECISION.legacyDisabled };
+}
+
 /** The wire body for GET /api/client-config/public — no auth, no identifiers. */
-function publicConfigBody(watchDecision = { path: 'legacy' }) {
+function publicConfigBody(watchDecision = { path: 'legacy' }, authDecision = { path: 'legacy' }) {
   return {
     watch: { path: watchDecision.path, v1Enabled: watchDecision.path === 'v1' },
+    // T-1302: which sign-in API the visitor uses.
+    auth: { path: authDecision.path, v1Enabled: authDecision.path === 'v1' },
     refreshAfterSeconds: 300,
   };
 }
@@ -255,5 +274,6 @@ module.exports = {
   decideWatch, watchPageEnabled, publicConfigBody, WATCH_DECISION,
   decideLibrary, libraryEnabled, LIBRARY_DECISION,
   decideEditor, editorEnabled, EDITOR_DECISION,
+  decideAuth, authEnabled, AUTH_DECISION,
   DECISION, SALT, BUCKETS,
 };

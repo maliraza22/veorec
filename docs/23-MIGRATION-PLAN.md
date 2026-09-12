@@ -146,6 +146,14 @@ dashboard → Notifications); both handlers verify the same secret, and until th
 legacy handler keeps serving with its dual-write mirror of `subscriptions`. After the switch
 the legacy handler is dead code for Phase 14.
 
+**Sign-in (T-1302).** The v1 auth routes are mounted whenever the v1 API is on, and the
+`requireAuth` bridge accepts session tokens everywhere from that moment; the `V1_AUTH`
+gate only decides which sign-in API the CLIENT uses (public config). Flip it per
+deployment; a rollback returns visitors to the JWT routes while every session token
+already issued keeps working (the bridge stays installed). Legacy JWTs expire on their
+own within 30 days of the flip; Phase 14 removes the JWT verifier once the legacy routes
+go.
+
 ## Phase 4 — Local recovery (IndexedDB)
 - **Goal:** `05` fully: chunk persistence, sessions, recovery UI.
 - **Files:** extension `store/recorderStore.ts`, recovery card in recorder + popup badge.

@@ -19,6 +19,8 @@ const { createEngagementRouter } = require('./engagement.router');
 const { createWatchContext } = require('./watch-context');
 const { createAnalyticsRouter } = require('./analytics.router');
 const billing = require('./billing');
+const authRouter = require('./auth.router');
+const sessions = require('./sessions');
 const entitlements = require('./entitlements');
 const { createEditingRouter } = require('./editing.router');
 const paywall = require('./paywall');
@@ -49,6 +51,8 @@ module.exports = {
   createAnalyticsRouter, ...paywall,
   // T-1301 / T-1303: the Paddle webhook ledger and entitlement resolution on PostgreSQL.
   ...billing, ...entitlements,
+  // T-1302: sessions-based auth.
+  ...authRouter, ...sessions,
   // T-1201: edit sessions, render enqueue, silence removal, stitch (the worker renders).
   createEditingRouter,
   ...identity,

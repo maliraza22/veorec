@@ -25,7 +25,7 @@ const users = require('./users');
 const { meta, folders, notifReads } = require('./meta');
 const transcription = require('./transcription');
 const ai = require('./ai');
-const { signToken, requireAuth, verifyToken } = require('./auth');
+const { signToken, requireAuth, verifyToken, configureSessionAuth } = require('./auth');
 
 // ── Monetization layer ────────────────────────────────────────────────────────
 const plans = require('./plans');
@@ -384,11 +384,14 @@ app.get('/api/client-config', requireAuth, async (req, res) => {
 // The watch page reads its gate here (viewers have no Bearer); the body carries
 // no identifiers and no per-user decision. Any failure resolves to legacy.
 app.get('/api/client-config/public', (req, res) => {
-  let watch;
+  let watch, auth;
   try { watch = rollout.decideWatch(); } catch (e) { watch = { path: 'legacy', decision: rollout.WATCH_DECISION.legacyDisabled }; }
   kpi.watchDecision(req, watch);
+  // T-1302: the sign-in API for visitors (its own gate, never per-user).
+  try { auth = rollout.decideAuth(); } catch (e) { auth = { path: 'legacy', decision: rollout.AUTH_DECISION.legacyDisabled }; }
+  kpi.authDecision(req, auth);
   res.set('Cache-Control', 'no-store');
-  res.json(rollout.publicConfigBody(watch));
+  res.json(rollout.publicConfigBody(watch, auth));
 });
 
 // ── /api/v1 upload sessions (T-301) ─────────────────────────────────────────
@@ -452,6 +455,38 @@ if (process.env.V1_UPLOAD_API === 'true') {
       },
     }));
     // T-306: the caller's own dual quota meters (docs/16 §4.5).
+    // T-1302: sessions-based auth on PostgreSQL. Session tokens (`vs_…`) are
+    // accepted by EVERY route through the requireAuth bridge (the legacy JWT
+    // keeps working); accounts created here also exist in the legacy store so
+    // the 59 legacy routes keep reading `req.userId` as the legacy id.
+    {
+      const { idFor } = require('../db/src/legacy-ids.js');
+      const { createAuthRouter, createSessionResolver } = require('../api/src/index.js');
+      configureSessionAuth({ resolve: createSessionResolver({ repositories }) });
+      const accounts = {
+        create: async ({ name, email, passwordHash = null, googleId = null }) => {
+          const user = { id: uuidv4(), name, email, password: passwordHash, googleId: googleId || undefined, plan: 'free', created_at: Date.now() };
+          users.create(user);
+          return user.id;
+        },
+        update: async (legacyId, fields) => { users.update(legacyId, fields); },
+        findByEmail: (email) => users.findByEmail(email),
+        isAdmin: (email) => isAdmin({ email }),
+      };
+      app.use('/api/v1', createAuthRouter({
+        repositories, withTransaction, requireAuth, logger, plans, rateStore, accounts,
+        passwords: { hash: (pw) => bcrypt.hash(pw, 12), verify: (pw, hash) => bcrypt.compare(pw, hash) },
+        pgIdFor: (id) => idFor('usr', id),
+        sendEmail: process.env.BREVO_API_KEY ? sendEmail : null,
+        googleVerify: async (credential) => {
+          const r = await fetch('https://oauth2.googleapis.com/tokeninfo?id_token=' + encodeURIComponent(credential));
+          const info = await r.json().catch(() => null);
+          return r.ok && info ? info : null;
+        },
+        googleClientId: process.env.GOOGLE_CLIENT_ID || null,
+        clientUrl: process.env.CLIENT_URL || 'https://veorec.com',
+      }));
+    }
     // T-1303: the caller's entitlement resolved from PostgreSQL rows only
     // (admin comp → entitled subscription → free), from the ONE plan catalog.
     app.use('/api/v1', createMeRouter({ repositories, requireAuth, quota, plans, logger }));

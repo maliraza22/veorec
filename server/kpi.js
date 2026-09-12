@@ -104,6 +104,9 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
     // T-802: the watch page gate (per deployment; read by anonymous viewers).
     watchV1Selected: 0,
     watchLegacySelected: 0,
+    // T-1302: the auth gate (per deployment; read by visitors on the public config).
+    authV1Selected: 0,
+    authLegacySelected: 0,
     // T-803: the library gate (dashboard / folders / notifications).
     libraryV1Selected: 0,
     libraryLegacySelected: 0,
@@ -281,6 +284,13 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
     }, `kpi: editor ${decision.decision}`);
   }
 
+  /** T-1302: one line per public client-config lookup for the auth gate. */
+  function authDecision(req, decision) {
+    if (decision.path === 'v1') counters.authV1Selected++;
+    else counters.authLegacySelected++;
+    logOf(req).info({ kpi: 'auth_decision', auth_path: decision.path, decision: decision.decision }, `kpi: auth ${decision.decision}`);
+  }
+
   /** T-803: one line per authed client-config lookup for the library gate. */
   function libraryDecision(req, decision) {
     if (decision.path === 'v1') counters.libraryV1Selected++;
@@ -421,6 +431,12 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
           v1Selected: counters.watchV1Selected,
           legacySelected: counters.watchLegacySelected,
         },
+        // T-1302: the auth gate.
+        auth: {
+          enabled: process.env.V1_AUTH === 'true' && process.env.V1_UPLOAD_API === 'true',
+          v1Selected: counters.authV1Selected,
+          legacySelected: counters.authLegacySelected,
+        },
         // T-803: the library gate.
         library: {
           enabled: process.env.V1_LIBRARY === 'true' && process.env.V1_UPLOAD_API === 'true',
@@ -482,7 +498,7 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
   }
 
   return {
-    uploadStarted, uploadFinished, rolloutDecision, webUploadDecision, watchDecision, libraryDecision, editorDecision, legacyReplaceUsed, legacyEditingUsed,
+    uploadStarted, uploadFinished, rolloutDecision, webUploadDecision, watchDecision, authDecision, libraryDecision, editorDecision, legacyReplaceUsed, legacyEditingUsed,
     watchMiss, watchHit, requestError, snapshot,
     counters,                                  // mutated by the dual-write mirror
     _counters: counters,                       // test introspection only

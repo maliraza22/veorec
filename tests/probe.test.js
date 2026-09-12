@@ -257,7 +257,7 @@ const near = (a, b, tol) => Math.abs(Number(a) - Number(b)) <= tol;
   console.log('\nD. Wiring');
   const reg = W.createDefaultRegistry();
   ok(reg.has('probe') && reg.get('probe').queue === 'media' && reg.get('probe').timeoutMs === 5 * 60 * 1000, 'the shipped registry runs probe on the media queue with the 5-minute timeout');
-  ok(reg.has('transcode') && reg.has('thumbnail') && reg.has('audio_extract') && reg.has('hls') && !reg.has('render'), 'every media processor of Phase 7 is registered; render is Phase 12');
+  ok(reg.has('transcode') && reg.has('thumbnail') && reg.has('audio_extract') && reg.has('hls') && reg.has('render') && reg.has('silence_detect'), 'every media processor of Phase 7 is registered, and the Phase 12 editing processors alongside');
   const main = fs.readFileSync(path.join(ROOT, 'worker', 'src', 'main.js'), 'utf8');
   ok(/createProber\(/.test(main) && /resolveBinaries\(/.test(main), 'main.js builds the prober from the resolved binaries');
 

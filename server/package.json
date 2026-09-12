@@ -8,7 +8,7 @@
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "test": "node ../tests/fixwebm.test.js && node ../tests/observability.test.js && node ../tests/kpi.test.js && node ../tests/r2mirror.test.js && node ../tests/uploader.test.js && node ../tests/rollout.test.js && node ../tests/web-upload.test.js && node ../tests/recorder-store.test.js && node ../tests/recorder-wiring.test.js && node ../tests/recovery.test.js && node ../tests/quota-ux.test.js && node ../tests/coverage-machine.js && node ../tests/capture.test.js && node ../tests/recorder-ui.test.js && node ../tests/watch-page.test.js && node ../tests/library-page.test.js && node ../tests/editor-page.test.js && node ../tests/ai-status-page.test.js",
+    "test": "node ../tests/fixwebm.test.js && node ../tests/observability.test.js && node ../tests/kpi.test.js && node ../tests/r2mirror.test.js && node ../tests/uploader.test.js && node ../tests/rollout.test.js && node ../tests/web-upload.test.js && node ../tests/recorder-store.test.js && node ../tests/recorder-wiring.test.js && node ../tests/recovery.test.js && node ../tests/quota-ux.test.js && node ../tests/coverage-machine.js && node ../tests/capture.test.js && node ../tests/recorder-ui.test.js && node ../tests/watch-page.test.js && node ../tests/library-page.test.js && node ../tests/editor-page.test.js && node ../tests/ai-status-page.test.js && node ../tests/auth-page.test.js",
     "test:r2mirror": "node ../tests/r2mirror.test.js",
     "test:uploader": "node ../tests/uploader.test.js",
     "test:rollout": "node ../tests/rollout.test.js",
@@ -24,7 +24,8 @@
     "test:watch-page": "node ../tests/watch-page.test.js",
     "test:library-page": "node ../tests/library-page.test.js",
     "test:editor-page": "node ../tests/editor-page.test.js",
-    "test:ai-status": "node ../tests/ai-status-page.test.js"
+    "test:ai-status": "node ../tests/ai-status-page.test.js",
+    "test:auth-page": "node ../tests/auth-page.test.js"
   },
   "dependencies": {
     "@sentry/node": "^10.73.0",

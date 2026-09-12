@@ -2,20 +2,23 @@ import React, { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../AuthContext';
 import API from '../api';
+import { useAuthClient } from '../hooks/useAuthClient';
 
 // Renders the official "Continue with Google" button if a Google client ID is
 // configured on the server. Verifies the credential on our backend and logs in.
 export default function GoogleButton() {
   const { login } = useAuth();
   const navigate = useNavigate();
+  const authClient = useAuthClient();
   const ref = useRef(null);
   const [clientId, setClientId] = useState(null);
   const [err, setErr] = useState('');
 
   useEffect(() => {
-    fetch(`${API}/api/auth/config`).then(r => r.json())
-      .then(d => setClientId(d.googleClientId)).catch(() => {});
-  }, []);
+    if (!authClient) return;
+    authClient.config().then(d => setClientId(d.googleClientId)).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authClient]);
 
   useEffect(() => {
     if (!clientId) return;
@@ -25,12 +28,8 @@ export default function GoogleButton() {
         client_id: clientId,
         callback: async (resp) => {
           try {
-            const r = await fetch(`${API}/api/auth/google`, {
-              method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ credential: resp.credential }),
-            });
-            const data = await r.json();
-            if (!r.ok) { setErr(data.error || 'Google sign-in failed'); return; }
+            const data = await authClient.google(resp.credential);
+            if (data.error) { setErr(data.error || 'Google sign-in failed'); return; }
             login(data.token, data.user);
             navigate('/');
           } catch { setErr('Network error'); }
