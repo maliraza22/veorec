@@ -153,3 +153,14 @@ upload rescued onto legacy carries `fallback_from:"v1"` and counts as a v1 failu
 surfaced as `kpi_snapshot.deprecations.legacyReplaceUsed`. **This number is the Phase 14
 gate**: the route may be deleted only once it has stayed at zero over a full observation
 window. Sizes and the mode are recorded; never bytes, never identity.
+
+**`deprecated_editing_used`** (T-1205) — the same discipline for the legacy Cloudinary
+editing routes: a `warn`-level line each time `POST /api/recordings/:id/trim`,
+`…/compose`, `/api/recordings/stitch` or `…/remove-silences` is used, with
+`deprecated:true`, the replacement (the v1 edit session → render job, the v1 stitch,
+the `silence_detect` job — `08` §11) and the removal phase. Counters
+`legacyTrimUsed`, `legacyComposeUsed`, `legacyStitchUsed`, `legacySilenceUsed`,
+surfaced under `kpi_snapshot.deprecations.*`. Only the mode and the clip count are
+recorded. **These are the Phase 14 gate for those handlers**: they stay byte-identical
+for accounts on the legacy editor path (`V1_EDITOR` off, or unmirrored) and may be
+deleted only once every counter has stayed at zero over a full observation window.

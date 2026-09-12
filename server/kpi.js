@@ -116,6 +116,13 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
     // POST /api/recordings/:id/replace. This number is what decides whether
     // Phase 14 may remove the route — zero over a full observation window.
     legacyReplaceUsed: 0,
+    // T-1205: the legacy Cloudinary editing routes (trim / compose / stitch /
+    // remove-silences) still in use. Their v1 replacements are the edit
+    // sessions + render jobs (docs/14); removal is Phase 14, gated on zero.
+    legacyTrimUsed: 0,
+    legacyComposeUsed: 0,
+    legacyStitchUsed: 0,
+    legacySilenceUsed: 0,
     // T-403 recovery effectiveness (docs/19 §7): uploads the client tagged as a
     // RESUMED crashed take. successes / attempts is the KPI; the client-side
     // denominator (crash-interrupted sessions found at launch) is not visible
@@ -292,6 +299,34 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
    * measured, and Phase 14 may delete the route only once they stay at zero
    * over a full observation window. Only sizes and the mode are recorded.
    */
+  /**
+   * T-1205: a legacy Cloudinary editing route was used (trim / compose /
+   * stitch / remove-silences). DEPRECATED, not removed — aliasing them onto
+   * edit sessions is impossible while an account may be unmirrored, so the
+   * routes stay byte-identical for the legacy path and every use is measured.
+   * Phase 14 may delete them only once these counters stay at zero over a
+   * full observation window. Only the mode and clip count are recorded.
+   */
+  const LEGACY_EDITING = {
+    trim: { counter: 'legacyTrimUsed', route: 'POST /api/recordings/:id/trim', replacement: 'v1 edit session → render (docs/08 §11)' },
+    compose: { counter: 'legacyComposeUsed', route: 'POST /api/recordings/:id/compose', replacement: 'v1 edit session → render (docs/08 §11)' },
+    stitch: { counter: 'legacyStitchUsed', route: 'POST /api/recordings/stitch', replacement: 'POST /api/v1/recordings/stitch (docs/08 §11)' },
+    silence: { counter: 'legacySilenceUsed', route: 'POST /api/recordings/:id/remove-silences', replacement: 'v1 silence_detect job (docs/08 §11)' },
+  };
+  function legacyEditingUsed(req, { route, mode = null, clips = null } = {}) {
+    const spec = LEGACY_EDITING[route];
+    if (!spec) return;
+    counters[spec.counter]++;
+    logOf(req).warn({
+      kpi: 'deprecated_editing_used',
+      deprecated: true,
+      route: spec.route,
+      replacement: spec.replacement,
+      removal: 'Phase 14',
+      mode, clips,
+    }, `kpi: deprecated ${spec.route} used`);
+  }
+
   function legacyReplaceUsed(req, meta = {}) {
     counters.legacyReplaceUsed++;
     logOf(req).warn({
@@ -405,6 +440,11 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
       // these staying at zero.
       deprecations: {
         legacyReplaceUsed: counters.legacyReplaceUsed,
+        // T-1205: the legacy editing routes (the Phase 14 gate for docs/14's legacy handlers).
+        legacyTrimUsed: counters.legacyTrimUsed,
+        legacyComposeUsed: counters.legacyComposeUsed,
+        legacyStitchUsed: counters.legacyStitchUsed,
+        legacySilenceUsed: counters.legacySilenceUsed,
       },
       // T-403: recovery effectiveness (docs/19 §7 — target ≥ 90%).
       recovery: {
@@ -442,7 +482,7 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
   }
 
   return {
-    uploadStarted, uploadFinished, rolloutDecision, webUploadDecision, watchDecision, libraryDecision, editorDecision, legacyReplaceUsed,
+    uploadStarted, uploadFinished, rolloutDecision, webUploadDecision, watchDecision, libraryDecision, editorDecision, legacyReplaceUsed, legacyEditingUsed,
     watchMiss, watchHit, requestError, snapshot,
     counters,                                  // mutated by the dual-write mirror
     _counters: counters,                       // test introspection only

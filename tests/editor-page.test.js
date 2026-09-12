@@ -52,6 +52,16 @@ const RUN = Math.random().toString(36).slice(2, 8);
   kpi.editorDecision({}, rollout.decideEditor({ env: on }));
   kpi.editorDecision({}, rollout.decideEditor({ env: on, hasPostgresMirror: false }));
   ok(kpi._counters.editorV1Selected === 1 && kpi._counters.editorLegacySelected === 1 && kpi._counters.editorAccountNotMigrated === 1 && lines.some((o) => o.kpi === 'editor_decision' && o.editor_path === 'v1'), 'KPI counters and the editor_decision line');
+  // T-1205: the legacy editing routes are measured, not removed.
+  ok(kpi._counters.legacyTrimUsed === 0 && kpi._counters.legacyComposeUsed === 0 && kpi._counters.legacyStitchUsed === 0 && kpi._counters.legacySilenceUsed === 0, 'T-1205: the editing deprecation counters start at zero');
+  kpi.legacyEditingUsed({}, { route: 'trim', mode: 'copy', clips: 2 });
+  kpi.legacyEditingUsed({}, { route: 'compose', mode: 'overwrite', clips: 3 });
+  kpi.legacyEditingUsed({}, { route: 'stitch', clips: 2 });
+  kpi.legacyEditingUsed({}, { route: 'silence' });
+  kpi.legacyEditingUsed({}, { route: 'nope' });
+  ok(kpi._counters.legacyTrimUsed === 1 && kpi._counters.legacyComposeUsed === 1 && kpi._counters.legacyStitchUsed === 1 && kpi._counters.legacySilenceUsed === 1, 'each legacy editing route increments its own counter (an unknown route is ignored)');
+  kpi.snapshot(); const snap = lines.find((l) => l.kpi === 'kpi_snapshot');
+  ok(snap && snap.deprecations && snap.deprecations.legacyTrimUsed === 1 && snap.deprecations.legacyComposeUsed === 1 && snap.deprecations.legacyStitchUsed === 1 && snap.deprecations.legacySilenceUsed === 1 && snap.deprecations.legacyReplaceUsed === 0, 'the snapshot carries deprecations.legacy{Trim,Compose,Stitch,Silence}Used (the Phase 14 gate)');
   kpi._stop();
 
   console.log('\nB. Client data layer (editorApi.mjs)');
@@ -149,6 +159,7 @@ const RUN = Math.random().toString(36).slice(2, 8);
   ok(!/`\$\{API\}\/api\/recordings\/stitch`/.test(watch) && !/`\$\{API\}\/api\/recordings\/\$\{id\}\/remove-silences`/.test(watch), 'the watch page builds no stitch / remove-silences URL itself');
   const server = fs.readFileSync(path.join(SERVER_DIR, 'index.js'), 'utf8');
   ok(/rollout\.editorEnabled\(\)/.test(server) && /kpi\.editorDecision\(req, editor\)/.test(server) && /rollout\.clientConfigBody\(decision, web, rollout\.decideWatch\(\), library, editor\)/.test(server), 'the server decides the editor gate with the mirror rule and reports it');
+  ok(/kpi\.legacyEditingUsed\(req, \{ route: 'trim'/.test(server) && /kpi\.legacyEditingUsed\(req, \{ route: 'compose'/.test(server) && /kpi\.legacyEditingUsed\(req, \{ route: 'stitch'/.test(server) && /kpi\.legacyEditingUsed\(req, \{ route: 'silence'/.test(server), 'T-1205: every legacy editing handler reports its use (deprecated, measured, not removed)');
   const envExample = fs.readFileSync(path.join(ROOT, '.env.example'), 'utf8');
   ok(/# V1_EDITOR=false/.test(envExample), '.env.example documents V1_EDITOR (off by default)');
 

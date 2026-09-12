@@ -1504,7 +1504,11 @@ app.post('/api/recordings/:id/replace', requireAuth, memUpload.single('video'), 
 // Concatenates the kept segments using Cloudinary's video "splice" transform,
 // bakes it into a new asset, and overwrites the original. Returns 501 when
 // Cloudinary isn't configured so the client can fall back to in-browser render.
+// T-1205: DEPRECATED (measured, not removed) — the v1 editor uses edit sessions +
+// render jobs (docs/14). These handlers stay byte-identical for the legacy path;
+// `kpi.legacyEditingUsed` is the Phase 14 removal gate (docs/19 §8.3).
 app.post('/api/recordings/:id/trim', requireAuth, async (req, res) => {
+  kpi.legacyEditingUsed(req, { route: 'trim', mode: req.body?.mode === 'copy' ? 'copy' : 'overwrite', clips: Array.isArray(req.body?.segments) ? req.body.segments.length : null });
   if (!(await userOwns(req.userId, req.params.id))) return res.status(404).json({ error: 'Not found' });
   if (!USE_CLOUDINARY) return res.status(501).json({ error: 'Server-side trim unavailable' });
 
@@ -1589,6 +1593,7 @@ app.post('/api/recordings/:id/trim', requireAuth, async (req, res) => {
 // Compose = trim the base video's kept segments AND append other clips, in one
 // Cloudinary "splice" render. Powers the editor's "add a clip" flow. Pro feature.
 app.post('/api/recordings/:id/compose', requireAuth, async (req, res) => {
+  kpi.legacyEditingUsed(req, { route: 'compose', mode: req.body?.mode === 'copy' ? 'copy' : 'overwrite', clips: Array.isArray(req.body?.clips) ? req.body.clips.length : null });
   if (!(await userOwns(req.userId, req.params.id))) return res.status(404).json({ error: 'Not found' });
 
   // T-305 protective check. This pipeline composes CLOUDINARY assets only. A
@@ -1738,6 +1743,7 @@ function keepRangesFromTranscript(segments, duration, { pad = 0.2, minGap = 0.8 
 // VIRTUAL cut (player skips the gaps instantly; no re-encode). The owner can
 // then bake it permanently via the existing Cloudinary trim. Efficient by design.
 app.post('/api/recordings/:id/remove-silences', requireAuth, async (req, res) => {
+  kpi.legacyEditingUsed(req, { route: 'silence' });
   if (!(await userOwns(req.userId, req.params.id))) return res.status(404).json({ error: 'Not found' });
   try {
     const m = meta.get(req.params.id);
@@ -1769,6 +1775,7 @@ app.post('/api/recordings/:id/remove-silences', requireAuth, async (req, res) =>
 // Stitch multiple recordings into one — Cloudinary video "splice" concatenation
 // (server-side render, no client re-encode), saved as a new library entry.
 app.post('/api/recordings/stitch', requireAuth, async (req, res) => {
+  kpi.legacyEditingUsed(req, { route: 'stitch', clips: Array.isArray(req.body?.ids) ? req.body.ids.length : null });
   if (!USE_CLOUDINARY) return res.status(501).json({ error: 'Combining clips needs Cloudinary.' });
   const ids = Array.isArray(req.body.ids) ? req.body.ids.filter(v => typeof v === 'string').slice(0, 10) : [];
   if (ids.length < 2) return res.status(400).json({ error: 'Pick at least two videos to combine.' });
