@@ -216,9 +216,9 @@ const REASON = 'T-601 outbox test';
     console.log('\nJ. Default worker: no processors, relay only');
     const app7 = W.createWorkerApp({ config, logger: silent, repositories, jobQueue: mkQueue(), registry: W.createDefaultRegistry() });
     await app7.start();
-    const j = await insert('probe', 'j');
-    ok(await until(async () => !!(await rowOf(j.id)).enqueuedAt, 3000) && (await q.has(j.id, 'probe')), 'a default worker relays outbox rows into the transport where they wait for a consumer (media has no processor yet)');
-    ok(app7.status().queues.sort().join() === 'ai,maintenance,stt' && (await rowOf(j.id)).status !== 'completed', 'the default worker consumes maintenance/stt/ai (T-602/T-603) and never the media queue');
+    const j = await insert('render', 'j');
+    ok(await until(async () => !!(await rowOf(j.id)).enqueuedAt, 3000) && (await q.has(j.id, 'render')), 'a default worker relays outbox rows into the transport where they wait for a consumer (render has no processor yet)');
+    ok(app7.status().queues.sort().join() === 'ai,maintenance,media,stt' && (await rowOf(j.id)).status === 'queued', 'the default worker consumes maintenance/stt/ai/media (T-602/T-603/T-701) and never the render queue');
     await app7.stop();
   } finally {
     await q.obliterate().catch(() => {});

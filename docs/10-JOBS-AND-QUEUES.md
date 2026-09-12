@@ -35,6 +35,8 @@ For each: **input** (payload), **output**, **retry**, **timeout**, **idempotency
 - Retry 5× / timeout 5m. Idempotent: re-probing overwrites the same facts.
 - Fail: recording `failed(probe_invalid)` only after retries exhausted **and** the error is deterministic (corrupt file); infra errors keep retrying. Dead-letter: admin triage; user sees "processing failed — Retry" (maps to `reprocess`).
 
+> **As implemented (T-701):** see `09` §2.1 — facts + entitlement + fan-out; the job fails terminally with `probe_invalid` only for deterministic verdicts (corrupt/unsupported/size mismatch/missing source), keeps retrying on infrastructure errors; fan-out enqueues transcode/thumbnail/audio_extract (+ hls when earned) by dedupe key.
+
 ### `media.transcode`
 - In: `{recordingId, sourceAssetId, variant:'mp4'}`; dedupe `transcode:{recordingId}:mp4`.
 - Out: `video_assets(kind='mp4', status='ready')`; flips recording → `ready` when poster also ready (a tiny `maybe_mark_ready` check runs at the end of both jobs, in a tx, so whichever finishes second promotes).

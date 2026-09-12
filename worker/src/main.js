@@ -20,6 +20,8 @@ const { createPlanResolver } = require('./plan-limits');
 const { createRateGate } = require('./stt/rate-gate');
 const { createTranscriber } = require('./stt/transcription');
 const { createAi } = require('./stt/ai');
+const { resolveBinaries } = require('./media/exec');
+const { createProber } = require('./media/probe');
 
 const DB_DIR = path.join(__dirname, '..', '..', 'db', 'src');
 const STORAGE_DIR = path.join(__dirname, '..', '..', 'storage', 'src');
@@ -55,14 +57,15 @@ async function main() {
   // else PATH, else the static binaries when installed (local dev/test only —
   // the worker image ships system ffmpeg, docs/02 §2.2). One Groq budget shared
   // by every worker through Redis (docs/10 §3 limiter).
-  const sttConfig = {};
-  if (!process.env.FFMPEG_BIN) { try { sttConfig.ffmpegBin = require('ffmpeg-static'); } catch { /* PATH */ } }
-  if (!process.env.FFPROBE_BIN) { try { sttConfig.ffprobeBin = require('ffprobe-static').path; } catch { /* PATH */ } }
+  const bins = resolveBinaries();
+  const sttConfig = { ffmpegBin: bins.ffmpegBin, ffprobeBin: bins.ffprobeBin };
   const rateGate = createRateGate({ redis: config.inline ? null : jobQueue.connection, max: Number(process.env.GROQ_RPM_BUDGET || 18) });
   const transcriber = createTranscriber({ config: sttConfig, rateGate, logger });
   const ai = createAi({ rateGate, logger });
-  logger.info({ stt_configured: transcriber.isConfigured(), whisper_model: transcriber.hasWhisperModel(), llm_configured: ai.isLLMConfigured(), rate_gate: rateGate.kind }, 'stt/ai providers');
-  const app = createWorkerApp({ config, logger, repositories, withTransaction: tx, storage, jobQueue, registry, deps: { resolveLimits, transcriber, ai, rateGate } });
+  // T-701: the prober (ffprobe facts) for media.probe; the same binaries feed T-702+.
+  const prober = createProber({ ffprobeBin: bins.ffprobeBin, ffmpegBin: bins.ffmpegBin, logger });
+  logger.info({ stt_configured: transcriber.isConfigured(), whisper_model: transcriber.hasWhisperModel(), llm_configured: ai.isLLMConfigured(), rate_gate: rateGate.kind, ffmpeg: bins.ffmpegBin, ffprobe: bins.ffprobeBin }, 'stt/ai/media providers');
+  const app = createWorkerApp({ config, logger, repositories, withTransaction: tx, storage, jobQueue, registry, deps: { resolveLimits, transcriber, ai, rateGate, prober } });
 
   logger.info({ app_env: config.appEnv, redis: config.inline ? 'inline' : redactRedisUrl(config.redisUrl), prefix: config.prefix }, 'worker booting');
   await app.start();

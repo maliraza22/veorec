@@ -17,7 +17,10 @@ const { createRegistry } = require('./registry');
 const { createJobRunner } = require('./run-job');
 const { createOutboxRelay } = require('./outbox');
 const { createWorkerApp, createChildRegistry } = require('./app');
-const { createDefaultRegistry, registerMaintenanceProcessors, registerSttProcessors } = require('./processors');
+const { createDefaultRegistry, registerMaintenanceProcessors, registerSttProcessors, registerMediaProcessors } = require('./processors');
+const mediaExec = require('./media/exec');
+const probe = require('./media/probe');
+const mediaProcessors = require('./processors/media');
 const transcription = require('./stt/transcription');
 const { createAi } = require('./stt/ai');
 const { createRateGate } = require('./stt/rate-gate');
@@ -42,4 +45,8 @@ module.exports = {
   mapGroqJson: transcription.mapGroqJson, buildSpeechChunks: transcription.buildSpeechChunks, capChunkCount: transcription.capChunkCount,
   parseSilences: transcription.parseSilences, generateTitle: transcription.generateTitle, WHISPER_NAME_TO_CODE: transcription.WHISPER_NAME_TO_CODE,
   settleAiStatus: sttProcessors.settleAiStatus, isDefaultTitle: sttProcessors.isDefaultTitle, DEFAULT_TITLES: sttProcessors.DEFAULT_TITLES,
+  // T-701: media probe.
+  registerMediaProcessors, createProber: probe.createProber, containerOf: probe.containerOf, parseDecodedDuration: probe.parseDecodedDuration,
+  resolveBinaries: mediaExec.resolveBinaries, runTool: mediaExec.run,
+  scratchDir: mediaProcessors.scratchDir, DURATION_GRACE_SEC: mediaProcessors.DURATION_GRACE_SEC, HLS_MIN_DURATION_SEC: mediaProcessors.HLS_MIN_DURATION_SEC,
 };

@@ -240,7 +240,7 @@ function writeWav(file, pattern) {
       const q = mkQueue();
       try {
         await reset({ languages: ['english', 'english', 'english'] });
-        const app = W.createWorkerApp({ config, logger: silent, repositories, jobQueue: q, registry: W.createDefaultRegistry({ maintenance: false }), deps });
+        const app = W.createWorkerApp({ config, logger: silent, repositories, jobQueue: q, registry: W.createDefaultRegistry({ maintenance: false, media: false }), deps });
         await app.start();
         ok(app.status().queues.sort().join() === 'ai,stt', 'the stt/ai processors subscribe to their own queues (isolated from media)');
 
@@ -327,7 +327,7 @@ function writeWav(file, pattern) {
         ok(await until(async () => out.includes(`STARTED ${fj.id}`), 15000), 'the doomed worker took the transcribe job');
         child.kill('SIGKILL');
         await new Promise((r0) => child.once('exit', r0));
-        const app2 = W.createWorkerApp({ config, logger: silent, repositories, jobQueue: mkQueue(), registry: W.createDefaultRegistry({ maintenance: false }), deps });
+        const app2 = W.createWorkerApp({ config, logger: silent, repositories, jobQueue: mkQueue(), registry: W.createDefaultRegistry({ maintenance: false, media: false }), deps });
         await app2.start();
         ok(await until(async () => (await transcript(F) || {}).status === 'done', 25000), 'the surviving worker re-runs the job from scratch and the transcript lands');
         ok((await rowOf(`stt:${F}`)).attempts === 2 && (await repos.transcripts.listSegments((await transcript(F)).id)).length === 3, 'attempts=2, one transcript, full segment set');
