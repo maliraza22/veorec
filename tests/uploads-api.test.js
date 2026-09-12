@@ -77,7 +77,7 @@ const nextId = () => `u${RUN}${(n += 1)}`;
   let txRunner = (fn) => rawTx(fn, db);
 
   const app = express();
-  app.use('/api/v1', createUploadRouter({
+  app.use('/api/v1', createUploadRouter({ rateLimits: { sessions: { max: 100000, windowMs: 3600000 } },
     repositories: (...a) => repoFactory(...a),
     withTransaction: (fn) => txRunner(fn),
     storage: provider,
@@ -409,7 +409,7 @@ const nextId = () => `u${RUN}${(n += 1)}`;
     const brokenProvider = {
       createMultipartUpload: async () => { const e = new Error('down'); e.code = 'provider_unavailable'; e.retryable = true; throw e; },
     };
-    brokenApp.use('/api/v1', createUploadRouter({
+    brokenApp.use('/api/v1', createUploadRouter({ rateLimits: { sessions: { max: 100000, windowMs: 3600000 } },
       repositories: () => createRepositories(db), withTransaction: (fn) => rawTx(fn, db),
       storage: brokenProvider, keys: storagePkg.keys,
       requireAuth: (req, _res, next) => { req.userId = alice; req.id = 'req_t'; next(); },
@@ -431,7 +431,7 @@ const nextId = () => `u${RUN}${(n += 1)}`;
     // Entitlement refuses at completion, with the real size.
     const rec8 = await seedRecording(alice, `rec_${nextId()}`);
     const entApp = express();
-    entApp.use('/api/v1', createUploadRouter({
+    entApp.use('/api/v1', createUploadRouter({ rateLimits: { sessions: { max: 100000, windowMs: 3600000 } },
       repositories: () => createRepositories(db), withTransaction: (fn) => rawTx(fn, db),
       storage: provider, keys: storagePkg.keys,
       requireAuth: (req, _res, next) => { req.userId = alice; req.id = 'req_t'; next(); },
@@ -633,7 +633,7 @@ const nextId = () => `u${RUN}${(n += 1)}`;
     // Plan ceiling below 32 MiB is respected (entitlement, not the protocol constant).
     {
       const tight = express();
-      tight.use('/api/v1', createUploadRouter({
+      tight.use('/api/v1', createUploadRouter({ rateLimits: { sessions: { max: 100000, windowMs: 3600000 } },
         repositories: (...a) => repoFactory(...a), withTransaction: (fn) => txRunner(fn),
         storage: provider, keys: storagePkg.keys,
         requireAuth: (req, res, next) => { req.userId = alice; req.id = 'req_t'; next(); },

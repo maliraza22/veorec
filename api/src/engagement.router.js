@@ -45,11 +45,12 @@ const wireReaction = (r) => ({ id: r.id, emoji: r.emoji, t: num(r.t), at: ms(r.c
  * @param {() => number} [deps.now]
  * @param {object} [deps.logger]
  */
-function createEngagementRouter({ repositories, viewer, accessSecret, ipSalt = 'veorec-view-key', rateLimits = {}, now = () => Date.now(), logger = console }) {
+function createEngagementRouter({ repositories, viewer, accessSecret, ipSalt = 'veorec-view-key', rateLimits = {}, rateStore = null, now = () => Date.now(), logger = console }) {
   const ctx = createWatchContext({ repositories, viewer, accessSecret, now });
   const limits = { ...DEFAULT_LIMITS, ...rateLimits };
-  const limitView = createRateLimiter({ ...limits.view, keyOf: ipOf, now });
-  const limitEngage = createRateLimiter({ ...limits.engage, keyOf: ipOf, now });
+  // T-1304: shared through Redis when a store is given; engagement limits open-fail (docs/17 §5).
+  const limitView = createRateLimiter({ ...limits.view, keyOf: ipOf, now, store: rateStore, scope: 'view', policy: 'open' });
+  const limitEngage = createRateLimiter({ ...limits.engage, keyOf: ipOf, now, store: rateStore, scope: 'engage', policy: 'open' });
   const router = express.Router();
   router.use('/watch/:id', ctx.middleware);
 

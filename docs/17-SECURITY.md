@@ -30,6 +30,8 @@ Central `authorize(actor, action, resource)` (`12` §2); admins from `users.is_a
 
 Auth endpoints, unlock, comments/reactions, views/progress, contact, upload-session creation, AI triggers. 429 + Retry-After. Open-fail policy: if Redis is down, auth limits **closed-fail** (deny over-threshold via local fallback limiter), engagement limits open-fail.
 
+*(T-1304, as implemented: `api/src/rate-limit.js` — **fixed** windows (not sliding) shared through Redis, which is what `08` §1 enumerates; `policy:'closed'` limiters (unlock, upload sessions, AI triggers; auth follows with T-1302) fall back to the per-process window on a Redis error and keep denying over the threshold, `policy:'open'` limiters (watch, view, engage, lead) allow and mark the decision `degraded`; the outage is logged once a minute. The store is built once per API process from `REDIS_URL` (`server/index.js`) and handed to every limited router; tests exercise two limiter instances on one Redis budget, window expiry, TTL healing and both failure policies (`tests/rate-limit.test.js`).)*
+
 ## 6. Upload security
 
 - Presigned PUT URLs: 1h TTL, bound to exact key + part number + content checksum (`x-amz-checksum-crc32c`); sessions owned per user; part size/count caps (10k parts, plan-derived total size ceiling at complete).

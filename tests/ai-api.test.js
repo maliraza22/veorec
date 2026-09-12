@@ -69,7 +69,7 @@ const silent = { info() {}, warn() {}, error() {}, debug() {} };
     req.userId = currentUser; req.id = 'req_test'; next();
   };
   const entitlements = { isFeatureEnabled: async (f) => !!features[f] };
-  app.use('/api/v1', createAiRouter({ repositories, withTransaction, requireAuth, entitlements, configured: () => configured, logger: silent }));
+  app.use('/api/v1', createAiRouter({ rateLimits: { ai: { max: 100000, windowMs: 3600000 } }, repositories, withTransaction, requireAuth, entitlements, configured: () => configured, logger: silent }));
   const server = app.listen(0, '127.0.0.1');
   await new Promise((r) => server.once('listening', r));
   const base = `http://127.0.0.1:${server.address().port}/api/v1`;
@@ -213,7 +213,7 @@ const silent = { info() {}, warn() {}, error() {}, debug() {} };
       let autoOn = true, canT = true, canDocs = false;
       const upApp = express();
       upApp.use(express.json());
-      upApp.use('/api/v1', createUploadRouter({
+      upApp.use('/api/v1', createUploadRouter({ rateLimits: { sessions: { max: 100000, windowMs: 3600000 } },
         repositories, withTransaction, storage: provider, keys: storagePkg.keys, requireAuth, logger: silent,
         autoProcess: { enabled: () => autoOn, transcriptionEnabled: async () => canT, aiDocsEnabled: async () => canDocs },
       }));

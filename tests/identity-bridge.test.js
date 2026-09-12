@@ -73,7 +73,7 @@ const nextLegacyId = () => `8332889e-a1e9-45de-9eb9-${RUN}${String(n += 1).padSt
   let storagePkg = null;
   if (storageUp) {
     storagePkg = require(path.join(ROOT, 'storage', 'src', 'index.js'));
-    app.use('/api/v1', createUploadRouter({
+    app.use('/api/v1', createUploadRouter({ rateLimits: { sessions: { max: 100000, windowMs: 3600000 } },
       repositories: () => createRepositories(db), withTransaction: rawTx,
       storage: storagePkg.createStorageProvider({ appEnv: 'test' }),
       keys: storagePkg.keys, requireAuth: auth,

@@ -55,17 +55,18 @@ const DEFAULT_LIMITS = {
  * @param {() => number} [deps.now]
  * @param {object} [deps.logger]
  */
-function createWatchRouter({ repositories, storage, keys, viewer, accessSecret, verifyPassword = authz.createPasswordVerifier(), configured = () => false, publicBaseUrl = null, rateLimits = {}, now = () => Date.now(), logger = console }) {
+function createWatchRouter({ repositories, storage, keys, viewer, accessSecret, verifyPassword = authz.createPasswordVerifier(), configured = () => false, publicBaseUrl = null, rateLimits = {}, rateStore = null, now = () => Date.now(), logger = console }) {
   if (!storage || typeof storage.getSignedDownloadUrl !== 'function' || typeof storage.getObjectBuffer !== 'function') throw new Error('createWatchRouter: storage with getSignedDownloadUrl/getObjectBuffer is required');
   if (!keys || typeof keys.hlsSegment !== 'function') throw new Error('createWatchRouter: keys is required');
   if (typeof viewer !== 'function') throw new Error('createWatchRouter: viewer(req) resolver is required');
   if (!accessSecret || String(accessSecret).length < 16) throw new Error('createWatchRouter: accessSecret (≥ 16 chars) is required');
 
   const limits = { ...DEFAULT_LIMITS, ...rateLimits };
+  // T-1304: one budget across API instances when a shared store is given (open-fail: docs/17 §5).
   const limiter = {
-    watch: createRateLimiter({ ...limits.watch, keyOf: ipOf, now }),
-    unlock: createRateLimiter({ ...limits.unlock, keyOf: ipOf, now, name: 'rate_limited' }),
-    lead: createRateLimiter({ ...limits.lead, keyOf: ipOf, now }),
+    watch: createRateLimiter({ ...limits.watch, keyOf: ipOf, now, store: rateStore, scope: 'watch', policy: 'open' }),
+    unlock: createRateLimiter({ ...limits.unlock, keyOf: ipOf, now, name: 'rate_limited', store: rateStore, scope: 'unlock', policy: 'closed' }),
+    lead: createRateLimiter({ ...limits.lead, keyOf: ipOf, now, store: rateStore, scope: 'lead', policy: 'open' }),
   };
   const router = express.Router();
 

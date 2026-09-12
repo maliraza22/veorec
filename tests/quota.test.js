@@ -111,7 +111,7 @@ const LEGACY = plans.limitsFor(plans.getPlan('free'), {});
   };
   const quiet = { info() {}, warn() {}, error() {}, debug() {} };
   const app = express();
-  app.use('/api/v1', createUploadRouter({ repositories, withTransaction, storage: provider, keys: storagePkg.keys, requireAuth, logger: quiet, quota }));
+  app.use('/api/v1', createUploadRouter({ rateLimits: { sessions: { max: 100000, windowMs: 3600000 } }, repositories, withTransaction, storage: provider, keys: storagePkg.keys, requireAuth, logger: quiet, quota }));
   app.use('/api/v1', createRecordingsRouter({ repositories, withTransaction, storage: provider, requireAuth, logger: quiet }));
   app.use('/api/v1', createMeRouter({ repositories, requireAuth, quota, logger: quiet }));
   const server = await new Promise((r) => { const s = app.listen(0, '127.0.0.1', () => r(s)); });

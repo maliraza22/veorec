@@ -403,7 +403,7 @@ app.get('/api/client-config/public', (req, res) => {
 // every current client uses.
 if (process.env.V1_UPLOAD_API === 'true') {
   try {
-    const { createUploadRouter, createRecordingsRouter, createMeRouter, createAdminJobsRouter, createAiRouter, createWatchRouter, createFoldersRouter, createNotificationsRouter, createSharingRouter, createEngagementRouter, createAnalyticsRouter, createEditingRouter, authz: v1authz, createQuota } = require('../api/src/index.js');
+    const { createUploadRouter, createRecordingsRouter, createMeRouter, createAdminJobsRouter, createAiRouter, createWatchRouter, createFoldersRouter, createNotificationsRouter, createSharingRouter, createEngagementRouter, createAnalyticsRouter, createEditingRouter, authz: v1authz, createQuota , createRedisRateStore } = require('../api/src/index.js');
     const { repositories, withTransaction } = require('../db/src/index.js');
     const storagePkg = require('../storage/src/index.js');
     // T-306: the quota ledger. Limits come from the ONE plan catalog
@@ -416,7 +416,17 @@ if (process.env.V1_UPLOAD_API === 'true') {
       resolveLimits: (r) => plans.limitsFor(entitlements.resolve(users.findById(r.legacyUserId || r.userId))),
       logger,
     });
+    // T-1304: rate limits share one Redis budget across API instances when
+    // REDIS_URL is set (docs/08 §1, docs/17 §5); without it the per-process
+    // window applies (exact on a single instance). Auth/upload/AI limits
+    // closed-fail, engagement/watch limits open-fail when Redis is unreachable.
+    let rateStore = null;
+    if (process.env.REDIS_URL) {
+      try { rateStore = createRedisRateStore({ redisUrl: process.env.REDIS_URL, prefix: (process.env.QUEUE_PREFIX ? process.env.QUEUE_PREFIX + ':' : '') + 'rl:', logger }); logger.info({ redis: true }, 'T-1304: rate limits on the shared Redis store'); }
+      catch (e) { logger.warn({ err: e && e.message }, 'T-1304: shared rate-limit store unavailable — per-process windows'); }
+    }
     app.use('/api/v1', createUploadRouter({
+      rateStore,
       repositories, withTransaction,
       storage: storagePkg.storageProvider(),
       keys: storagePkg.keys,
@@ -470,6 +480,7 @@ if (process.env.V1_UPLOAD_API === 'true') {
     // legacy permission checks (the entitlement source during the migration
     // window); `configured` mirrors the legacy transcription.isConfigured().
     app.use('/api/v1', createAiRouter({
+      rateStore,
       repositories, withTransaction, requireAuth, logger,
       configured: () => transcription.isConfigured(),
       entitlements: {
@@ -554,10 +565,12 @@ if (process.env.V1_UPLOAD_API === 'true') {
       // reactions through the same watch authorisation. Anonymous IPs are
       // stored only as a salted daily hash.
       app.use('/api/v1', createEngagementRouter({
+        rateStore,
         repositories, logger, accessSecret: watchSecret, viewer: watchViewer,
         ipSalt: process.env.VIEW_KEY_SALT || crypto.createHash('sha256').update('veorec-view-key:' + watchSecret).digest('hex'),
       }));
       app.use('/api/v1', createWatchRouter({
+        rateStore,
         repositories, logger,
         storage: storagePkg.storageProvider(), keys: storagePkg.keys,
         accessSecret: watchSecret,

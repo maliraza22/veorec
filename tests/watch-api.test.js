@@ -94,9 +94,9 @@ const near = (a, b, tol) => Math.abs(a - b) <= tol;
     ok(threw, 'a playlist referencing an unexpected path is refused rather than resolved');
     ok(safeFilename('My video: "final" (v2)') === 'My video final v2' && safeFilename('') === 'video' && safeFilename('x'.repeat(200)).length === 80, 'download filenames are sanitised');
     let c = 0; const lim = createRateLimiter({ max: 2, windowMs: 1000, keyOf: (r) => r.ip, now: () => c });
-    const rr = lim.hit('1.1.1.1'); const r2 = lim.hit('1.1.1.1'); const r3 = lim.hit('1.1.1.1'); const other = lim.hit('2.2.2.2');
+    const rr = await lim.hit('1.1.1.1'); const r2 = await lim.hit('1.1.1.1'); const r3 = await lim.hit('1.1.1.1'); const other = await lim.hit('2.2.2.2');
     ok(rr.allowed && r2.allowed && !r3.allowed && r3.retryAfterSec === 1 && other.allowed, 'fixed-window limiter: max per key per window, Retry-After in seconds');
-    c = 1001; ok(lim.hit('1.1.1.1').allowed, 'a new window resets the key');
+    c = 1001; ok((await lim.hit('1.1.1.1')).allowed, 'a new window resets the key');
   }
 
   // ── infrastructure ──────────────────────────────────────────────────────

@@ -94,7 +94,13 @@ function createUploadRouter(deps) {
     // T-301 `entitlements` seam applies unchanged — so the router is usable
     // (and its earlier suites hold) without a ledger.
     quota = null,
+    // T-1304: upload-session creation is rate-limited per USER (docs/08 §1:
+    // 10/h) on the shared store when one is given; closed-fail (docs/17 §5).
+    rateLimits = {},
+    rateStore = null,
   } = deps;
+  const { createRateLimiter, userOf } = require('./rate-limit');
+  const sessionLimiter = createRateLimiter({ max: 10, windowMs: 60 * 60 * 1000, ...(rateLimits.sessions || {}), keyOf: userOf, name: 'rate_limited', scope: 'upload_sessions', store: rateStore, policy: 'closed' });
 
   const router = express.Router();
   router.use(express.json({ limit: '1mb' }));   // manifests only — never bytes
@@ -106,7 +112,7 @@ function createUploadRouter(deps) {
 
 
   // ── POST /uploads — create (or replay) a session ──────────────────────────
-  router.post('/uploads', asyncRoute(async (req, res) => {
+  router.post('/uploads', sessionLimiter.middleware, asyncRoute(async (req, res) => {
     const scope = scopeOf(req);
     const repos = repositories();
     const { recordingId, mimeType, sizeBytes } = req.body || {};

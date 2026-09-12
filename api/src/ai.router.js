@@ -59,11 +59,16 @@ function transcriptBody(t, segments, configured) {
  * @param {() => boolean} [deps.configured]  is an STT provider configured (docs/15 §1)
  * @param {object} [deps.logger]
  */
-function createAiRouter({ repositories, withTransaction, requireAuth, entitlements, configured = () => false, logger = console }) {
+function createAiRouter({ repositories, withTransaction, requireAuth, entitlements, configured = () => false, rateLimits = {}, rateStore = null, logger = console }) {
   if (!entitlements || typeof entitlements.isFeatureEnabled !== 'function') throw new Error('createAiRouter: entitlements.isFeatureEnabled is required');
   const router = express.Router();
   router.use('/recordings', requireAuth);
   router.use('/recordings', createIdentityBridge({ repositories, logger }));
+  // T-1304: AI triggers are rate-limited per USER (docs/08 §1: 10/h) on the
+  // shared store when one is given; closed-fail (docs/17 §5). Reads are free.
+  const { createRateLimiter, userOf } = require('./rate-limit');
+  const aiLimiter = createRateLimiter({ max: 10, windowMs: 60 * 60 * 1000, ...(rateLimits.ai || {}), keyOf: userOf, name: 'rate_limited', scope: 'ai_triggers', store: rateStore, policy: 'closed' });
+  router.post(['/recordings/:id/transcribe', '/recordings/:id/transcript/translate', '/recordings/:id/title/auto', '/recordings/:id/summary', '/recordings/:id/chapters', '/recordings/:id/reprocess'], aiLimiter.middleware);
 
   async function mustGet(repos, scope, id) {
     const r = await repos.recordings.get(scope, id);

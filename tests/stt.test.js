@@ -240,7 +240,7 @@ function writeWav(file, pattern) {
       const q = mkQueue();
       try {
         await reset({ languages: ['english', 'english', 'english'] });
-        const app = W.createWorkerApp({ config, logger: silent, repositories, jobQueue: q, registry: W.createDefaultRegistry({ maintenance: false, media: false }), deps });
+        const app = W.createWorkerApp({ config, logger: silent, repositories, jobQueue: q, registry: W.createDefaultRegistry({ maintenance: false, media: false, editing: false }), deps });
         await app.start();
         ok(app.status().queues.sort().join() === 'ai,stt', 'the stt/ai processors subscribe to their own queues (isolated from media)');
 
