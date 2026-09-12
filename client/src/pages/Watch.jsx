@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef, useMemo } from 'react';
+import React, { useEffect, useState, useRef, useMemo, useCallback } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
 import { Scissors, Sparkles, Link2, Download, Settings as SettingsIcon,
   Activity as ActivityIcon, Pencil, Code2, Crown, Share2, Check,
@@ -9,7 +9,30 @@ import styles from './Watch.module.css';
 import API from '../api';
 import { useAuth } from '../AuthContext';
 import { useBilling } from '../hooks/useBilling';
+import { useToast } from '../components/Toast';
 import VideoPlayer from '../components/VideoPlayer';
+import { createWatchClient, fetchWatchConfig, watchIsV1, stateFor } from '../lib/watchApi.mjs';
+import { useWatchMedia } from './watch/useWatchMedia';
+import { useStatusPolling } from './watch/useStatusPolling';
+import { ProcessingPanel, FailedPanel, NotFoundPanel, LoadingPanel, LoginGate, LinkExpiredPanel, ErrorPanel, PasswordGate, EmailGate, PlaybackErrorPanel } from './watch/Panels';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// T-802 — WatchPage (docs/11 §1–§8).
+//
+// Page state is DRIVEN BY THE API: the payload's `status` and the gates the
+// server answers decide what renders. The two legacy hacks are gone — the
+// 6×1.5 s 404 retry loop (Cloudinary index lag) and the blind 12 s "video
+// ready" timeout. Their only surviving trace is guarded behind
+// `rec.source === 'legacy'`: a legacy recording (JSON store + Cloudinary) is
+// still played through the legacy rule until the T-204 backfill moves it, and
+// only there is media readiness a guess.
+//
+// Owner/engagement write endpoints follow the source: a v1 recording talks to
+// /api/v1/*, a legacy one to the untouched legacy routes. Engagement (views,
+// comments, reactions, progress) has no v1 endpoints until Phase 10, so it is
+// legacy-only for now and hidden on v1 recordings rather than pointed at
+// routes that do not exist.
+// ─────────────────────────────────────────────────────────────────────────────
 
 const REACTIONS = ['👍', '❤️', '😂', '🎉', '🔥', '👏'];
 
@@ -85,30 +108,101 @@ function authHeaders() {
   const t = localStorage.getItem('sr_token');
   return t ? { Authorization: `Bearer ${t}` } : {};
 }
+/** The nested v1 error contract or the flat legacy one → one message. */
+function errMessage(d, fallback) {
+  if (!d) return fallback;
+  if (d.error && typeof d.error === 'object') return d.error.message || fallback;
+  if (typeof d.error === 'string') return d.error;
+  return fallback;
+}
+const errCode = (d) => (d && d.error && typeof d.error === 'object') ? d.error.code : (d && d.code) || null;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** SEO/meta (docs/11 §8): title always; og:image only when the video is public/unlisted. */
+function setMeta(rec, posterUrl) {
+  if (typeof document === 'undefined') return;
+  document.title = rec && rec.title ? `${rec.title} · VeoRec` : 'VeoRec';
+  const upsert = (prop, content) => {
+    let el = document.head.querySelector(`meta[property="${prop}"]`);
+    if (!content) { if (el) el.remove(); return; }
+    if (!el) { el = document.createElement('meta'); el.setAttribute('property', prop); document.head.appendChild(el); }
+    el.setAttribute('content', content);
+  };
+  const open = rec && (rec.privacy === 'public' || rec.privacy === 'unlisted');
+  upsert('og:title', rec ? rec.title : null);
+  upsert('og:image', open ? posterUrl : null);
+  upsert('og:type', rec ? 'video.other' : null);
+}
 
 export default function Watch() {
   const { id } = useParams();
   const { user, logout } = useAuth();
   const { isPaid } = useBilling();   // reflect the viewer's real plan in the UI
   const navigate = useNavigate();
+  const toast = useToast();
   const videoRef = useRef(null);
 
+  // ── data layer ──────────────────────────────────────────────────────────
+  const shareToken = useMemo(() => { const q = new URLSearchParams(window.location.search); return q.get('s') || q.get('shareToken') || null; }, []);
+  const client = useMemo(() => createWatchClient({ API, id, authHeaders, shareToken }), [id, shareToken]);
   const [rec, setRec] = useState(null);
-  const [state, setState] = useState('loading'); // loading | ok | notfound | login | password
-  const [pw, setPw] = useState('');
+  const [pageState, setPageState] = useState('loading'); // loading | ready | processing | failed | login_gate | password_gate | email_gate | link_expired | not_found | error
+  const [gateTitle, setGateTitle] = useState('');
+  const [loadError, setLoadError] = useState('');
   const [pwErr, setPwErr] = useState('');
+  const [pwBusy, setPwBusy] = useState(false);
+  const [leadBusy, setLeadBusy] = useState(false);
+  const [leadErr, setLeadErr] = useState('');
+  const [playbackError, setPlaybackError] = useState(null);
+  const [retrying, setRetrying] = useState(false);
+  const [reloadKey, setReloadKey] = useState(0);
+
+  const isV1 = !!rec && rec.source === 'v1';
+  const isLegacy = !!rec && rec.source === 'legacy';
+
+  const applyRec = useCallback((next) => { setRec(next); setPageState(stateFor(next)); }, []);
+
+  // Load: the server's decision, then ONE deterministic request (docs/11 §1).
+  useEffect(() => {
+    let alive = true;
+    setPageState('loading'); setRec(null); setLoadError('');
+    (async () => {
+      try {
+        const cfg = await fetchWatchConfig({ API });
+        const r = await client.load({ useV1: watchIsV1(cfg) });
+        if (!alive) return;
+        if (r.gate) { setGateTitle(r.gate.title || ''); setPageState(r.gate.state); setLoadError(r.gate.state === 'error' ? 'The server could not load this video.' : ''); return; }
+        applyRec(r.rec);
+        if (r.rec.source === 'legacy') afterLoadLegacy();
+      } catch (e) { if (alive) { setPageState('error'); setLoadError('Network error — please check your connection.'); } }
+    })();
+    return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [client, reloadKey]);
+
+  // Processing → ready/failed is a fact the server reports (polled, backed off).
+  const { jobs } = useStatusPolling({ client, rec, API, authHeaders, enabled: pageState === 'processing', onUpdate: applyRec });
+
+  // Media URLs (signed, refreshed before expiry) once the page is ready.
+  const { media, gate: mediaGate, onNeedRefresh, reload: reloadMedia } = useWatchMedia({ client, rec, enabled: pageState === 'ready' });
+  useEffect(() => {
+    if (!mediaGate) return;
+    if (mediaGate.state === 'email_gate') return;            // rendered over the player
+    if (mediaGate.state === 'error') { toast.error('Could not load the video right now.'); return; }
+    setGateTitle(rec ? rec.title : ''); setPageState(mediaGate.state);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mediaGate]);
+  useEffect(() => { setMeta(rec, media ? media.posterUrl : null); }, [rec, media]);
+  useEffect(() => { setPlaybackError(null); }, [media]);
+
+  // ── UI state (unchanged features) ───────────────────────────────────────
   const [copied, setCopied] = useState('');
-  const [videoReady, setVideoReady] = useState(false); // player can actually play
   const [menuOpen, setMenuOpen] = useState(false);   // header "more" (⋯) menu
   const [avatarOpen, setAvatarOpen] = useState(false); // account dropdown
   const [viewsOpen, setViewsOpen] = useState(false);   // views/insights popup
   const [viewers, setViewers] = useState(null);        // analytics viewers list
-  const [engagement, setEngagement] = useState(null);  // {avgViewThrough, completionRate, samples}
+  const [engagementStats, setEngagementStats] = useState(null);  // {avgViewThrough, completionRate, samples}
   const [leads, setLeads] = useState(null);            // captured viewer emails (owner)
-  const [leadGiven, setLeadGiven] = useState(false);   // this viewer cleared the email gate
-  const [leadEmail, setLeadEmail] = useState('');
-  const [leadName, setLeadName] = useState('');
-  const [leadBusy, setLeadBusy] = useState(false);
   const [settingsSub, setSettingsSub] = useState('audience'); // Settings: 'audience' | 'enhancements'
   const [summaryDraft, setSummaryDraft] = useState(null);     // editable Summary (owner)
   const [tagInput, setTagInput] = useState('');
@@ -119,7 +213,6 @@ export default function Watch() {
   const [commentText, setCommentText] = useState('');
   const [commentName, setCommentName] = useState('');
   const [atTime, setAtTime] = useState(true);
-  const [dur, setDur] = useState(0);                // real video duration (s)
   const [isOwner, setIsOwner] = useState(false);    // show owner-only panels
   const [canTranscribe, setCanTranscribe] = useState(true); // plan allows transcription
   const [renaming, setRenaming] = useState(false);
@@ -154,8 +247,22 @@ export default function Watch() {
   const [videoTime, setVideoTime] = useState(0);
   const activeSegRef = useRef(null);
 
-  // Determine ownership (owner-only endpoint 200s only for the owner).
+  // Engagement routes exist only on the legacy API until Phase 10.
+  const engagementAvailable = isLegacy;
+
+  // Owner detection: explicit on the v1 payload (docs/11 §4); the legacy
+  // probe (owner-only endpoint 200s only for the owner) stays for legacy rows.
   useEffect(() => {
+    if (!rec) { setIsOwner(false); return; }
+    if (rec.source === 'v1') {
+      setIsOwner(!!(rec.viewer && rec.viewer.isOwner));
+      if (rec.viewer && rec.viewer.isOwner && user) {
+        fetch(`${API}/api/v1/recordings/${id}`, { headers: authHeaders() })
+          .then(async r => { if (r.ok) { const d = await r.json().catch(() => ({})); setCanTranscribe(d.canTranscribe !== false); } })
+          .catch(() => {});
+      }
+      return;
+    }
     if (!user) { setIsOwner(false); return; }
     fetch(`${API}/api/recordings/${id}`, { headers: authHeaders() })
       .then(async r => {
@@ -163,39 +270,45 @@ export default function Watch() {
         if (r.ok) { const d = await r.json().catch(() => ({})); setCanTranscribe(d.canTranscribe !== false); }
       })
       .catch(() => setIsOwner(false));
-  }, [user, id]);
+  }, [user, id, rec]);
 
+  useEffect(() => { setViews(rec ? rec.views || 0 : 0); }, [rec && rec.id, rec && rec.views]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { if (isOwner && !tabTouched) setTab('edit'); }, [isOwner, tabTouched]);
 
-  // Owner's folders for the ⋯ → "Move to folder" submenu.
+  // Owner's folders for the ⋯ → "Move to folder" submenu (legacy library only).
   useEffect(() => {
-    if (!isOwner) return;
+    if (!isOwner || !isLegacy) return;
     fetch(`${API}/api/folders`, { headers: authHeaders() })
       .then(r => (r.ok ? r.json() : [])).then(d => setFolders(Array.isArray(d) ? d : [])).catch(() => {});
-  }, [isOwner]);
+  }, [isOwner, isLegacy]);
 
   function selectTab(t) { setTabTouched(true); setTab(t); }
+
+  // ── owner writes: follow the source ─────────────────────────────────────
+  const recBase = () => (isV1 ? `${API}/api/v1/recordings/${id}` : `${API}/api/recordings/${id}`);
 
   async function saveRename() {
     const title = (renameVal || '').trim();
     if (!title) { setRenaming(false); return; }
-    const res = await fetch(`${API}/api/recordings/${id}`, {
+    const res = await fetch(recBase(), {
       method: 'PATCH', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ title }),
     });
-    if (res.ok) { const d = await res.json().catch(() => ({})); setRec((r) => ({ ...r, title: d.title || title })); setRenaming(false); }
-    else { const d = await res.json().catch(() => ({})); alert(d.error || 'Could not rename'); }
+    const d = await res.json().catch(() => ({}));
+    if (res.ok) { setRec((r) => ({ ...r, title: d.title || title })); setRenaming(false); }
+    else toast.error(errMessage(d, 'Could not rename'));
   }
 
   async function deleteVideo() {
     if (!window.confirm('Delete this video permanently? This can’t be undone.')) return;
-    const res = await fetch(`${API}/api/recordings/${id}`, { method: 'DELETE', headers: authHeaders() });
-    if (res.ok) navigate('/'); else alert('Could not delete this video.');
+    const res = await fetch(recBase(), { method: 'DELETE', headers: authHeaders() });
+    if (res.ok) navigate('/'); else toast.error('Could not delete this video.');
   }
   async function duplicateVideo() {
     setMenuOpen(false);
+    if (!isLegacy) { toast.info('Duplicating is coming to migrated recordings soon.'); return; }
     const res = await fetch(`${API}/api/recordings/${id}/duplicate`, { method: 'POST', headers: authHeaders() });
     const d = await res.json().catch(() => ({}));
-    if (res.ok && d.id) navigate(`/watch/${d.id}`); else alert(d.error || 'Could not duplicate this video.');
+    if (res.ok && d.id) navigate(`/watch/${d.id}`); else toast.error(errMessage(d, 'Could not duplicate this video.'));
   }
   function openCommentDock() {
     try { videoRef.current?.pause(); } catch {}
@@ -210,30 +323,29 @@ export default function Watch() {
     });
     const c = await res.json().catch(() => ({}));
     if (res.ok && c.id) { setComments(cs => [...cs, c]); setCommentText(''); setCommentDockOpen(false); }
-    else alert(c.error || 'Could not post comment.');
+    else toast.error(errMessage(c, 'Could not post comment.'));
   }
   function loadViewers() {
+    if (!isLegacy) { setViewers([]); return; }
     fetch(`${API}/api/recordings/${id}/analytics`, { headers: authHeaders() })
       .then(r => (r.ok ? r.json() : null))
-      .then(d => { setViewers(Array.isArray(d?.viewers) ? d.viewers : []); setEngagement(d?.engagement || null); setLeads(Array.isArray(d?.leads) ? d.leads : []); })
+      .then(d => { setViewers(Array.isArray(d?.viewers) ? d.viewers : []); setEngagementStats(d?.engagement || null); setLeads(Array.isArray(d?.leads) ? d.leads : []); })
       .catch(() => setViewers([]));
   }
 
-  async function submitLead(e) {
-    e.preventDefault();
-    const email = leadEmail.trim();
-    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return;
-    setLeadBusy(true);
+  // The email gate: the server issues the access grant (docs/12 §6); we keep it for the session.
+  async function submitLead({ email, name }) {
+    setLeadBusy(true); setLeadErr('');
     try {
-      await fetch(`${API}/api/watch/${id}/lead`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() },
-        body: JSON.stringify({ email, name: leadName }),
-      });
-      try { sessionStorage.setItem('veorec_lead_' + id, '1'); } catch {}
-      setLeadGiven(true);
-    } catch {}
+      const r = await client.lead({ email, name });
+      if (!r.ok) { setLeadErr(r.error || 'Could not submit.'); return; }
+      if (isLegacy) { try { sessionStorage.setItem('veorec_lead_' + id, '1'); } catch {} setLegacyLeadGiven(true); }
+      else applyRec({ ...rec, requiresEmail: false });   // → 'ready': the media hook loads the now-permitted URLs
+    } catch { setLeadErr('Network error — please try again.'); }
     finally { setLeadBusy(false); }
   }
+  const [legacyLeadGiven, setLegacyLeadGiven] = useState(false);
+  useEffect(() => { try { if (sessionStorage.getItem('veorec_lead_' + id)) setLegacyLeadGiven(true); } catch {} }, [id]);
 
   function shareGmail() {
     setMenuOpen(false);
@@ -244,6 +356,7 @@ export default function Watch() {
 
   async function shareSlack() {
     setMenuOpen(false);
+    if (!isLegacy) { toast.info('Slack sharing is coming to migrated recordings soon.'); return; }
     const post = () => fetch(`${API}/api/recordings/${id}/share/slack`, { method: 'POST', headers: authHeaders() });
     let res = await post();
     let d = await res.json().catch(() => ({}));
@@ -254,52 +367,70 @@ export default function Watch() {
       const save = await fetch(`${API}/api/auth/profile`, {
         method: 'PATCH', headers: { 'Content-Type': 'application/json', ...authHeaders() }, body: JSON.stringify({ slackWebhook: url.trim() }),
       });
-      if (!save.ok) { const e = await save.json().catch(() => ({})); alert(e.error || 'Could not save the webhook.'); return; }
+      if (!save.ok) { const e = await save.json().catch(() => ({})); toast.error(errMessage(e, 'Could not save the webhook.')); return; }
       res = await post();
       if (res.ok) { setCopied('slack'); setTimeout(() => setCopied(''), 2500); return; }
       d = await res.json().catch(() => ({}));
     }
-    alert(d.error || 'Could not send to Slack.');
+    toast.error(errMessage(d, 'Could not send to Slack.'));
   }
 
-  async function autoTitle() {
-    setAutoTitling(true);
-    try {
-      const res = await fetch(`${API}/api/recordings/${id}/title/auto`, { method: 'POST', headers: authHeaders() });
-      const d = await res.json().catch(() => ({}));
-      if (res.ok && d.title) { setRec(r => ({ ...r, title: d.title })); if (d.transcriptGenerated) setTranscript(null); }
-      else if (d.code === 'feature_locked') { setCanTranscribe(false); selectTab('transcript'); }
-      else alert(d.error || 'Could not generate a title.');
-    } catch { alert('Network error — please try again.'); }
-    finally { setAutoTitling(false); }
+  // v1 AI actions are ASYNC (202): poll the payload until ai_status settles.
+  async function waitForAi({ maxMs = 180000 } = {}) {
+    const started = Date.now();
+    while (Date.now() - started < maxMs) {
+      await sleep(3000);
+      const next = await client.poll();
+      if (!next) continue;
+      if (next.ai_status !== 'queued' && next.ai_status !== 'running') { setRec((r) => ({ ...r, ...next, viewer: r.viewer })); return next; }
+    }
+    return null;
   }
-
-  async function aiSummary() {
-    setSummarizing(true);
+  async function aiAction({ kind, path, setBusy, onDone, defaultErr }) {
+    setBusy(true);
     try {
-      const res = await fetch(`${API}/api/recordings/${id}/summary`, { method: 'POST', headers: authHeaders() });
+      const res = await fetch(isV1 ? `${API}/api/v1/recordings/${id}/${path}` : `${API}/api/recordings/${id}/${path}`, { method: 'POST', headers: authHeaders() });
       const d = await res.json().catch(() => ({}));
-      if (res.ok && d.summary) { setRec(r => ({ ...r, description: d.summary })); setSummaryDraft(d.summary); }
-      else if (d.code === 'feature_locked') { setCanTranscribe(false); selectTab('transcript'); }
-      else alert(d.error || 'Could not generate a summary.');
-    } catch { alert('Network error — please try again.'); }
-    finally { setSummarizing(false); }
+      if (!res.ok) {
+        if (errCode(d) === 'feature_locked') { setCanTranscribe(false); selectTab('transcript'); return; }
+        if (errCode(d) === 'transcript_required') { toast.info('Generate a transcript first — it powers this.'); selectTab('transcript'); return; }
+        toast.error(errMessage(d, defaultErr)); return;
+      }
+      if (isV1 && res.status === 202) {
+        toast.info(`${kind} is being generated — this takes a moment.`);
+        const next = await waitForAi();
+        if (!next) toast.error(`${kind} is taking longer than expected. It will appear when ready.`);
+        else if (next.ai_status === 'failed') toast.error(`${kind} could not be generated.`);
+        else { onDone(null, next); toast.success(`${kind} ready.`); }
+        return;
+      }
+      onDone(d, null);
+    } catch { toast.error('Network error — please try again.'); }
+    finally { setBusy(false); }
   }
+  const autoTitle = () => aiAction({ kind: 'Title', path: 'title/auto', setBusy: setAutoTitling, defaultErr: 'Could not generate a title.',
+    onDone: (d) => { if (d && d.title) { setRec(r => ({ ...r, title: d.title })); if (d.transcriptGenerated) setTranscript(null); } } });
+  const aiSummary = () => aiAction({ kind: 'Summary', path: 'summary', setBusy: setSummarizing, defaultErr: 'Could not generate a summary.',
+    onDone: (d, next) => { const text = d ? d.summary : (next ? next.description : null); if (text) { setRec(r => ({ ...r, description: text })); setSummaryDraft(text); } } });
+  const genChapters = () => aiAction({ kind: 'Chapters', path: 'chapters', setBusy: setChaptering, defaultErr: 'Could not generate chapters.',
+    onDone: (d, next) => { const ch = d ? d.chapters : (next ? next.chapters : null); if (Array.isArray(ch)) setRec(r => ({ ...r, chapters: ch })); } });
 
   async function removeSilences() {
+    if (!isLegacy) { toast.info('Silence removal is coming to migrated recordings soon.'); return; }
     setDesilencing(true);
     try {
       const res = await fetch(`${API}/api/recordings/${id}/remove-silences`, { method: 'POST', headers: authHeaders() });
       const d = await res.json().catch(() => ({}));
       if (res.ok && d.segments) {
         setRec(r => ({ ...r, segments: d.segments }));
-        alert(`Removed ~${d.removedSeconds}s of silence (kept ${d.keptSeconds}s). The player now skips the quiet gaps — open “Edit & trim video” to save it permanently.`);
-      } else alert(d.error || 'Could not remove silences.');
-    } catch { alert('Network error — please try again.'); }
+        toast.success(`Removed ~${d.removedSeconds}s of silence (kept ${d.keptSeconds}s). The player now skips the quiet gaps — open “Edit & trim video” to save it permanently.`, { ttl: 8000 });
+      } else toast.error(errMessage(d, 'Could not remove silences.'));
+    } catch { toast.error('Network error — please try again.'); }
     finally { setDesilencing(false); }
   }
 
   function openCombine() {
+    if (!isLegacy) { toast.info('Combining is coming to migrated recordings soon.'); return; }
     setCombineOpen(o => !o);
     if (myVideos == null) {
       fetch(`${API}/api/recordings`, { headers: authHeaders() })
@@ -321,21 +452,9 @@ export default function Watch() {
       });
       const d = await res.json().catch(() => ({}));
       if (res.ok && d.id) navigate(`/watch/${d.id}`);
-      else alert(d.error || 'Could not combine the videos.');
-    } catch { alert('Network error — please try again.'); }
+      else toast.error(errMessage(d, 'Could not combine the videos.'));
+    } catch { toast.error('Network error — please try again.'); }
     finally { setCombining(false); }
-  }
-
-  async function genChapters() {
-    setChaptering(true);
-    try {
-      const res = await fetch(`${API}/api/recordings/${id}/chapters`, { method: 'POST', headers: authHeaders() });
-      const d = await res.json().catch(() => ({}));
-      if (res.ok && Array.isArray(d.chapters)) setRec(r => ({ ...r, chapters: d.chapters }));
-      else if (d.code === 'feature_locked') { setCanTranscribe(false); selectTab('transcript'); }
-      else alert(d.error || 'Could not generate chapters.');
-    } catch { alert('Network error — please try again.'); }
-    finally { setChaptering(false); }
   }
 
   async function translateTo(lang) {
@@ -343,32 +462,34 @@ export default function Watch() {
     if (lang === 'Original') { setTranslated(null); return; }
     setTranslating(true);
     try {
-      const res = await fetch(`${API}/api/recordings/${id}/transcript/translate`, {
-        method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ lang }),
-      });
-      const d = await res.json().catch(() => ({}));
+      const code = isV1 ? ((LANGUAGES.find(l => l.name === lang) || {}).code || lang) : lang;
+      const url = isV1 ? `${API}/api/v1/recordings/${id}/transcript/translate` : `${API}/api/recordings/${id}/transcript/translate`;
+      const call = () => fetch(url, { method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ lang: code }) });
+      let res = await call();
+      let d = await res.json().catch(() => ({}));
+      if (isV1 && res.status === 202) {
+        // Queued: the same endpoint answers with the cached translation once the worker is done.
+        const started = Date.now();
+        while (Date.now() - started < 180000) { await sleep(3000); res = await call(); d = await res.json().catch(() => ({})); if (res.status !== 202) break; }
+      }
       if (res.ok && Array.isArray(d.segments)) setTranslated(d.segments);
-      else { alert(d.error || (d.code === 'no_llm' ? 'Translation needs the AI key (GROQ_API_KEY).' : 'Could not translate.')); setTransLang('Original'); setTranslated(null); }
-    } catch { alert('Network error — please try again.'); setTransLang('Original'); }
+      else { toast.error(errMessage(d, errCode(d) === 'no_llm' ? 'Translation needs the AI key (GROQ_API_KEY).' : 'Could not translate.')); setTransLang('Original'); setTranslated(null); }
+    } catch { toast.error('Network error — please try again.'); setTransLang('Original'); }
     finally { setTranslating(false); }
   }
 
+  // ── Owner: audience / sharing settings (optimistic) ─────────────────────────
+  function patchMeta(body) {
+    return fetch(`${recBase()}/meta`, {
+      method: 'PATCH', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    }).then(async (res) => { if (!res.ok) { const d = await res.json().catch(() => ({})); toast.error(errMessage(d, 'Could not save the change.')); } return res; });
+  }
   async function saveCta() {
     let url = (ctaUrl || '').trim();
     if (!url) { setCtaOpen(false); return; }
     if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
-    const res = await fetch(`${API}/api/recordings/${id}/meta`, {
-      method: 'PATCH', headers: { ...authHeaders(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ cta: { label: (ctaLabel || '').trim() || 'Learn more', url } }),
-    });
+    const res = await patchMeta({ cta: { label: (ctaLabel || '').trim() || 'Learn more', url } });
     if (res.ok) { const d = await res.json().catch(() => ({})); setRec((r) => ({ ...r, cta: d.cta })); setCtaOpen(false); }
-    else { const d = await res.json().catch(() => ({})); alert(d.error || 'Could not save link'); }
-  }
-  // ── Owner: audience / sharing settings (optimistic) ─────────────────────────
-  function patchMeta(body) {
-    return fetch(`${API}/api/recordings/${id}/meta`, {
-      method: 'PATCH', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-    });
   }
   function saveAudience(partial) {
     setRec(r => ({ ...r, audience: { ...(r.audience || {}), ...partial } }));
@@ -414,21 +535,17 @@ export default function Watch() {
     setRec(r => ({ ...r, tags: next }));
     patchMeta({ tags: next }).catch(() => {});
   }
-
   async function removeCta() {
-    const res = await fetch(`${API}/api/recordings/${id}/meta`, {
-      method: 'PATCH', headers: { ...authHeaders(), 'Content-Type': 'application/json' }, body: JSON.stringify({ cta: null }),
-    });
+    const res = await patchMeta({ cta: null });
     if (res.ok) { setRec((r) => ({ ...r, cta: null })); setCtaLabel(''); setCtaUrl(''); }
   }
 
   // ── Transcript ──────────────────────────────────────────────────────────────
   function loadTranscript() {
-    fetch(`${API}/api/watch/${id}/transcript`, { headers: authHeaders() })
-      .then(r => r.json()).then(setTranscript).catch(() => {});
+    client.transcript().then((r) => { if (r.transcript) setTranscript(r.transcript); }).catch(() => {});
   }
   // Lazy-load the transcript the first time the tab is opened.
-  useEffect(() => { if (tab === 'transcript' && !transcript) loadTranscript(); /* eslint-disable-next-line */ }, [tab]);
+  useEffect(() => { if (tab === 'transcript' && !transcript && rec) loadTranscript(); /* eslint-disable-next-line */ }, [tab, rec && rec.id]);
 
   async function generateTranscript() {
     setTranscribing(true); setTranscriptErr('');
@@ -436,15 +553,31 @@ export default function Watch() {
     try {
       // No language sent — the server returns the native MIXED "Original" (each
       // part in the language actually spoken).
-      const res = await fetch(`${API}/api/recordings/${id}/transcribe`, {
+      const res = await fetch(isV1 ? `${API}/api/v1/recordings/${id}/transcribe` : `${API}/api/recordings/${id}/transcribe`, {
         method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' },
         body: JSON.stringify({}),
       });
       const d = await res.json().catch(() => ({}));
       if (!res.ok) {
-        if (d.code === 'feature_locked') { setCanTranscribe(false); return; }
-        setTranscriptErr(d.error || 'Transcription failed');
-        setTranscript(t => ({ ...(t || {}), configured: d.code === 'transcription_unconfigured' ? false : (t?.configured ?? true) }));
+        if (errCode(d) === 'feature_locked') { setCanTranscribe(false); return; }
+        setTranscriptErr(errMessage(d, 'Transcription failed'));
+        setTranscript(t => ({ ...(t || {}), configured: errCode(d) === 'transcription_unconfigured' ? false : (t?.configured ?? true) }));
+        return;
+      }
+      if (isV1) {
+        // 202: the worker transcribes; poll the public transcript until it settles.
+        const started = Date.now();
+        while (Date.now() - started < 600000) {
+          await sleep(3000);
+          const r = await client.transcript();
+          const t = r.transcript;
+          if (t && (t.status === 'done' || t.status === 'failed')) {
+            setTranscript(t);
+            if (t.status === 'failed') setTranscriptErr(t.error || 'Transcription failed');
+            return;
+          }
+        }
+        setTranscriptErr('Transcription is taking longer than expected — check back shortly.');
         return;
       }
       setTranscript({ status: 'done', configured: true, segments: d.segments || [], text: d.text || '', language: d.language });
@@ -491,25 +624,8 @@ export default function Watch() {
     return m.sort((a, b) => a.t - b.t);
   }, [comments, reactions]);
 
-  function loadVideo(attempt = 0) {
-    fetch(`${API}/api/watch/${id}`, { headers: authHeaders() })
-      .then(async r => {
-        const data = await r.json().catch(() => ({}));
-        if (r.status === 401 && data.error === 'login_required') { setRec(data); setState('login'); return; }
-        if (!r.ok) {
-          // Just-uploaded videos can lag Cloudinary's index for a few seconds —
-          // retry a few times before giving up so the page doesn't need a manual refresh.
-          if (r.status === 404 && attempt < 6) { setTimeout(() => loadVideo(attempt + 1), 1500); return; }
-          setState('notfound'); return;
-        }
-        if (data.requiresPassword) { setRec(data); setState('password'); return; }
-        setRec(data); setState('ok'); afterLoad();
-      })
-      .catch(() => { if (attempt < 6) setTimeout(() => loadVideo(attempt + 1), 1500); else setState('notfound'); });
-  }
-
-  function afterLoad() {
-    // count a view (unique per viewer; owner self-views don't count) + engagement
+  // Legacy engagement (views / reactions / comments) — legacy recordings only until Phase 10.
+  function afterLoadLegacy() {
     fetch(`${API}/api/watch/${id}/view`, {
       method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ visitorId: getVisitorId() }),
@@ -520,16 +636,15 @@ export default function Watch() {
       .catch(() => {});
   }
 
-  useEffect(() => { loadVideo(); /* eslint-disable-next-line */ }, [id]);
-
-  // Reveal the player only once the video can actually play — until then show a
-  // "processing" animation (a just-recorded video may still be finalising on
-  // Cloudinary). A safety timeout guarantees the overlay never traps the viewer.
+  // Legacy-only readiness overlay (docs/11 §1): a legacy recording may still be
+  // finalising on Cloudinary, so the player is revealed on canplay with a
+  // safety timeout. NEVER used for a v1 recording — there, readiness is a fact.
+  const [legacyVideoReady, setLegacyVideoReady] = useState(false);
   useEffect(() => {
-    if (state !== 'ok') { setVideoReady(false); return; }
-    setVideoReady(false);
+    if (!isLegacy || pageState !== 'ready') { setLegacyVideoReady(true); return; }
+    setLegacyVideoReady(false);
     let done = false;
-    const ready = () => { if (!done) { done = true; setVideoReady(true); } };
+    const ready = () => { if (!done) { done = true; setLegacyVideoReady(true); } };
     const v = videoRef.current;
     if (v) {
       if (v.readyState >= 2) ready();
@@ -538,17 +653,12 @@ export default function Watch() {
     const t = setTimeout(ready, 12000);
     return () => { if (v) { v.removeEventListener('loadeddata', ready); v.removeEventListener('canplay', ready); v.removeEventListener('error', ready); } clearTimeout(t); };
     /* eslint-disable-next-line */
-  }, [state, id]);
+  }, [isLegacy, pageState, id]);
 
-  // Email gate: remember if this viewer already gave their email this session.
+  // View-through tracking (legacy engagement) — report how far a (non-owner)
+  // viewer watches via sendBeacon on leave. Keeps the >2% guard.
   useEffect(() => {
-    try { if (sessionStorage.getItem('veorec_lead_' + id)) setLeadGiven(true); } catch {}
-  }, [id]);
-
-  // View-through tracking — record how far a (non-owner) viewer watches and report
-  // it on leave via sendBeacon. The >2% guard avoids logging the owner's own load.
-  useEffect(() => {
-    if (state !== 'ok' || isOwner) return;
+    if (pageState !== 'ready' || isOwner || !engagementAvailable) return;
     const v = videoRef.current; if (!v) return;
     let maxFrac = 0, sent = false;
     const onTime = () => { if (v.duration > 0) maxFrac = Math.max(maxFrac, v.currentTime / v.duration); };
@@ -562,18 +672,37 @@ export default function Watch() {
     window.addEventListener('pagehide', report);
     return () => { v.removeEventListener('timeupdate', onTime); document.removeEventListener('visibilitychange', onHide); window.removeEventListener('pagehide', report); report(); };
     /* eslint-disable-next-line */
-  }, [state, id, isOwner]);
+  }, [pageState, id, isOwner, engagementAvailable]);
 
-  async function unlock(e) {
-    e.preventDefault();
-    setPwErr('');
-    const res = await fetch(`${API}/api/watch/${id}/unlock`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ password: pw }),
-    });
-    const data = await res.json();
-    if (!res.ok) { setPwErr(data.error || 'Wrong password'); return; }
-    setRec(data); setState('ok'); afterLoad();
+  async function unlock(password) {
+    setPwErr(''); setPwBusy(true);
+    try {
+      const r = await client.unlock(password);
+      if (r.error) { setPwErr(r.error); return; }
+      applyRec(r.rec);
+      if (r.rec.source === 'legacy') afterLoadLegacy();
+    } catch { setPwErr('Network error — please try again.'); }
+    finally { setPwBusy(false); }
+  }
+
+  async function retryProcessing() {
+    setRetrying(true);
+    try {
+      const res = await fetch(`${API}/api/v1/recordings/${id}/reprocess`, { method: 'POST', headers: authHeaders() });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok) { toast.error(errMessage(d, 'Could not retry processing.')); return; }
+      toast.info('Processing restarted.');
+      const next = await client.poll();
+      if (next) applyRec(next);
+    } catch { toast.error('Network error — please try again.'); }
+    finally { setRetrying(false); }
+  }
+
+  async function download() {
+    setMenuOpen(false);
+    const url = await client.downloadUrl({ rec });
+    if (!url) { toast.error('The download is not available right now.'); return; }
+    window.location.href = url;
   }
 
   function copy(kind, text) {
@@ -588,8 +717,8 @@ export default function Watch() {
       method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify({ emoji, t, name: commentName }),
     });
-    const d = await res.json();
-    if (res.ok) setReactions(d.reactions);
+    const d = await res.json().catch(() => ({}));
+    if (res.ok) setReactions(d.reactions); else toast.error(errMessage(d, 'Could not react.'));
   }
 
   async function addComment(e) {
@@ -600,61 +729,30 @@ export default function Watch() {
       method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify({ text: commentText, name: commentName, t }),
     });
-    const c = await res.json();
-    if (res.ok) { setComments(cs => [...cs, c]); setCommentText(''); }
+    const c = await res.json().catch(() => ({}));
+    if (res.ok) { setComments(cs => [...cs, c]); setCommentText(''); } else toast.error(errMessage(c, 'Could not post comment.'));
   }
 
   function seekTo(t) {
     if (videoRef.current != null && t != null) {
       videoRef.current.currentTime = t;
-      videoRef.current.play();
+      videoRef.current.play().catch(() => {});
     }
   }
 
-  // ── Render states ──────────────────────────────────────────────────────────
-  if (state === 'notfound') return (
-    <div className={styles.center}>
-      <h2>Recording not found</h2>
-      <Link to="/" className="btn-primary" style={{ marginTop: 16, display: 'inline-block' }}>← Dashboard</Link>
-    </div>
-  );
-  if (state === 'loading') return (
-    <div className={styles.center}>
-      <Loader2 size={34} className={styles.spin} style={{ color: '#5b5bf6' }} />
-      <p style={{ marginTop: 14, color: '#9090a0' }}>Preparing your video…</p>
-    </div>
-  );
+  // ── Render states (docs/11 §1) ─────────────────────────────────────────────
+  if (pageState === 'not_found') return <NotFoundPanel />;
+  if (pageState === 'loading') return <LoadingPanel />;
+  if (pageState === 'error') return <ErrorPanel message={loadError} onRetry={() => setReloadKey(k => k + 1)} />;
+  if (pageState === 'login_gate') return <LoginGate title={gateTitle || rec?.title} />;
+  if (pageState === 'link_expired') return <LinkExpiredPanel />;
+  if (pageState === 'password_gate') return <PasswordGate title={gateTitle || rec?.title || ''} onUnlock={unlock} error={pwErr} busy={pwBusy} />;
+  if (!rec) return <LoadingPanel />;
 
-  if (state === 'login') return (
-    <div className={styles.center}>
-      <h2>🔒 Sign in to watch</h2>
-      <p style={{ color: '#9090a0', margin: '10px 0 20px' }}>This video is restricted to signed-in users.</p>
-      <Link to="/login" className="btn-primary">Sign in</Link>
-    </div>
-  );
-
-  if (state === 'password') return (
-    <div className={styles.center}>
-      <h2>🔒 Password required</h2>
-      <p style={{ color: '#9090a0', margin: '10px 0 16px' }}>“{rec?.title}” is password-protected.</p>
-      <form onSubmit={unlock} style={{ display: 'flex', flexDirection: 'column', gap: 10, width: 260 }}>
-        <input type="password" value={pw} onChange={e => setPw(e.target.value)} placeholder="Enter password" autoFocus />
-        {pwErr && <span style={{ color: '#ef4444', fontSize: 13 }}>{pwErr}</span>}
-        <button className="btn-primary" type="submit">Unlock</button>
-      </form>
-    </div>
-  );
-
-  const src = rec.cloudinary ? rec.filename : `${API}/uploads/${rec.filename}`;
-  // The HTML `download` attribute is ignored cross-origin (Cloudinary), so it
-  // would just open the video. Cloudinary's fl_attachment forces a real download
-  // with a Content-Disposition header and the correct file extension.
-  const downloadUrl = (rec.cloudinary && src.includes('/upload/'))
-    ? src.replace('/upload/', '/upload/fl_attachment/')
-    : src;
   const shareUrl = typeof window !== 'undefined' ? window.location.href : '';
   const embedCode = `<iframe src="${typeof window !== 'undefined' ? window.location.origin : ''}/embed/${id}" width="640" height="360" frameborder="0" allowfullscreen></iframe>`;
-  const privacyLabel = { public: 'Anyone with the link', login: 'Signed-in users only', password: 'Password-protected' }[rec.privacy] || 'Anyone with the link';
+  const showEmailGate = isV1 ? (pageState === 'email_gate' || (mediaGate && mediaGate.state === 'email_gate')) : (rec.audience?.requireEmail && !isOwner && !legacyLeadGiven);
+  const playable = pageState === 'ready' || pageState === 'email_gate';
 
   // ── Reusable bits ──────────────────────────────────────────────────────────
   const reactionsBar = (
@@ -671,7 +769,9 @@ export default function Watch() {
   const activityPanel = (
     <div className={styles.panel}>
       <div className={styles.panelLabel}>Comments ({comments.length})</div>
-      {rec.audience?.comments !== false ? (
+      {!engagementAvailable ? (
+        <p className={styles.noComments}>Comments and reactions arrive for this video with the next update.</p>
+      ) : rec.audience?.comments !== false ? (
         <form onSubmit={addComment} className={styles.commentForm}>
           {!user && (
             <input className={styles.commentName} value={commentName}
@@ -691,7 +791,7 @@ export default function Watch() {
         <p className={styles.noComments}>Comments are turned off for this video.</p>
       )}
       <div className={styles.commentList}>
-        {comments.length === 0 && <p className={styles.noComments}>No comments yet — be the first.</p>}
+        {engagementAvailable && comments.length === 0 && <p className={styles.noComments}>No comments yet — be the first.</p>}
         {comments.map(c => (
           <div key={c.id} className={styles.comment}>
             <div className={styles.commentHead}>
@@ -710,7 +810,6 @@ export default function Watch() {
 
   // Genuinely-unbuilt features. These ship for nobody yet, so they always read
   // "Soon" and are non-interactive — never a dead click or a misleading upsell.
-  const proBadge = <span className={styles.soonPill}>Soon</span>;
   const ProRow = ({ title, sub }) => (
     <div className={styles.audRow} aria-disabled="true">
       <div className={styles.audText}><strong>{title}</strong><span>{sub}</span></div>
@@ -773,13 +872,15 @@ export default function Watch() {
           )}
         </div>
       )}
-      <button className={styles.action} onClick={removeSilences} disabled={desilencing}>
-        <span className={styles.actionIcon}>{desilencing ? <Loader2 size={18} className={styles.spin} /> : <Scissors size={18} />}</span>
-        <span className={styles.actionText}>
-          <strong>{desilencing ? 'Removing silences…' : 'Remove silences'}</strong>
-          <span>Auto-skip the quiet gaps from the transcript — free.</span>
-        </span>
-      </button>
+      {isLegacy && (
+        <button className={styles.action} onClick={removeSilences} disabled={desilencing}>
+          <span className={styles.actionIcon}>{desilencing ? <Loader2 size={18} className={styles.spin} /> : <Scissors size={18} />}</span>
+          <span className={styles.actionText}>
+            <strong>{desilencing ? 'Removing silences…' : 'Remove silences'}</strong>
+            <span>Auto-skip the quiet gaps from the transcript — free.</span>
+          </span>
+        </button>
+      )}
 
       <div className={styles.panelLabel} style={{ marginTop: 20 }}>Take action</div>
       <button className={styles.action} onClick={autoTitle} disabled={autoTitling}>
@@ -827,14 +928,14 @@ export default function Watch() {
           </div>
         </div>
       )}
-      {rec.audience?.download !== false && (
-        <a className={styles.action} href={downloadUrl}>
+      {rec.audience?.download !== false && playable && (
+        <button className={styles.action} onClick={download}>
           <span className={styles.actionIcon}><Download size={18} /></span>
           <span className={styles.actionText}>
             <strong>Download video</strong>
-            <span>Save the original file to your device.</span>
+            <span>Save the video file to your device.</span>
           </span>
-        </a>
+        </button>
       )}
     </div>
   );
@@ -858,7 +959,8 @@ export default function Watch() {
           <div className={styles.audRow}>
             <div className={styles.audText}><strong>Who can view</strong><span>Control who can open this link</span></div>
             <select className={styles.audSelect} value={rec.privacy || 'public'} onChange={e => savePrivacy(e.target.value)}>
-              <option value="public">Anyone with the link</option>
+              {isV1 && <option value="unlisted">Anyone with the link</option>}
+              <option value="public">{isV1 ? 'Public (listed)' : 'Anyone with the link'}</option>
               <option value="login">Signed-in users only</option>
             </select>
           </div>
@@ -947,11 +1049,11 @@ export default function Watch() {
             ))}
           </div>
         </>
-      ) : transcribing ? (
+      ) : (transcribing || (transcript && (transcript.status === 'queued' || transcript.status === 'running'))) ? (
         <div className={styles.tEmpty}>
           <Loader2 size={26} className={styles.spin} />
           <strong>Transcribing your video…</strong>
-          <span>Whisper is listening — this usually takes a few seconds.</span>
+          <span>{transcript && transcript.status === 'queued' ? 'Waiting for a worker…' : 'This usually takes a few seconds to a few minutes.'}</span>
         </div>
       ) : (
         <div className={styles.tEmpty}>
@@ -984,8 +1086,67 @@ export default function Watch() {
     </div>
   );
 
+  const playerArea = (
+    <div style={{ position: 'relative' }}>
+      {pageState === 'processing' ? (
+        <ProcessingPanel rec={rec} jobs={jobs} posterUrl={media ? media.posterUrl : null} />
+      ) : pageState === 'failed' ? (
+        <FailedPanel rec={rec} isOwner={isOwner} onRetry={retryProcessing} retrying={retrying} />
+      ) : (
+        <>
+          <VideoPlayer
+            videoRef={videoRef}
+            src={media ? media.mp4Url : null}
+            hlsUrl={media ? media.hlsUrl : null}
+            poster={media ? media.posterUrl : null}
+            captionsUrl={media && (isOwner || rec.audience?.transcript !== false) ? media.captionsUrl : null}
+            segments={Array.isArray(rec.segments) && rec.segments.length ? rec.segments : null}
+            trimStart={rec.trimStart}
+            trimEnd={rec.trimEnd}
+            recommendedSpeed={rec.recommendedSpeed}
+            chapters={rec.chapters}
+            markers={markers.filter(m => m.kind === 'comment'
+              ? rec.audience?.comments !== false
+              : rec.audience?.reactions !== false)}
+            captions={(isOwner || rec.audience?.transcript !== false) ? (transcript?.segments || []) : []}
+            onMarkerClick={seekTo}
+            onTime={setVideoTime}
+            branding={rec.branding}
+            legacyWebm={!!(media && media.isWebm)}
+            onNeedRefresh={onNeedRefresh}
+            onPlaybackError={(e) => setPlaybackError(e)}
+          />
+          {isLegacy && !legacyVideoReady && (
+            <div style={{
+              position: 'absolute', inset: 0, zIndex: 6, borderRadius: 12,
+              display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 10,
+              background: 'rgba(15,15,25,0.86)', backdropFilter: 'blur(2px)',
+            }}>
+              <Loader2 size={40} className={styles.spin} style={{ color: '#fff' }} />
+              <strong style={{ color: '#fff', fontSize: 15 }}>Processing your video…</strong>
+              <span style={{ color: '#c7c7d6', fontSize: 13, textAlign: 'center', maxWidth: 320 }}>
+                This usually takes a few seconds — it’ll start playing automatically.
+              </span>
+            </div>
+          )}
+          {isV1 && !media && !mediaGate && (
+            <div style={{ position: 'absolute', inset: 0, zIndex: 6, borderRadius: 12, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(15,15,25,0.6)' }}>
+              <Loader2 size={36} className={styles.spin} style={{ color: '#fff' }} />
+            </div>
+          )}
+          {playbackError && (
+            <PlaybackErrorPanel kind={playbackError.kind} onRetry={() => { setPlaybackError(null); reloadMedia({ reason: 'expired' }).catch(() => {}); }} />
+          )}
+          {showEmailGate && (
+            <EmailGate author={rec.author} onSubmit={submitLead} busy={leadBusy} error={leadErr} />
+          )}
+        </>
+      )}
+    </div>
+  );
+
   return (
-    <div className={styles.page}>
+    <div className={styles.page} data-page-state={pageState} data-source={rec.source}>
       <header className={styles.header}>
         <Link to="/" className={styles.logo}><img src="/logo.png" className={styles.logoImg} alt="" />VeoRec</Link>
         <div className={styles.headerActions}>
@@ -1013,10 +1174,10 @@ export default function Watch() {
                       <Scissors size={15} /> Edit / Trim
                     </button>
                   )}
-                  {rec.audience?.download !== false && (
-                    <a className={styles.menuItem} href={downloadUrl} onClick={() => setMenuOpen(false)}>
+                  {rec.audience?.download !== false && playable && (
+                    <button className={styles.menuItem} onClick={download}>
                       <Download size={15} /> Download
-                    </a>
+                    </button>
                   )}
                   <button className={styles.menuItem} onClick={() => { setMenuOpen(false); copy('embed', embedCode); }}>
                     <Code2 size={15} /> Copy embed code
@@ -1024,30 +1185,34 @@ export default function Watch() {
                   <button className={styles.menuItem} onClick={shareGmail}>
                     <Share2 size={15} /> Share via Gmail
                   </button>
-                  {isOwner && (
+                  {isOwner && isLegacy && (
                     <button className={styles.menuItem} onClick={shareSlack}>
                       <Share2 size={15} /> Send to Slack
                     </button>
                   )}
                   {isOwner && (
                     <>
-                      <div className={styles.menuSub}>
-                        <button className={styles.menuItem} onClick={() => setMoveOpen(o => !o)}>
-                          <FolderInput size={15} /> Move to folder
+                      {isLegacy && (
+                        <div className={styles.menuSub}>
+                          <button className={styles.menuItem} onClick={() => setMoveOpen(o => !o)}>
+                            <FolderInput size={15} /> Move to folder
+                          </button>
+                          {moveOpen && (
+                            <div className={styles.subMenu}>
+                              <button className={styles.menuItem} onClick={() => moveToFolder(null)}>No folder</button>
+                              {folders.map((f) => (
+                                <button key={f.id} className={styles.menuItem} onClick={() => moveToFolder(f.id)}>{f.name}</button>
+                              ))}
+                              {!folders.length && <span className={styles.menuEmpty}>No folders yet</span>}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      {isLegacy && (
+                        <button className={styles.menuItem} onClick={duplicateVideo}>
+                          <CopyPlus size={15} /> Duplicate
                         </button>
-                        {moveOpen && (
-                          <div className={styles.subMenu}>
-                            <button className={styles.menuItem} onClick={() => moveToFolder(null)}>No folder</button>
-                            {folders.map((f) => (
-                              <button key={f.id} className={styles.menuItem} onClick={() => moveToFolder(f.id)}>{f.name}</button>
-                            ))}
-                            {!folders.length && <span className={styles.menuEmpty}>No folders yet</span>}
-                          </div>
-                        )}
-                      </div>
-                      <button className={styles.menuItem} onClick={duplicateVideo}>
-                        <CopyPlus size={15} /> Duplicate
-                      </button>
+                      )}
                       <button className={styles.menuItem} onClick={() => { setMenuOpen(false); saveArchived(!rec.archived); }}>
                         {rec.archived ? <><ArchiveRestore size={15} /> Unarchive</> : <><Archive size={15} /> Archive</>}
                       </button>
@@ -1124,10 +1289,10 @@ export default function Watch() {
                       {views} total view{views === 1 ? '' : 's'}
                       {viewers ? `, ${new Set(viewers.map(v => v.email || v.name || Math.random())).size} signed-in viewer${new Set(viewers.map(v => v.email || v.name)).size === 1 ? '' : 's'}` : ''}
                     </div>
-                    {isOwner && engagement && engagement.samples > 0 && (
+                    {isOwner && engagementStats && engagementStats.samples > 0 && (
                       <div className={styles.viewsStat} style={{ display: 'flex', gap: 16 }}>
-                        <span><strong>{engagement.avgViewThrough}%</strong> avg watched</span>
-                        <span><strong>{engagement.completionRate}%</strong> finished</span>
+                        <span><strong>{engagementStats.avgViewThrough}%</strong> avg watched</span>
+                        <span><strong>{engagementStats.completionRate}%</strong> finished</span>
                       </div>
                     )}
                     {isOwner && Array.isArray(leads) && leads.length > 0 && (
@@ -1147,7 +1312,7 @@ export default function Watch() {
                     {isOwner ? (
                       viewers ? (
                         <div className={styles.viewerList}>
-                          {viewers.length === 0 && <p className={styles.blockEmpty}>No signed-in viewers yet — anonymous views still count above.</p>}
+                          {viewers.length === 0 && <p className={styles.blockEmpty}>{isLegacy ? 'No signed-in viewers yet — anonymous views still count above.' : 'Viewer insights for this video arrive with the next update.'}</p>}
                           {viewers.map((v, i) => (
                             <div key={i} className={styles.viewerRow}>
                               <span className={styles.viewerAvatar}>{(v.name || 'A').charAt(0).toUpperCase()}</span>
@@ -1166,53 +1331,11 @@ export default function Watch() {
             </div>
           </div>
 
-          {/* Custom player — reaction/comment markers sit ON the progress bar */}
-          <div style={{ position: 'relative' }}>
-            <VideoPlayer
-              videoRef={videoRef}
-              src={src}
-              segments={Array.isArray(rec.segments) && rec.segments.length ? rec.segments : null}
-              trimStart={rec.trimStart}
-              trimEnd={rec.trimEnd}
-              recommendedSpeed={rec.recommendedSpeed}
-              markers={markers.filter(m => m.kind === 'comment'
-                ? rec.audience?.comments !== false
-                : rec.audience?.reactions !== false)}
-              captions={(isOwner || rec.audience?.transcript !== false) ? (transcript?.segments || []) : []}
-              onMarkerClick={seekTo}
-              onTime={setVideoTime}
-              branding={rec.branding}
-            />
-            {!videoReady && (
-              <div style={{
-                position: 'absolute', inset: 0, zIndex: 6, borderRadius: 12,
-                display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 10,
-                background: 'rgba(15,15,25,0.86)', backdropFilter: 'blur(2px)',
-              }}>
-                <Loader2 size={40} className={styles.spin} style={{ color: '#fff' }} />
-                <strong style={{ color: '#fff', fontSize: 15 }}>Processing your video…</strong>
-                <span style={{ color: '#c7c7d6', fontSize: 13, textAlign: 'center', maxWidth: 320 }}>
-                  This usually takes a few seconds — it’ll start playing automatically.
-                </span>
-              </div>
-            )}
-            {rec.audience?.requireEmail && !isOwner && !leadGiven && (
-              <div style={{ position: 'absolute', inset: 0, zIndex: 8, borderRadius: 12, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 12, background: 'rgba(15,15,25,0.95)', padding: 24 }}>
-                <strong style={{ color: '#fff', fontSize: 17 }}>Enter your email to watch</strong>
-                <span style={{ color: '#c7c7d6', fontSize: 13, textAlign: 'center', maxWidth: 340 }}>{rec.author ? `${rec.author} ` : 'The owner '}asks for your email before viewing.</span>
-                <form onSubmit={submitLead} style={{ display: 'flex', flexDirection: 'column', gap: 8, width: 300 }}>
-                  <input type="text" value={leadName} onChange={e => setLeadName(e.target.value)} placeholder="Your name (optional)"
-                    style={{ padding: '10px 12px', borderRadius: 9, border: '1px solid #3a3a4c', background: '#1a1a28', color: '#fff', fontSize: 14 }} />
-                  <input type="email" required value={leadEmail} onChange={e => setLeadEmail(e.target.value)} placeholder="you@email.com" autoFocus
-                    style={{ padding: '10px 12px', borderRadius: 9, border: '1px solid #3a3a4c', background: '#1a1a28', color: '#fff', fontSize: 14 }} />
-                  <button className="btn-primary" type="submit" disabled={leadBusy} style={{ padding: 11 }}>{leadBusy ? 'Unlocking…' : 'Watch video'}</button>
-                </form>
-              </div>
-            )}
-          </div>
+          {/* Player / processing / failed — explicit states (docs/11 §1) */}
+          {playerArea}
 
-          {/* Loom-style floating reaction dock */}
-          {(rec.audience?.reactions !== false || rec.audience?.comments !== false) && (
+          {/* Loom-style floating reaction dock (legacy engagement only until Phase 10) */}
+          {engagementAvailable && playable && (rec.audience?.reactions !== false || rec.audience?.comments !== false) && (
             <div className={styles.reactionDock}>
               {rec.audience?.reactions !== false && (
                 <div className={styles.reactionPill}>
@@ -1230,7 +1353,7 @@ export default function Watch() {
           )}
 
           {/* Inline comment composer (Loom-style) */}
-          {commentDockOpen && rec.audience?.comments !== false && (
+          {commentDockOpen && engagementAvailable && rec.audience?.comments !== false && (
             <div className={styles.composer}>
               {!user && (
                 <input className={styles.composerName} value={commentName}

@@ -1,62 +1,74 @@
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import API from '../api';
+import VideoPlayer from '../components/VideoPlayer';
+import { createWatchClient, fetchWatchConfig, watchIsV1, stateFor } from '../lib/watchApi.mjs';
+import { useWatchMedia } from './watch/useWatchMedia';
+import { useStatusPolling } from './watch/useStatusPolling';
 
-// Minimal player for iframe embeds — just the video, no chrome.
+// T-802 (docs/11 §7): the embed shares the watch page's data layer, states
+// and player — chrome-less, no sidebar. Privacy is respected exactly like the
+// watch page: public/unlisted embeds play; a gate shows a message with a link
+// out to the full page (where the viewer can sign in / unlock).
+function authHeaders() { const t = localStorage.getItem('sr_token'); return t ? { Authorization: `Bearer ${t}` } : {}; }
+
 export default function Embed() {
   const { id } = useParams();
-  const [rec, setRec] = useState(null);
-  const [err, setErr] = useState(false);
   const videoRef = useRef(null);
+  const shareToken = useMemo(() => new URLSearchParams(window.location.search).get('s') || new URLSearchParams(window.location.search).get('shareToken') || null, []);
+  const client = useMemo(() => createWatchClient({ API, id, authHeaders, shareToken }), [id, shareToken]);
+  const [rec, setRec] = useState(null);
+  const [state, setState] = useState('loading');
 
   useEffect(() => {
-    fetch(`${API}/api/watch/${id}`)
-      .then(async r => {
-        const d = await r.json().catch(() => ({}));
-        if (!r.ok || d.requiresPassword) { setErr(true); return; }
-        setRec(d);
-        fetch(`${API}/api/watch/${id}/view`, { method: 'POST' }).catch(() => {});
-      })
-      .catch(() => setErr(true));
-  }, [id]);
+    let alive = true;
+    (async () => {
+      const cfg = await fetchWatchConfig({ API });
+      const r = await client.load({ useV1: watchIsV1(cfg) }).catch(() => ({ gate: { state: 'error' } }));
+      if (!alive) return;
+      if (r.gate) { setState(r.gate.state); return; }
+      setRec(r.rec); setState(stateFor(r.rec));
+    })();
+    return () => { alive = false; };
+  }, [client]);
+
+  useStatusPolling({ client, rec, enabled: state === 'processing', onUpdate: (next) => { setRec(next); setState(stateFor(next)); } });
+  const { media, gate: mediaGate, onNeedRefresh } = useWatchMedia({ client, rec, enabled: state === 'ready' });
 
   const wrap = { margin: 0, background: '#000', width: '100vw', height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center' };
+  const msg = (text) => (
+    <div style={{ ...wrap, color: '#bbb', fontFamily: 'system-ui', flexDirection: 'column', gap: 10, textAlign: 'center', padding: 24 }}>
+      <span>{text}</span>
+      <a href={`/watch/${id}${window.location.search}`} target="_blank" rel="noopener noreferrer" style={{ color: '#8b8bff' }}>Open on VeoRec →</a>
+    </div>
+  );
+  if (state === 'loading') return <div style={{ ...wrap, color: '#888', fontFamily: 'system-ui' }}>Loading…</div>;
+  if (state === 'not_found' || state === 'error') return <div style={{ ...wrap, color: '#888', fontFamily: 'system-ui' }}>Video unavailable</div>;
+  if (state === 'login_gate') return msg('Sign in to watch this video.');
+  if (state === 'password_gate') return msg('This video is password-protected.');
+  if (state === 'link_expired') return msg('This link is no longer valid.');
+  if (state === 'failed') return msg("This video isn't available yet.");
+  if (state === 'processing') return <div style={{ ...wrap, color: '#bbb', fontFamily: 'system-ui' }}>Processing your video…</div>;
+  if (state === 'email_gate' || (mediaGate && mediaGate.state === 'email_gate')) return msg('Enter your email on VeoRec to watch this video.');
+  if (mediaGate) return msg('This video is not available in an embed.');
 
-  if (err) return <div style={{ ...wrap, color: '#888', fontFamily: 'system-ui' }}>Video unavailable</div>;
-  if (!rec) return <div style={{ ...wrap, color: '#888', fontFamily: 'system-ui' }}>Loading…</div>;
-
-  const src = rec.cloudinary ? rec.filename : `${API}/uploads/${rec.filename}`;
   return (
     <div style={{ ...wrap, position: 'relative' }}>
-      {rec.branding && (
-        <a href="https://veorec.com" target="_blank" rel="noopener noreferrer"
-          style={{ position: 'absolute', top: 12, right: 12, zIndex: 5, display: 'inline-flex', alignItems: 'center', gap: 6,
-            padding: '5px 10px 5px 8px', borderRadius: 8, background: 'rgba(11,11,20,.55)', backdropFilter: 'blur(6px)',
-            color: '#fff', fontFamily: 'system-ui, sans-serif', fontSize: 12, fontWeight: 700, textDecoration: 'none', opacity: .85 }}>
-          <span style={{ width: 13, height: 13, borderRadius: 4, background: 'linear-gradient(135deg,#6366f1,#a855f7)' }} /> VeoRec
-        </a>
-      )}
-      <video
-        ref={videoRef}
-        src={src}
-        controls
-        style={{ width: '100%', height: '100%', objectFit: 'contain' }}
-        onLoadedMetadata={(e) => {
-          const v = e.target;
-          const start = Number(rec.trimStart) || 0;
-          if (v.duration === Infinity || isNaN(v.duration)) {
-            v.currentTime = 1e101;
-            v.ontimeupdate = () => { v.ontimeupdate = null; v.currentTime = start; };
-          } else if (start) {
-            v.currentTime = start;
-          }
-        }}
-        onTimeUpdate={(e) => {
-          const v = e.target;
-          if (rec.trimEnd != null && v.currentTime >= rec.trimEnd) {
-            v.pause(); v.currentTime = Number(rec.trimStart) || 0;
-          }
-        }}
+      <VideoPlayer
+        videoRef={videoRef}
+        src={media ? media.mp4Url : null}
+        hlsUrl={media ? media.hlsUrl : null}
+        poster={media ? media.posterUrl : null}
+        captionsUrl={media ? media.captionsUrl : null}
+        segments={Array.isArray(rec.segments) && rec.segments.length ? rec.segments : null}
+        trimStart={rec.trimStart}
+        trimEnd={rec.trimEnd}
+        recommendedSpeed={rec.recommendedSpeed}
+        chapters={rec.chapters}
+        branding={rec.branding}
+        legacyWebm={!!(media && media.isWebm)}
+        onNeedRefresh={onNeedRefresh}
+        autoPlay={false}
       />
     </div>
   );

@@ -21,6 +21,7 @@ import Billing from './pages/Billing';
 import Admin from './pages/Admin';
 import Contact from './pages/Contact';
 import Embed from './pages/Embed';
+import { ToastProvider } from './components/Toast';
 import './index.css';
 
 function PrivateRoute({ children }) {
@@ -45,6 +46,7 @@ function HomeRoute() {
 ReactDOM.createRoot(document.getElementById('root')).render(
   <BrowserRouter>
     <AuthProvider>
+      <ToastProvider>
       <Routes>
         <Route path="/" element={<HomeRoute />} />
         <Route path="/watch/:id" element={<Watch />} />
@@ -66,6 +68,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(
         <Route path="/forgot" element={<PublicRoute><Forgot /></PublicRoute>} />
         <Route path="/reset"  element={<Reset />} />
       </Routes>
+      </ToastProvider>
     </AuthProvider>
   </BrowserRouter>
 );

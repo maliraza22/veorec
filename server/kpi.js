@@ -101,6 +101,9 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
     webUploadV1Selected: 0,
     webUploadLegacySelected: 0,
     webUploadAccountNotMigrated: 0,
+    // T-802: the watch page gate (per deployment; read by anonymous viewers).
+    watchV1Selected: 0,
+    watchLegacySelected: 0,
     // T-305 deprecation signal: each use of the legacy memory-multer
     // POST /api/recordings/:id/replace. This number is what decides whether
     // Phase 14 may remove the route — zero over a full observation window.
@@ -238,6 +241,20 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
   }
 
   /**
+   * T-802: one line per public client-config lookup for the watch page gate.
+   * No user identifier (the route is anonymous by design).
+   */
+  function watchDecision(req, decision) {
+    if (decision.path === 'v1') counters.watchV1Selected++;
+    else counters.watchLegacySelected++;
+    logOf(req).info({
+      kpi: 'watch_decision',
+      watch_path: decision.path,
+      decision: decision.decision,
+    }, `kpi: watch page ${decision.decision}`);
+  }
+
+  /**
    * T-305: the legacy memory-multer replace route was used. DEPRECATED, not
    * removed — this counter and this line are how remaining traffic is
    * measured, and Phase 14 may delete the route only once they stay at zero
@@ -331,6 +348,12 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
             ? +((counters.uploadV1SingleSuccess / counters.uploadV1SingleAttempt) * 100).toFixed(2) : null,
           accountNotMigrated: counters.webUploadAccountNotMigrated,
         },
+        // T-802: the watch page gate — how many config lookups were told v1 vs legacy.
+        watchPage: {
+          enabled: process.env.V1_WATCH_PAGE === 'true' && process.env.V1_UPLOAD_API === 'true',
+          v1Selected: counters.watchV1Selected,
+          legacySelected: counters.watchLegacySelected,
+        },
       },
       // T-305: deprecated routes still in use. Phase 14 removal is gated on
       // these staying at zero.
@@ -373,7 +396,7 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
   }
 
   return {
-    uploadStarted, uploadFinished, rolloutDecision, webUploadDecision, legacyReplaceUsed,
+    uploadStarted, uploadFinished, rolloutDecision, webUploadDecision, watchDecision, legacyReplaceUsed,
     watchMiss, watchHit, requestError, snapshot,
     counters,                                  // mutated by the dual-write mirror
     _counters: counters,                       // test introspection only

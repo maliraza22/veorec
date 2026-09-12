@@ -102,3 +102,17 @@
 }
 .watermark:hover { opacity: 1; }
 .watermarkDot { width: 13px; height: 13px; border-radius: 4px; background: linear-gradient(135deg, #6366f1, #a855f7); flex: 0 0 auto; }
+
+/* T-802: buffered-ranges bar, chapter ticks, buffering spinner */
+.barBuffered { position: absolute; left: 0; height: 5px; border-radius: 999px; background: rgba(255,255,255,.45); }
+.bar:hover .barBuffered { height: 7px; }
+.chapterTick { position: absolute; top: 50%; transform: translate(-50%, -50%); width: 3px; height: 9px; border-radius: 2px; background: #fff; opacity: .85; pointer-events: none; z-index: 1; }
+.spinner {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  color: #fff; pointer-events: none; display: flex; align-items: center; justify-content: center;
+  width: 64px; height: 64px; border-radius: 50%; background: rgba(20, 20, 35, .55);
+}
+.spinner svg { animation: vpSpin 1s linear infinite; }
+@keyframes vpSpin { to { transform: rotate(360deg); } }
+.wrap:focus { outline: none; }
+.wrap:focus-visible { outline: 2px solid var(--accent, #5b5bf6); outline-offset: 2px; }

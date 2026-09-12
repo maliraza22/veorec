@@ -146,8 +146,35 @@ function decideWeb({ env = process.env, hasPostgresMirror = null } = {}) {
   return { path: 'v1', decision: WEB_DECISION.v1Enabled };
 }
 
+// ── T-802: the WATCH PAGE gate ───────────────────────────────────────────────
+// A third, independent on/off gate: anonymous viewers read it from the PUBLIC
+// config route (they have no Bearer), so it is per-deployment, never per-user.
+const WATCH_DECISION = {
+  legacyDisabled: 'watch_legacy_disabled',
+  v1Enabled: 'watch_v1_enabled',
+};
+
+/** Only the literal 'true' enables the v1 watch page, and only while the v1 API is on. */
+function watchPageEnabled(env = process.env) {
+  return env.V1_WATCH_PAGE === 'true' && v1ApiEnabled(env);
+}
+
+function decideWatch({ env = process.env } = {}) {
+  return watchPageEnabled(env)
+    ? { path: 'v1', decision: WATCH_DECISION.v1Enabled }
+    : { path: 'legacy', decision: WATCH_DECISION.legacyDisabled };
+}
+
+/** The wire body for GET /api/client-config/public — no auth, no identifiers. */
+function publicConfigBody(watchDecision = { path: 'legacy' }) {
+  return {
+    watch: { path: watchDecision.path, v1Enabled: watchDecision.path === 'v1' },
+    refreshAfterSeconds: 300,
+  };
+}
+
 /** The wire body for GET /api/client-config. Contains no identifiers. */
-function clientConfigBody(decision, webDecision = { path: 'legacy' }) {
+function clientConfigBody(decision, webDecision = { path: 'legacy' }, watchDecision = { path: 'legacy' }) {
   return {
     upload: {
       // The client obeys this; it never computes eligibility itself.
@@ -159,6 +186,11 @@ function clientConfigBody(decision, webDecision = { path: 'legacy' }) {
       path: webDecision.path,
       v1Enabled: webDecision.path === 'v1',
     },
+    // T-802: the watch page's decision (also served without auth on /client-config/public).
+    watch: {
+      path: watchDecision.path,
+      v1Enabled: watchDecision.path === 'v1',
+    },
     // Advisory only — a client may refresh sooner. Short, so a rollback reaches
     // clients quickly rather than waiting out a long cache.
     refreshAfterSeconds: 300,
@@ -168,5 +200,6 @@ function clientConfigBody(decision, webDecision = { path: 'legacy' }) {
 module.exports = {
   decide, bucketFor, resolvePercent, clientConfigBody, v1ApiEnabled,
   decideWeb, webUploadEnabled, WEB_DECISION,
+  decideWatch, watchPageEnabled, publicConfigBody, WATCH_DECISION,
   DECISION, SALT, BUCKETS,
 };

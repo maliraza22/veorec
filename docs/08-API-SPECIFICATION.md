@@ -201,6 +201,12 @@ client cannot opt into the rollout.
   configuration unreadable) resolves to `legacy`, never to `v1`: the endpoint fails
   toward the path production already runs.
 
+### 14b. Public client configuration (T-802)
+
+| Method & path | Auth | Response |
+|---|---|---|
+| GET `/api/client-config/public` | – | `{ watch: { path: 'v1'|'legacy', v1Enabled }, refreshAfterSeconds }` — the WATCH PAGE gate for anonymous viewers. `path:'v1'` only when `V1_WATCH_PAGE` is exactly `'true'` **and** `V1_UPLOAD_API` is on; every other value, and any failure, is legacy. No identifiers, no per-user decision, `no-store`. The authed `/api/client-config` carries the same `watch` block beside `upload` and `webUpload`. One `watch_decision` KPI line per lookup (`19` §8.3). |
+
 ## 15. Admin (⚿A; every mutation writes `audit_logs`)
 
 | Method & path | Notes |

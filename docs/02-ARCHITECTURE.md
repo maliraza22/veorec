@@ -565,6 +565,10 @@ dashboard *can* render from v1 behind the flag, but nothing points at it yet.
 
 `api/src/watch.router.js` + `api/src/authz.js` + `api/src/rate-limit.js`. Optional auth (`viewer(req)` → PostgreSQL viewer or anonymous; the privacy level decides), one resolver for every route, signed media URLs minted after the decision with the `12` §5 TTLs, the HLS playlist rewrite proxy (`12` §5.2), the transcript, the unlock and lead gates with HMAC access tokens (`WATCH_ACCESS_SECRET`, derived from `JWT_SECRET` when unset). Mounted on the same `V1_UPLOAD_API` flag; the legacy `/api/watch/*` routes are untouched until T-802 flips the watch page. Rate limits are per-process fixed windows for now (Redis limiter: Phase 9/10).
 
+### 2.7.5b The watch page on v1 (delivered by T-802)
+
+`client/src/lib/watchApi.mjs` is the ONE client module that knows which watch API is in use: the server's public decision (`V1_WATCH_PAGE`) selects `/api/v1/watch/*` or the untouched legacy `/api/watch/*`; a v1 miss for an id falls back to legacy once (a legacy recording the T-204 backfill has not reached). Page state is driven by the payload (`11` §1); media URLs are signed and refreshed before expiry; HLS plays through hls.js against the T-801 playlist proxy; captions attach as a native `<track>`. Cloudinary URL logic exists only in the legacy media resolver.
+
 ### 2.7.6 Legacy → PostgreSQL identity bridge (prerequisite for T-304)
 
 The legacy JWT carries the **legacy** user id. Every PostgreSQL row the T-104

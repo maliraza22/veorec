@@ -333,7 +333,18 @@ app.get('/api/client-config', requireAuth, async (req, res) => {
     web = { path: 'legacy', decision: rollout.WEB_DECISION.legacyDisabled };
   }
   kpi.webUploadDecision(req, web);
-  res.json(rollout.clientConfigBody(decision, web));
+  res.json(rollout.clientConfigBody(decision, web, rollout.decideWatch()));
+});
+
+// T-802: the PUBLIC client configuration — what an ANONYMOUS viewer may know.
+// The watch page reads its gate here (viewers have no Bearer); the body carries
+// no identifiers and no per-user decision. Any failure resolves to legacy.
+app.get('/api/client-config/public', (req, res) => {
+  let watch;
+  try { watch = rollout.decideWatch(); } catch (e) { watch = { path: 'legacy', decision: rollout.WATCH_DECISION.legacyDisabled }; }
+  kpi.watchDecision(req, watch);
+  res.set('Cache-Control', 'no-store');
+  res.json(rollout.publicConfigBody(watch));
 });
 
 // ── /api/v1 upload sessions (T-301) ─────────────────────────────────────────
