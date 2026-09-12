@@ -30,7 +30,7 @@ Principals: `owner` (recording.user_id), `admin` (users.is_admin), `viewer` (any
 | transcribe/AI actions | ✓ (plan-gated) | ✓ | – | – | – |
 | admin endpoints | – | – | – | – | – (admins only, audited) |
 
-Enforcement is centralized: `authorize(actor, action, resource)` in one module (`apps/api/src/authz.ts`); route handlers call it — no inline ownership checks scattered per route (today `userOwns()` is a Cloudinary query called ad hoc in ~20 routes).
+Enforcement is centralized: `authorize(actor, action, resource)` in one module (`apps/api/src/authz.ts`); route handlers call it — no inline ownership checks scattered per route (today `userOwns()` is a Cloudinary query called ad hoc in ~20 routes). *(T-801: `api/src/authz.js` — `resolveWatchAccess({recording, viewer, shareLink, shareTokenPresented, access, workspaceRole})` is the pure, unit-tested matrix for the `watch` action (owner → admin → presented share link → privacy level); `workspace` is enforced now through `workspace_members` (a signed-in non-member gets 404). The owner-side actions still use the scoped repositories (T-302); the full `authorize(actor, action, resource)` facade grows around this resolver as Phases 9–10 add actions.)*
 
 ## 3. Share links (`share_links` table)
 
@@ -70,7 +70,7 @@ sequenceDiagram
 - Never expose raw bucket URLs; bucket is private (invariant: leaked URL ≤ TTL exposure, vs. today's forever-public Cloudinary URL).
 
 ### 5.2 HLS specifics
-Master playlist is fetched via presigned URL; variant playlists/segments: the API rewrites playlists at request time (`/watch/:id/hls/*` proxy for playlists **only** — tiny text files, not media bytes) embedding presigned segment URLs; segments go direct to R2. *(T-705: every playlist references siblings by bare file name — `720p_index.m3u8`, `720p_init.mp4`, `720p_seg_00001.m4s` — all under the asset's `hls/` prefix, so the rewrite is a one-level name → presigned-URL substitution; the worker stores them with their content types. The proxy/rewrite itself is T-801.)* Alternative (preferred when adopted): CDN edge token covering the `derived/{recordingId}/…/hls/` prefix. Decision recorded per deployment in ops docs; both satisfy "API serves no video bytes".
+Master playlist is fetched via presigned URL; variant playlists/segments: the API rewrites playlists at request time (`/watch/:id/hls/*` proxy for playlists **only** — tiny text files, not media bytes) embedding presigned segment URLs; segments go direct to R2. *(T-705: every playlist references siblings by bare file name — `720p_index.m3u8`, `720p_init.mp4`, `720p_seg_00001.m4s` — all under the asset's `hls/` prefix, so the rewrite is a one-level name → presigned-URL substitution; the worker stores them with their content types. The proxy/rewrite itself is T-801 — ✅ delivered as `GET /api/v1/watch/:id/hls/:file`: the master's variant lines become absolute proxy URLs (the playlist token propagated), variant playlists' `#EXT-X-MAP` init and segment lines become presigned storage URLs with the media TTL; playlists only, `no-store`; a name outside the key contract is refused; gated recordings authorise with the `hls` grant `/media` mints or, without one, with the full resolver.)* Alternative (preferred when adopted): CDN edge token covering the `derived/{recordingId}/…/hls/` prefix. Decision recorded per deployment in ops docs; both satisfy "API serves no video bytes".
 
 ### 5.3 Download
 `GET /watch/:id/media?disposition=attachment` → presigned GET with `response-content-disposition: attachment; filename="<safe-title>.mp4"`; allowed only when `audience.download` or owner.
@@ -85,6 +85,6 @@ Master playlist is fetched via presigned URL; variant playlists/segments: the AP
 | Password gate brute force | bcrypt + 10/15min·IP limiter on `/unlock` (today unlimited — `index.js:673-686`) |
 | Privacy downgrade via cached CDN | private assets never get long-cache signatures; CDN caches only public paths |
 | Owner-spoofed engagement | actor identity from session, not client `name` field; anonymous names are display-only and flagged `unverified` in owner analytics |
-| Lead-gate bypass | gate enforced server-side in `/media` (email session token required when `requireEmail`), not just client-side (today it is client-only — `Watch.jsx:544-546` sessionStorage) |
+| Lead-gate bypass | gate enforced server-side in `/media` (email session token required when `requireEmail`), not just client-side (today it is client-only — `Watch.jsx:544-546` sessionStorage) *(T-801: `403 email_required` until `POST /watch/:id/lead` returns a token with the `lead` grant; the playlist proxy is gated the same way)* |
 | IDOR on owner endpoints | central `authorize()`; tests enumerate every route × non-owner (matrix in `20` §6) |
 | Deleted-video access | soft delete blocks watch/media immediately (checked before minting) |

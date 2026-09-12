@@ -97,11 +97,11 @@ function createUploadRouter(deps) {
 
   const router = express.Router();
   router.use(express.json({ limit: '1mb' }));   // manifests only — never bytes
-  router.use(requireAuth);
+  router.use('/uploads', requireAuth);
   // Translate the legacy id to the PostgreSQL identity ONCE, here, before any
   // ownership scope is built. `req.userId` is deliberately untouched: the same
   // requireAuth instance serves 59 legacy routes that read it as the legacy id.
-  router.use(createIdentityBridge({ repositories, logger }));
+  router.use('/uploads', createIdentityBridge({ repositories, logger }));
 
 
   // ── POST /uploads — create (or replay) a session ──────────────────────────

@@ -48,8 +48,8 @@ function transcriptBody(t, segments, configured) {
 function createAiRouter({ repositories, withTransaction, requireAuth, entitlements, configured = () => false, logger = console }) {
   if (!entitlements || typeof entitlements.isFeatureEnabled !== 'function') throw new Error('createAiRouter: entitlements.isFeatureEnabled is required');
   const router = express.Router();
-  router.use(requireAuth);
-  router.use(createIdentityBridge({ repositories, logger }));
+  router.use('/recordings', requireAuth);
+  router.use('/recordings', createIdentityBridge({ repositories, logger }));
 
   async function mustGet(repos, scope, id) {
     const r = await repos.recordings.get(scope, id);

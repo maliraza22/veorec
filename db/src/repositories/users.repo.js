@@ -11,7 +11,7 @@
 'use strict';
 
 const { and, eq, isNull, gt, desc, or, ilike, sql } = require('drizzle-orm');
-const { users } = require('../schema');
+const { users, workspaceMembers } = require('../schema');
 const { newId } = require('../ids');
 const { exec, NotFoundError } = require('./errors');
 const { requireScope, requireSystemReason } = require('./scope');
@@ -150,3 +150,23 @@ module.exports = function usersRepo(db) {
     },
   };
 };
+
+/**
+ * Workspaces (docs/07 §2). Only what the watch authorisation needs today: the
+ * viewer's role in a recording's workspace (docs/12 §2). The workspaces UI is
+ * later work; the privacy level is enforced now for rows that carry one.
+ */
+function workspacesRepo(db) {
+  return {
+    /** The viewer's role in a workspace, or null when they are not a member. */
+    async memberRole(workspaceId, userId) {
+      if (!workspaceId || !userId) return null;
+      const [row] = await exec('workspace_member', () => db.select({ role: workspaceMembers.role })
+        .from(workspaceMembers)
+        .where(and(eq(workspaceMembers.workspaceId, workspaceId), eq(workspaceMembers.userId, userId)))
+        .limit(1));
+      return row ? row.role : null;
+    },
+  };
+}
+module.exports.workspacesRepo = workspacesRepo;

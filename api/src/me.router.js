@@ -21,8 +21,8 @@ const asyncRoute = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next
  */
 function createMeRouter({ repositories, requireAuth, quota, logger = console }) {
   const router = express.Router();
-  router.use(requireAuth);
-  router.use(createIdentityBridge({ repositories, logger }));
+  router.use('/me', requireAuth);
+  router.use('/me', createIdentityBridge({ repositories, logger }));
 
   router.get('/me/usage', asyncRoute(async (req, res) => {
     const scope = scopeOf(req);

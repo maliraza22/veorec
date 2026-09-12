@@ -58,6 +58,7 @@ function createRepositories(db) {
   return {
     db,                                   // escape hatch for migrations/tests only
     users: usersRepo(db),
+    workspaces: usersRepo.workspacesRepo(db),   // T-801: membership for the workspace privacy level
     sessions: sessionsRepo(db),
     recordings: recordingsRepo(db),
     folders: recordingsRepo.foldersRepo(db),

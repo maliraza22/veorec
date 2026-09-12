@@ -30,7 +30,7 @@ stateDiagram-v2
 
 ## 2. Media resolution
 
-`GET /watch/:id/media` → `{mp4Url?, hlsUrl?, posterUrl, captionsUrl?, expiresAt}` (signed URLs, `12` §5). The player:
+`GET /watch/:id/media` → `{status, mp4Url, hlsUrl, posterUrl, captionsUrl, expiresAt, ttlSeconds, download}` (signed URLs, `12` §5; null for what does not exist yet). *(T-801: delivered; gated recordings receive an `hlsUrl` that already carries its playlist token, so the player passes it to hls.js unchanged; the unlock/lead **access token** from `/unlock` or `/lead` must be sent as `X-Watch-Access` on every later call and kept in `sessionStorage` per recording.)* The player:
 
 - Prefers **HLS** when `hlsUrl` present (hls.js; Safari native). Falls back to MP4 on HLS fatal errors (see §5).
 - MP4 has `+faststart` → native seeking works; **delete** the Infinity-duration workaround (`VideoPlayer.jsx:44-47`) once all legacy WebM assets are re-transcoded (keep it guarded behind `src.endsWith('.webm')` during migration).

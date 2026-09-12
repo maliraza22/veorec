@@ -11,6 +11,9 @@ const { createRecordingsRouter, defaultEntitlements: defaultRecordingEntitlement
 const { createMeRouter } = require('./me.router');
 const { createAdminJobsRouter } = require('./admin-jobs.router');
 const { createAiRouter } = require('./ai.router');
+const { createWatchRouter } = require('./watch.router');
+const authz = require('./authz');
+const rateLimit = require('./rate-limit');
 const quota = require('./quota');
 const errors = require('./errors');
 const identity = require('./identity');
@@ -24,6 +27,8 @@ module.exports = {
   createAdminJobsRouter,
   // T-603: async transcription/AI triggers + /recordings/:id/status.
   createAiRouter,
+  // T-801: the public watch read path — payload, unlock, signed media, HLS playlist proxy, transcript, lead gate.
+  createWatchRouter, authz, ...rateLimit,
   ...identity,
   ...errors,
 };

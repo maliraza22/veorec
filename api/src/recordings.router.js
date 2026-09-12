@@ -65,11 +65,11 @@ function createRecordingsRouter(deps) {
 
   const router = express.Router();
   router.use(express.json({ limit: '256kb' }));   // metadata only — never media
-  router.use(requireAuth);
+  router.use('/recordings', requireAuth);
   // Translate the legacy id to the PostgreSQL identity ONCE, here, before any
   // ownership scope is built. `req.userId` is deliberately untouched: the same
   // requireAuth instance serves 59 legacy routes that read it as the legacy id.
-  router.use(createIdentityBridge({ repositories, logger }));
+  router.use('/recordings', createIdentityBridge({ repositories, logger }));
 
 
   // ── POST /recordings ──────────────────────────────────────────────────────

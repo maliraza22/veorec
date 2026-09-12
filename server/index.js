@@ -348,7 +348,7 @@ app.get('/api/client-config', requireAuth, async (req, res) => {
 // every current client uses.
 if (process.env.V1_UPLOAD_API === 'true') {
   try {
-    const { createUploadRouter, createRecordingsRouter, createMeRouter, createAdminJobsRouter, createAiRouter, createQuota } = require('../api/src/index.js');
+    const { createUploadRouter, createRecordingsRouter, createMeRouter, createAdminJobsRouter, createAiRouter, createWatchRouter, authz: v1authz, createQuota } = require('../api/src/index.js');
     const { repositories, withTransaction } = require('../db/src/index.js');
     const storagePkg = require('../storage/src/index.js');
     // T-306: the quota ledger. Limits come from the ONE plan catalog
@@ -415,6 +415,30 @@ if (process.env.V1_UPLOAD_API === 'true') {
         },
       },
     }));
+    // T-801: the public watch read path (docs/08 §7, docs/12). Auth is
+    // OPTIONAL: a legacy Bearer resolves to the viewer's PostgreSQL id (the
+    // canonical mapping) or to anonymous; the privacy level decides. Media
+    // URLs are signed per request; the API serves no video bytes. The legacy
+    // /api/watch routes are untouched and remain what every current client
+    // uses until T-802 flips the watch page.
+    {
+      const { idFor } = require('../db/src/legacy-ids.js');
+      // Watch access tokens are HMAC-signed with their own secret; when none is configured a key is DERIVED from the JWT secret (never the raw secret, never shorter than the router accepts).
+      const watchSecret = process.env.WATCH_ACCESS_SECRET || crypto.createHash('sha256').update('veorec-watch-access:' + (process.env.JWT_SECRET || 'screenrec-dev-secret-change-in-prod')).digest('hex');
+      app.use('/api/v1', createWatchRouter({
+        repositories, logger,
+        storage: storagePkg.storageProvider(), keys: storagePkg.keys,
+        accessSecret: watchSecret,
+        viewer: async (req) => {
+          const u = viewerFromAuth(req);
+          if (!u) return null;
+          return { id: idFor('usr', u.id), isAdmin: isAdmin(u) };
+        },
+        verifyPassword: v1authz.createPasswordVerifier({ bcryptCompare: (p, h) => bcrypt.compare(p, h) }),
+        configured: () => transcription.isConfigured(),
+        publicBaseUrl: process.env.PUBLIC_API_URL ? `${String(process.env.PUBLIC_API_URL).replace(/[/]+$/, '')}/api/v1` : null,
+      }));
+    }
     // T-302: recordings CRUD, served from PostgreSQL. Same flag, same
     // rollback: the legacy /api/recordings routes are untouched and remain what
     // every current client uses.
@@ -424,7 +448,7 @@ if (process.env.V1_UPLOAD_API === 'true') {
       requireAuth,
       logger,
     }));
-    logger.info({ v1UploadApi: true }, '/api/v1 upload session + recordings API ENABLED (legacy routes unchanged)');
+    logger.info({ v1UploadApi: true }, '/api/v1 upload session + recordings + watch API ENABLED (legacy routes unchanged)');
   } catch (e) {
     // A misconfigured new stack must never stop the legacy server booting.
     logger.error({ err: { message: String(e && e.message).slice(0, 300) } },

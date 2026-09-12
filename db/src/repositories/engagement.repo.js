@@ -64,6 +64,21 @@ module.exports = function engagementRepos(db) {
           .where(eq(shareLinks.tokenHash, tokenHash)).limit(1));
         return row || null;
       },
+      /**
+       * T-801: one successful watch through the link counts against max_views.
+       * Atomic increment guarded by the cap, so concurrent viewers cannot push
+       * the count past it; returns the row when counted, null when the link is
+       * already exhausted (the caller answers link_expired).
+       */
+      async countViewSystem(id, reason) {
+        requireSystemReason(reason);
+        const [row] = await exec('share_link', () => db.update(shareLinks)
+          .set({ viewCount: sql`${shareLinks.viewCount} + 1`, updatedAt: new Date() })
+          .where(and(eq(shareLinks.id, id), isNull(shareLinks.revokedAt),
+            sql`(${shareLinks.maxViews} IS NULL OR ${shareLinks.viewCount} < ${shareLinks.maxViews})`))
+          .returning());
+        return row || null;
+      },
     },
 
     comments: {

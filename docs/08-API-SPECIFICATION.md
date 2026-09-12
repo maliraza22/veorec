@@ -12,6 +12,7 @@
 - Idempotency: unsafe endpoints that clients may retry accept `Idempotency-Key` (uuid). The server stores `(user_id, key) → response hash` for 24h and replays the stored response on repeat. Endpoints with natural idempotency note it instead.
 - Rate limits (Redis, per user or IP): auth 10/15min·IP, signup 15/h·IP, forgot 5/h·IP, comments/reactions 30/min·IP, views/progress 60/min·IP, uploads 10 sessions/h·user, AI endpoints 10/h·user. 429 + `Retry-After`.
 - Validation errors: 400 with `details` array (zod-derived).
+- **Router auth scope (T-801):** every `/api/v1` router mounted on the same prefix gates ONLY its own paths (`/uploads`, `/recordings`, `/me`, `/admin`) — an unscoped `router.use(requireAuth)` on one router would reject anonymous requests to a sibling's public routes (the watch routes) with the legacy flat 401 before they were ever reached. Rate limits on the watch routes are per-process fixed windows until the Redis limiter lands (Phase 9/10).
 
 ## 2. Response & error contract
 
@@ -85,18 +86,19 @@ Error (every non-2xx):
 
 | Method & path | Auth | Request → Response |
 |---|---|---|
-| GET `/watch/:id` | optional | → `WatchPayload` or `401 {code:'login_required'}` or `200 {requiresPassword:true,title}` or `403 {code:'link_expired'}`; `?shareToken=` for share-link access |
-| POST `/watch/:id/unlock` | optional | `{password}` → `WatchPayload`; 401 wrong password; rate-limited 10/15min·IP |
+| GET `/watch/:id` | optional | → `WatchPayload` or `401 {code:'login_required'}` or `200 {requiresPassword:true,title,shareLink?:{label}}` or `403 {code:'link_expired'}`; `?s=`/`?shareToken=` for share-link access; workspace non-members and deleted/unknown ids are **404** *(T-801 ✅; each fetch through a share link counts one view against `max_views`)* |
+| POST `/watch/:id/unlock` | optional | `{password}` → `WatchPayload + {accessToken, accessExpiresAt}`; `401 invalid_password`; rate-limited 10/15min·IP (`429 rate_limited` + `Retry-After`) *(T-801 ✅: verifies the recording password, or the share link's own password when `?s=` is present; the **access token** (HMAC, recording-bound, 24 h, grants `password` / `share:<linkId>` / `lead`) is sent back as `X-Watch-Access` or `?a=` on `/media`, `/transcript` and the HLS proxy — nothing is stored server-side; sha256 (v1) and bcrypt (legacy) hashes both verify)* |
 | POST `/watch/:id/view` | optional | `{visitorId?}` → `{views}`; upserts `view_sessions` (unique viewer_key; owner ⇒ `is_owner`, not counted); naturally idempotent |
 | POST `/watch/:id/progress` | optional | `{pct}` (0–1, sendBeacon) → 204; upsert max_progress |
 | GET `/watch/:id/engagement` | optional | `{views,reactions,comments}` |
 | POST `/watch/:id/comment` | optional | `{text,name?,t?,parentId?}` → `Comment`; 403 if audience.comments=false; rate-limited |
 | POST `/watch/:id/react` | optional | `{emoji,t?,name?}` → `{reactions}`; 403 if disabled; rate-limited |
-| POST `/watch/:id/lead` | optional | `{email,name?}` → `{ok}`; unique per (recording,email) |
-| GET `/watch/:id/transcript` | optional | `{status:'none'|'queued'|'running'|'done'|'failed', configured, language, text, segments}` — real statuses at last (today only done/none) |
-| GET `/watch/:id/media` | optional | `{playback:{mp4Url?,hlsUrl?,posterUrl,expiresAt}}` — **signed URLs**, TTL per privacy (`12` §5); 403 if privacy unsatisfied. Player refreshes before expiry |
+| POST `/watch/:id/lead` | optional | `{email,name?}` → `{ok, accessToken, accessExpiresAt}`; unique per (recording,email); rate-limited 30/min·IP *(T-801 ✅: the email gate — with `audience.requireEmail` the server refuses `/media` (`403 email_required`) until a lead token is presented; the payload carries `requiresEmail`)* |
+| GET `/watch/:id/transcript` | optional | `{status:'none'|'queued'|'running'|'done'|'failed', configured, language, text, segments}` — real statuses at last (today only done/none) *(T-801 ✅: gated exactly like `/media` incl. the lead gate; `403 audience_disabled` for viewers when `audience.transcript=false`)* |
+| GET `/watch/:id/media` | optional | `{status, mp4Url, hlsUrl, posterUrl, captionsUrl, expiresAt, ttlSeconds, download}` (flat, as `11` §2 consumes it — the earlier `{playback:{…}}` envelope is dropped) — **signed URLs**, TTL per privacy (`12` §5: public 24 h, everything else 10 min; posters always 24 h); 401/403 exactly as `/watch/:id`; `?disposition=attachment` → the mp4 URL forces a download with a safe filename (`403 audience_disabled` for viewers when `audience.download=false`); a processing recording answers `status` with null URLs; `hlsUrl` points at the playlist proxy and carries a playlist-scoped token (`?a=`, grant `hls`, expires with the media TTL) whenever the recording is gated, because hls.js cannot send a Bearer *(T-801 ✅)* |
+| GET `/watch/:id/hls/:file` | optional | the playlist rewrite proxy (`12` §5.2): `master.m3u8` → variant playlists as absolute proxy URLs (token propagated); `{name}_index.m3u8` → `#EXT-X-MAP` init + segments as presigned storage URLs (media TTL). Playlists only — a segment name is 404, a non-key-safe name 400. `application/vnd.apple.mpegurl`, `no-store` *(T-801 ✅)* |
 
-`WatchPayload`: recording public fields + `author`, `branding`, `status` (viewers see 'processing' honestly), chapters, audience, cta, trim/segments, recommendedSpeed — media URLs only via `/media`.
+`WatchPayload`: recording public fields + `author`, `branding`, `status` (viewers see 'processing' honestly), chapters, audience, cta, trim/segments, recommendedSpeed — media URLs only via `/media`. *(T-801: also `requiresEmail`, `views` (unique, non-owner), `viewer:{isOwner,isAdmin,via,signedIn}`; `failureCode` is owner/admin-only — viewers get `status:'failed'` and nothing else; no storage key, URL or hash ever appears.)*
 
 ## 8. Sharing
 

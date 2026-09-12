@@ -9,9 +9,10 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node ../tests/identity-bridge.test.js && node ../tests/uploads-api.test.js && node ../tests/recordings-api.test.js && node ../tests/quota.test.js && node ../tests/admin-jobs.test.js && node ../tests/ai-api.test.js && node ../tests/pipeline-backfill.test.js",
+    "test": "node ../tests/identity-bridge.test.js && node ../tests/uploads-api.test.js && node ../tests/recordings-api.test.js && node ../tests/quota.test.js && node ../tests/admin-jobs.test.js && node ../tests/ai-api.test.js && node ../tests/pipeline-backfill.test.js && node ../tests/watch-api.test.js",
     "test:ai": "node ../tests/ai-api.test.js",
     "test:backfill-pipeline": "node ../tests/pipeline-backfill.test.js",
+    "test:watch": "node ../tests/watch-api.test.js",
     "test:uploads": "node ../tests/uploads-api.test.js",
     "test:recordings": "node ../tests/recordings-api.test.js",
     "test:identity": "node ../tests/identity-bridge.test.js",

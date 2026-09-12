@@ -561,6 +561,10 @@ upload) are neither CRUD nor buildable yet. No quota ledger or reservation
 (T-306), no legacy route change, no client change, no read cutover — the
 dashboard *can* render from v1 behind the flag, but nothing points at it yet.
 
+### 2.7.5a `/api/v1/watch` — the public read path (delivered by T-801)
+
+`api/src/watch.router.js` + `api/src/authz.js` + `api/src/rate-limit.js`. Optional auth (`viewer(req)` → PostgreSQL viewer or anonymous; the privacy level decides), one resolver for every route, signed media URLs minted after the decision with the `12` §5 TTLs, the HLS playlist rewrite proxy (`12` §5.2), the transcript, the unlock and lead gates with HMAC access tokens (`WATCH_ACCESS_SECRET`, derived from `JWT_SECRET` when unset). Mounted on the same `V1_UPLOAD_API` flag; the legacy `/api/watch/*` routes are untouched until T-802 flips the watch page. Rate limits are per-process fixed windows for now (Redis limiter: Phase 9/10).
+
 ### 2.7.6 Legacy → PostgreSQL identity bridge (prerequisite for T-304)
 
 The legacy JWT carries the **legacy** user id. Every PostgreSQL row the T-104
