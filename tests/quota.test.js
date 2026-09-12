@@ -233,6 +233,9 @@ const LEGACY = plans.limitsFor(plans.getPlan('free'), {});
     ok(won === 1 && refused === 49, `Q1: 50 parallel creations, one slot — exactly one wins (${won}), 49 refused with video_limit (${refused})`);
     L = await ledger(carol);
     ok(Number(L.s) === 1 && Number(L.v) === 512 * MiB, 'Q1: the ledger holds exactly one slot and one reservation after 50 parallel attempts');
+    // T-1003: every plan-limit refusal is also a recorded conversion fact with the legacy trigger name.
+    const hits = (await db.execute(sql`select recording_id, props from analytics_events where event = 'paywall_hit' and user_id = ${pgId(carol)}`)).rows;
+    ok(hits.length === 49 && hits.every((h) => h.props.trigger === 'video_limit_reached' && h.props.feature === 'videoLimit' && cRecs.includes(h.recording_id)), `T-1003: 49 paywall_hit events (video_limit_reached) recorded AFTER the rolled-back reservations (${hits.length})`);
     ok(attempts.filter((a) => a.status === 403)[0].body.error.message === MSG_VIDEOS_V2, 'Q3: the video-limit message is the docs/16 §4.6 copy');
 
     // Q2 — several tabs within quota: independent reservations, sums correct.

@@ -417,9 +417,14 @@ function ShareSettings({ rec, folders, client, onClose, onSaved, onUpgrade, onAn
 function Analytics({ rec, authFetch, onClose, onUpgrade }) {
   const [data, setData] = useState(null);
   useEffect(() => {
-    // The per-recording analytics endpoint is legacy-only until Phase 10; a
-    // v1 recording shows what its summary already carries.
-    if (rec.source === 'v1') { setData({ views: rec.views || 0, comments: [], reactions: [], viewers: [], v1: true }); return; }
+    // T-1002: a v1 recording reads its analytics from PostgreSQL (the same
+    // shape, plus the retention curve); the paywall is the nested v1 contract.
+    if (rec.source === 'v1') {
+      authFetch(`${API}/api/v1/recordings/${rec.id}/analytics`)
+        .then(async (r) => { if (r.status === 403) { const d = await r.json().catch(() => ({})); if (d.error && d.error.upgradeRequired && onUpgrade) onUpgrade('analytics', d.error.message); return null; } return r.ok ? r.json() : {}; })
+        .then((d) => { if (d) setData(d); }).catch(() => setData({}));
+      return;
+    }
     authFetch(`${API}/api/recordings/${rec.id}/analytics`)
       .then(async (r) => { if (r.status === 403) { const d = await r.json().catch(() => ({})); if (d.upgradeRequired && onUpgrade) onUpgrade(d.feature || 'analytics', d.error); return null; } return r.json(); })
       .then((d) => { if (d) setData(d); }).catch(() => setData({}));

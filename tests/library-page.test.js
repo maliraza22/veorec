@@ -107,7 +107,7 @@ const RUN = Math.random().toString(36).slice(2, 8);
   ok(/r\.animatedThumbnail !== false/.test(dash), 'the animated-thumbnail setting governs the hover preview');
   ok(/data-status=\{r\.status\}/.test(dash) && /'Processing…'/.test(dash), 'a v1 card shows its pipeline status (processing / failed) honestly');
   ok(!/cloudinary/i.test(api.split('\n').filter((x) => !/^\s*\/\//.test(x)).join('\n').replace(/normalizeLegacy[\s\S]*?\}\);/, '').replace(/cloudinary: false/g, '')), 'the data layer never builds a Cloudinary URL (the legacy row keeps what the legacy API sent)');
-  ok(/if \(rec\.source === 'v1'\) \{ setData\(/.test(dash) && /rec && rec\.source === 'v1'\) \{ toast\.info\('Duplicating/.test(dash), 'legacy-only actions (analytics, duplicate) are guarded for v1 rows rather than pointed at routes that do not exist');
+  ok(/if \(rec\.source === 'v1'\) \{\s*authFetch\(`\$\{API\}\/api\/v1\/recordings\/\$\{rec\.id\}\/analytics`\)/.test(dash) && /rec && rec\.source === 'v1'\) \{ toast\.info\('Duplicating/.test(dash), 'a v1 row reads its analytics from /api/v1 (T-1002); legacy-only actions (duplicate) are guarded rather than pointed at routes that do not exist');
   const server = fs.readFileSync(path.join(SERVER_DIR, 'index.js'), 'utf8');
   ok(/createFoldersRouter\(\{ repositories, requireAuth, logger \}\)/.test(server) && /createNotificationsRouter\(\{ repositories, requireAuth, logger \}\)/.test(server) && /kpi\.libraryDecision\(req, library\)/.test(server), 'the server mounts both routers on the v1 flag and reports the library decision');
 

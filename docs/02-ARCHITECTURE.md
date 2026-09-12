@@ -565,6 +565,10 @@ dashboard *can* render from v1 behind the flag, but nothing points at it yet.
 
 `api/src/watch.router.js` + `api/src/authz.js` + `api/src/rate-limit.js`. Optional auth (`viewer(req)` → PostgreSQL viewer or anonymous; the privacy level decides), one resolver for every route, signed media URLs minted after the decision with the `12` §5 TTLs, the HLS playlist rewrite proxy (`12` §5.2), the transcript, the unlock and lead gates with HMAC access tokens (`WATCH_ACCESS_SECRET`, derived from `JWT_SECRET` when unset). Mounted on the same `V1_UPLOAD_API` flag; the legacy `/api/watch/*` routes are untouched until T-802 flips the watch page. Rate limits are per-process fixed windows for now (Redis limiter: Phase 9/10).
 
+### 2.7.5f Owner analytics + paywall facts on v1 (delivered by T-1002 / T-1003)
+
+`api/src/analytics.router.js` (per-recording analytics and the overview, Pro-gated, from `view_sessions` / `comments` / `reactions` / `leads` / `analytics_events` through the repositories) and `api/src/paywall.js` (the one helper every router uses when it answers `feature_locked` or a plan limit: the response is unchanged, and one `analytics_events` `paywall_hit` with the legacy trigger name is recorded). The dashboard's analytics modal reads a v1 recording from `/api/v1/recordings/:id/analytics`.
+
 ### 2.7.5e Engagement on v1 (delivered by T-1001)
 
 `api/src/engagement.router.js` on the shared `api/src/watch-context.js`: views (one `view_sessions` row per viewer key — user → visitorId → salted daily IP hash; the owner's rows carry `is_owner` and are never counted), progress beacons (monotonic, `completed` at 90 %), comments (one reply level, account identity for signed-in callers, owner/author removal) and reactions (appended events) — PostgreSQL only, plus `analytics_events` facts. The watch page's data layer (`watchApi.mjs`) serves both APIs with the same shapes, so `Watch.jsx` calls `client.view / engagement / comment / react / progressBeacon` regardless of the recording's source.

@@ -29,14 +29,14 @@
 
 ## 4. Analytics events
 
-Append-only `analytics_events` for funnel/behavior facts: `view, play, progress_25/50/75/complete, reaction, comment, share_copy, share_slack, lead, paywall_hit, checkout_open`. Paywall triggers keep the canonical names from `conversion.js` (`storage_limit_reached`, `recording_over_limit`, `analytics_attempted`, …) so historical comparisons survive migration.
+Append-only `analytics_events` for funnel/behavior facts: `view, play, progress_25/50/75/complete, reaction, comment, share_copy, share_slack, lead, paywall_hit, checkout_open`. Paywall triggers keep the canonical names from `conversion.js` (`storage_limit_reached`, `recording_over_limit`, `analytics_attempted`, …) so historical comparisons survive migration. *(T-1003 ✅ `api/src/paywall.js`: every v1 `403 feature_locked` and every plan-limit refusal (`storage_limit`, `video_limit`, `recording_limit` — recorded after the reservation transaction rolled back, so the fact survives it) writes one `paywall_hit` with `props.trigger` = the legacy name (`analytics_attempted`, `password_protection_attempted`, `remove_branding_attempted`, `advanced_sharing_attempted`, `transcription_attempted`, `ai_docs_attempted`, `storage_limit_reached`, `recording_over_limit`, `video_limit_reached`) plus `feature`, attributed to the user and recording. `view`, `comment`, `reaction` land with T-1001.)*
 
 ## 5. Owner analytics (Pro-gated, `analyticsEnabled`)
 
 Per recording (`GET /recordings/:id/analytics`):
 - `views` (unique, non-owner), `viewers[]` (name/email for signed-in, "Anonymous (Chrome, DE)" style for others; last seen; max progress per viewer),
 - `engagement`: avgViewThrough = avg(max_progress), completionRate = share(completed), samples = count — same numbers the current UI shows, now per-viewer-accurate instead of `{sum,n}` blobs,
-- **retention curve** (new, cheap now): histogram of max_progress deciles,
+- **retention curve** (new, cheap now): histogram of max_progress deciles, *(T-1002 ✅ — `viewSessions.retentionForOwner`: one `generate_series(0,9)` query counting viewers with `max_progress ≥ d/10`)*
 - reactions/comments/leads lists.
 Workspace-level rollups on `/analytics/overview` (totals per recording, 30-day trend from `analytics_events`).
 

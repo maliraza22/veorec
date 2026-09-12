@@ -12,6 +12,7 @@
 const express = require('express');
 const { errorHandler, badRequest, forbidden, notFound, conflict, ApiError } = require('./errors');
 const { createIdentityBridge, scopeOf } = require('./identity');
+const { paywall } = require('./paywall');   // T-1003
 
 const asyncRoute = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 const REASON = 'T-603 API: transcription/AI triggers (rows only; the worker runs the jobs)';
@@ -58,7 +59,8 @@ function createAiRouter({ repositories, withTransaction, requireAuth, entitlemen
   }
   async function gate(feature, ctx) {
     const on = await entitlements.isFeatureEnabled(feature, ctx);
-    if (!on) throw forbidden('feature_locked', `${feature === 'aiDocsEnabled' ? 'AI summaries, chapters & translation are' : 'AI transcription is'} a Pro feature. Upgrade to unlock it.`, { upgradeRequired: true, details: { feature } });
+    // T-1003: the paywall is also a recorded conversion fact (canonical trigger name).
+    if (!on) throw await paywall(ctx.repos, { userId: ctx.req && ctx.req.pgUserId, recordingId: ctx.recording && ctx.recording.id, feature, message: `${feature === 'aiDocsEnabled' ? 'AI summaries, chapters & translation are' : 'AI transcription is'} a Pro feature. Upgrade to unlock it.` }, logger);
   }
 
   /** Create-or-requeue the logical job for a dedupe key. Returns the row. */

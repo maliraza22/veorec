@@ -26,6 +26,7 @@ const express = require('express');
 const { errorHandler, badRequest, forbidden, notFound } = require('./errors');
 const { createIdentityBridge, scopeOf } = require('./identity');
 const { legacyPosterUrl } = require('./legacy-media');   // T-803: the READ fallback for un-backfilled rows
+const { paywall } = require('./paywall');                 // T-1003: every feature_locked is also a conversion fact
 
 const MAX_TITLE = 200;
 const MAX_DESCRIPTION = 5000;
@@ -406,8 +407,10 @@ async function buildMetaPatch(body, { entitlements, repos, scope, recording }) {
     if (body[field] === undefined) continue;
     const enabled = await entitlements.isFeatureEnabled(feature, { repos, scope, recording });
     if (!enabled) {
-      throw forbidden('feature_locked', `${feature} is not available on your plan.`,
-        { upgradeRequired: true, meta: { feature } });
+      // T-1003: the paywall is also a recorded conversion fact (canonical trigger name).
+      const err = await paywall(repos, { userId: scope.userId, recordingId: recording.id, feature, message: `${feature} is not available on your plan.` });
+      err.meta = { feature };
+      throw err;
     }
     if (field === 'password') {
       if (body.password === null) patch.passwordHash = null;

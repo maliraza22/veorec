@@ -113,8 +113,8 @@ Error (every non-2xx):
 
 | Method & path | Auth | Response |
 |---|---|---|
-| GET `/recordings/:id/analytics` | ⚿ owner, Pro `analyticsEnabled` | `{views, uniqueViewers, viewers:[{name,email,at,maxProgress}], engagement:{avgViewThrough,completionRate,samples}, reactions, comments, leads}` — SQL aggregates over view_sessions |
-| GET `/analytics/overview` | ⚿, Pro | per-recording rollup for the analytics page |
+| GET `/recordings/:id/analytics` | ⚿ owner, Pro `analyticsEnabled` | `{views, uniqueViewers, viewers:[{name,email,at,maxProgress}], engagement:{avgViewThrough,completionRate,samples}, reactions, comments, leads}` — SQL aggregates over view_sessions *(T-1002 ✅ `api/src/analytics.router.js`: also `retention:[{decile,viewers}]` (viewers reaching each tenth) and `viewers[].verified/completed`; signed-in viewers named from `users`, anonymous ones "Anonymous viewer"; the owner's own sessions excluded by user id; a locked account gets `403 feature_locked` + `upgradeRequired` AND a `paywall_hit` event (T-1003))* |
+| GET `/analytics/overview` | ⚿, Pro | per-recording rollup for the analytics page *(T-1002 ✅: `?days=` (1–90, default 30) → `{days, totals:{recordings,views,comments,reactions,completed,completionRate}, recordings:[{id,title,created_at,views,comments,reactions,avgViewThrough,completionRate}], trend:[{day,views,comments,reactions,paywallHits}]}` — the trend comes from `analytics_events`, every day of the window present)* |
 | GET `/notifications` | ⚿ | `{items:[Event], unread, lastReadAt}` — query over comments/reactions/view_sessions newer-than, excluding actor==owner **by user_id** (not display-name matching) *(T-803 ✅: `Event = {type:'comment'|'reaction'|'view', name, videoId, videoTitle, text?, emoji?, at}` with `at`/`lastReadAt` in epoch ms — the bell's existing shape; three indexed queries (live recordings only, deleted comments and owner self-views excluded, signed-in viewers named from `users`), merged newest first, capped at 50; `unread` = events after the read marker)* |
 | POST `/notifications/read` | ⚿ | `{lastReadAt}` *(T-803 ✅: upserts `notification_reads`; monotonic — an older stamp never moves it back)* |
 

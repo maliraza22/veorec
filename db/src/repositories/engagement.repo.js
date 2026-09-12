@@ -10,7 +10,7 @@
 'use strict';
 
 const { and, eq, isNull, desc, sql } = require('drizzle-orm');
-const { shareLinks, comments, reactions, viewSessions, leads, analyticsEvents, recordings } = require('../schema');
+const { shareLinks, comments, reactions, viewSessions, leads, analyticsEvents, recordings, users } = require('../schema');
 const { newId } = require('../ids');
 const { exec, NotFoundError } = require('./errors');
 const { requireScope, requireSystemReason } = require('./scope');
@@ -180,6 +180,38 @@ module.exports = function engagementRepos(db) {
           .where(and(eq(viewSessions.recordingId, recordingId), eq(viewSessions.isOwner, false))));
         return row || { views: 0, avgProgress: 0, completed: 0 };
       },
+      /**
+       * T-1002: the viewers list for the owner (docs/13 §5) — signed-in ones
+       * named from `users`, anonymous ones labelled; newest activity first.
+       */
+      async viewersForOwner(scope, recordingId, { limit = 200 } = {}) {
+        const { userId } = requireScope(scope);
+        await assertOwnsRecording(db, userId, recordingId);
+        const rows = await exec('view_session', () => db.select({
+          viewerUserId: viewSessions.viewerUserId, name: users.name, email: users.email,
+          startedAt: viewSessions.startedAt, lastSeenAt: viewSessions.lastSeenAt,
+          maxProgress: viewSessions.maxProgress, completed: viewSessions.completed,
+        }).from(viewSessions).leftJoin(users, eq(viewSessions.viewerUserId, users.id))
+          .where(and(eq(viewSessions.recordingId, recordingId), eq(viewSessions.isOwner, false)))
+          .orderBy(desc(viewSessions.lastSeenAt), desc(viewSessions.startedAt)).limit(limit));
+        return rows.map((r) => ({ ...r, name: r.viewerUserId ? (r.name || 'Member') : 'Anonymous viewer', email: r.viewerUserId ? r.email : null }));
+      },
+      /**
+       * T-1002: the retention curve — for each decile d (0..9) how many
+       * non-owner viewers reached at least d/10 of the video.
+       * @returns {Promise<Array<{decile: number, viewers: number}>>}
+       */
+      async retentionForOwner(scope, recordingId) {
+        const { userId } = requireScope(scope);
+        await assertOwnsRecording(db, userId, recordingId);
+        const res = await exec('view_session', () => db.execute(sql`
+          select d.decile::int as decile,
+                 count(v.id) filter (where v.max_progress >= d.decile / 10.0)::int as viewers
+          from generate_series(0, 9) as d(decile)
+          left join view_sessions v on v.recording_id = ${recordingId} and v.is_owner = false
+          group by d.decile order by d.decile`));
+        return (res.rows || []).map((r) => ({ decile: Number(r.decile), viewers: Number(r.viewers) }));
+      },
     },
 
     leads: {
@@ -206,6 +238,47 @@ module.exports = function engagementRepos(db) {
         const [row] = await exec('analytics_event', () => db.insert(analyticsEvents)
           .values({ event, recordingId, userId, props }).returning());
         return row;
+      },
+      /**
+       * T-1002: per-recording rollup for the owner's analytics overview —
+       * unique non-owner views, avg progress, completed, live comments,
+       * reactions — one grouped query per source, merged per recording.
+       */
+      async rollupForOwner(scope, { limit = 200 } = {}) {
+        const { userId } = requireScope(scope);
+        const res = await exec('recording', () => db.execute(sql`
+          select r.id, r.title, r.created_at,
+                 coalesce(v.views, 0)::int as views, coalesce(v.avg_progress, 0)::float as avg_progress, coalesce(v.completed, 0)::int as completed,
+                 coalesce(c.n, 0)::int as comments, coalesce(x.n, 0)::int as reactions
+          from recordings r
+          left join (select recording_id, count(*) as views, avg(max_progress) as avg_progress, count(*) filter (where completed) as completed
+                     from view_sessions where is_owner = false group by recording_id) v on v.recording_id = r.id
+          left join (select recording_id, count(*) as n from comments where deleted_at is null group by recording_id) c on c.recording_id = r.id
+          left join (select recording_id, count(*) as n from reactions group by recording_id) x on x.recording_id = r.id
+          where r.user_id = ${userId} and r.deleted_at is null
+          order by r.created_at desc limit ${limit}`));
+        return (res.rows || []).map((r) => ({ id: r.id, title: r.title, createdAt: r.created_at, views: Number(r.views), avgProgress: Number(r.avg_progress), completed: Number(r.completed), comments: Number(r.comments), reactions: Number(r.reactions) }));
+      },
+      /**
+       * T-1002: the owner's day-by-day trend from analytics_events over the
+       * last `days` days (UTC), every day present even when empty.
+       * @returns {Promise<Array<{day: string, views: number, comments: number, reactions: number, paywallHits: number}>>}
+       */
+      async trendForOwner(scope, { days = 30 } = {}) {
+        const { userId } = requireScope(scope);
+        const n = Math.max(1, Math.min(90, Number(days) || 30));
+        const res = await exec('analytics_event', () => db.execute(sql`
+          select to_char(d.day, 'YYYY-MM-DD') as day,
+                 count(e.id) filter (where e.event = 'view')::int as views,
+                 count(e.id) filter (where e.event = 'comment')::int as comments,
+                 count(e.id) filter (where e.event = 'reaction')::int as reactions,
+                 count(e.id) filter (where e.event = 'paywall_hit')::int as paywall_hits
+          from generate_series((now() at time zone 'utc')::date - (${n}::int - 1), (now() at time zone 'utc')::date, interval '1 day') as d(day)
+          left join analytics_events e
+            on (e.created_at at time zone 'utc')::date = d.day::date
+           and (e.recording_id in (select id from recordings where user_id = ${userId}) or (e.recording_id is null and e.user_id = ${userId}))
+          group by d.day order by d.day`));
+        return (res.rows || []).map((r) => ({ day: r.day, views: Number(r.views), comments: Number(r.comments), reactions: Number(r.reactions), paywallHits: Number(r.paywall_hits) }));
       },
       async countByEventSystem({ since }, reason) {
         requireSystemReason(reason);

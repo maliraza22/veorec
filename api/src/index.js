@@ -17,6 +17,8 @@ const { createNotificationsRouter } = require('./notifications.router');
 const { createSharingRouter } = require('./sharing.router');
 const { createEngagementRouter } = require('./engagement.router');
 const { createWatchContext } = require('./watch-context');
+const { createAnalyticsRouter } = require('./analytics.router');
+const paywall = require('./paywall');
 const authz = require('./authz');
 const rateLimit = require('./rate-limit');
 const quota = require('./quota');
@@ -40,6 +42,8 @@ module.exports = {
   createSharingRouter,
   // T-1001: engagement (views / progress / comments / reactions) on PostgreSQL, sharing the watch context.
   createEngagementRouter, createWatchContext,
+  // T-1002 / T-1003: owner analytics from view_sessions + the unified paywall events.
+  createAnalyticsRouter, ...paywall,
   ...identity,
   ...errors,
 };

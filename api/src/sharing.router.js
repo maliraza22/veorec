@@ -16,6 +16,7 @@ const crypto = require('crypto');
 const express = require('express');
 const { errorHandler, badRequest, forbidden, notFound, ApiError } = require('./errors');
 const { createIdentityBridge, scopeOf } = require('./identity');
+const { paywall } = require('./paywall');   // T-1003
 
 const asyncRoute = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 const MAX_LABEL = 80;
@@ -89,7 +90,7 @@ function createSharingRouter({ repositories, requireAuth, entitlements = { isFea
     if (body.password !== undefined && body.password !== null && body.password !== '') {
       if (typeof body.password !== 'string' || body.password.length < MIN_PASSWORD) throw badRequest('invalid_request', `password must be at least ${MIN_PASSWORD} characters.`);
       const on = await entitlements.isFeatureEnabled('passwordProtection', { repos, scope, recording, req });
-      if (!on) throw forbidden('feature_locked', 'Password-protected links are a Pro feature. Upgrade to unlock them.', { upgradeRequired: true, details: { feature: 'passwordProtection' } });
+      if (!on) throw await paywall(repos, { userId: req.pgUserId, recordingId: recording.id, feature: 'passwordProtection', message: 'Password-protected links are a Pro feature. Upgrade to unlock them.' }, logger);
       data.passwordHash = sha256(body.password);
     }
     const token = crypto.randomBytes(16).toString('base64url');
@@ -117,7 +118,7 @@ function createSharingRouter({ repositories, requireAuth, entitlements = { isFea
     const repos = repositories();
     const recording = await mustOwn(repos, scope, req.params.id);
     const on = await entitlements.isFeatureEnabled('slackEnabled', { repos, scope, recording, req });
-    if (!on) throw forbidden('feature_locked', 'Sharing to Slack is a Pro feature. Upgrade to unlock it.', { upgradeRequired: true, details: { feature: 'slack' } });
+    if (!on) throw await paywall(repos, { userId: req.pgUserId, recordingId: recording.id, feature: 'slack', message: 'Sharing to Slack is a Pro feature. Upgrade to unlock it.' }, logger);
     const user = await repos.users.findById(req.pgUserId);
     const webhook = user && user.slackWebhook;
     if (!webhook || !/^https:\/\/hooks\.slack\.com\//.test(webhook)) throw badRequest('needs_webhook', 'Add your Slack webhook in account settings first.', { meta: { needsWebhook: true } });

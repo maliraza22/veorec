@@ -43,6 +43,7 @@ const {
   ApiError, errorHandler, badRequest, forbidden, notFound, conflict, unprocessable,
 } = require('./errors');
 const { createIdentityBridge, scopeOf } = require('./identity');
+const { recordPaywall } = require('./paywall');   // T-1003: plan-limit rejections are conversion facts too
 
 // docs/06 §3
 const DEFAULT_PART_SIZE = 8 * 1024 * 1024;      // 8 MiB
@@ -178,14 +179,22 @@ function createUploadRouter(deps) {
       if (!quota) {
         return repos.uploads.createSession(scope, { ...fields, byteCeiling: fixedCeiling ?? planCeiling, expiresAt });
       }
-      return withTransaction(async (tx) => {
-        const { reserveBytes } = await quota.reserve({
-          tx, scope, limits, expiresAt, maxBytes: fixedCeiling, declaredBytes,
+      try {
+        return await withTransaction(async (tx) => {
+          const { reserveBytes } = await quota.reserve({
+            tx, scope, limits, expiresAt, maxBytes: fixedCeiling, declaredBytes,
+          });
+          const session = await tx.uploads.createSession(scope, { ...fields, byteCeiling: reserveBytes, expiresAt });
+          await quota.attach({ tx, scope, uploadSessionId: session.id, reserveBytes, expiresAt });
+          return session;
         });
-        const session = await tx.uploads.createSession(scope, { ...fields, byteCeiling: reserveBytes, expiresAt });
-        await quota.attach({ tx, scope, uploadSessionId: session.id, reserveBytes, expiresAt });
-        return session;
-      });
+      } catch (err) {
+        // T-1003: a plan-limit refusal is a conversion fact — recorded AFTER the
+        // reservation transaction rolled back, so the event survives it.
+        const feature = err && (err.code === 'video_limit' ? 'videoLimit' : err.code === 'recording_limit' ? 'recordingLimit' : err.code === 'storage_limit' ? 'storageLimit' : null);
+        if (feature) await recordPaywall(repos, { userId: req.pgUserId, recordingId, feature, meta: err.meta || {} }, logger);
+        throw err;
+      }
     }
 
     async function replayOnConflict(err) {
@@ -202,6 +211,7 @@ function createUploadRouter(deps) {
       // than the plan allows, never more than 32 MiB. The declared size must
       // already fit, or the PUT we are about to sign could never succeed.
       if (!quota && sizeBytes > Math.min(planCeiling, SINGLE_MAX_BYTES)) {
+        await recordPaywall(repos, { userId: req.pgUserId, recordingId: recording.id, feature: 'storageLimit', meta: { sizeBytes } }, logger);
         throw forbidden('storage_limit',
           'This upload would exceed the size limit reserved for the recording.',
           { upgradeRequired: true, meta: { byteCeiling: Math.min(planCeiling, SINGLE_MAX_BYTES), sizeBytes } });
@@ -300,6 +310,7 @@ function createUploadRouter(deps) {
     const declared = requested.reduce((sum, p) => sum + p.size, 0);
     const ceiling = Number(session.byteCeiling);
     if (already + declared > ceiling) {
+      await recordPaywall(repos, { userId: req.pgUserId, recordingId: session.recordingId, feature: 'storageLimit', meta: { byteCeiling: ceiling, alreadyDeclared: already } }, logger);
       throw forbidden('storage_limit',
         'This upload would exceed the size limit reserved for the recording.',
         { upgradeRequired: true, meta: { byteCeiling: ceiling, alreadyDeclared: already } });
@@ -447,6 +458,7 @@ function createUploadRouter(deps) {
         await repos.uploads.setSessionStatus(scope, session.id, 'aborted');
       }
       telemetry.uploadFinished(req, 'rejected_limit', { code: verdict.code || 'storage_limit', mode: session.mode });
+      await recordPaywall(repos, { userId: req.pgUserId, recordingId: session.recordingId, feature: verdict.code === 'video_limit' ? 'videoLimit' : verdict.code === 'recording_limit' ? 'recordingLimit' : 'storageLimit', meta: verdict.meta || {} }, logger);
       throw forbidden(verdict.code || 'storage_limit', verdict.message
         || 'This upload exceeds your plan.', { upgradeRequired: true, meta: verdict.meta });
     };

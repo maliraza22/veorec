@@ -9,13 +9,14 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node ../tests/identity-bridge.test.js && node ../tests/uploads-api.test.js && node ../tests/recordings-api.test.js && node ../tests/quota.test.js && node ../tests/admin-jobs.test.js && node ../tests/ai-api.test.js && node ../tests/pipeline-backfill.test.js && node ../tests/watch-api.test.js && node ../tests/library-api.test.js && node ../tests/sharing-api.test.js && node ../tests/engagement-api.test.js",
+    "test": "node ../tests/identity-bridge.test.js && node ../tests/uploads-api.test.js && node ../tests/recordings-api.test.js && node ../tests/quota.test.js && node ../tests/admin-jobs.test.js && node ../tests/ai-api.test.js && node ../tests/pipeline-backfill.test.js && node ../tests/watch-api.test.js && node ../tests/library-api.test.js && node ../tests/sharing-api.test.js && node ../tests/engagement-api.test.js && node ../tests/analytics-api.test.js",
     "test:ai": "node ../tests/ai-api.test.js",
     "test:backfill-pipeline": "node ../tests/pipeline-backfill.test.js",
     "test:watch": "node ../tests/watch-api.test.js",
     "test:library": "node ../tests/library-api.test.js",
     "test:sharing": "node ../tests/sharing-api.test.js",
     "test:engagement": "node ../tests/engagement-api.test.js",
+    "test:analytics": "node ../tests/analytics-api.test.js",
     "test:uploads": "node ../tests/uploads-api.test.js",
     "test:recordings": "node ../tests/recordings-api.test.js",
     "test:identity": "node ../tests/identity-bridge.test.js",
