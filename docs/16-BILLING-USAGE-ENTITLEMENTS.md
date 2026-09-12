@@ -49,6 +49,8 @@ pro.min_start_bytes                 = 67_108_864
 
 `summary(user)` (plan, planSlug, isPaid, source: comped|subscription|free, subscription snapshot) is embedded in `user.entitlements` on auth responses and served at `GET /me/entitlements` — the extension recorder consumes it for the countdown limit (`03` §8).
 
+*(T-1303, as implemented: `api/src/entitlements.js` — `isEntitled(sub, now)` (active / trialing / past_due, and `canceled` while `current_period_end > now`), `resolveEntitlement({user, subscription, plans, now})` (admin comp — only an exact, known plan slug counts, optional expiry — → entitled subscription → free), `summaryBody` = the legacy `entitlements.summary` shape served at `GET /api/v1/me/entitlements` and consumed by `client/src/hooks/useBilling.js` when the v1 stack answers for the account. The legacy `entitlements.js` keeps serving the legacy path unchanged.)*
+
 ## 3. Server-side enforcement (unchanged shape, new authority points)
 
 All gates return `{allowed, reason?, upgradeRequired?, meta?}` and are called server-side before privileged actions (`permissions.service` port):
@@ -184,6 +186,8 @@ Nightly `maintenance.usage_sync` re-derives `retained`, `active_video_count`, an
 3. Process in one transaction: resolve user (custom_data.userId → known subscription/customer id, as today), apply the event to `subscriptions` + user mirror fields, mark event `processed`.
 4. **Out-of-order guard (new)**: events apply only if `payload.occurred_at` ≥ the subscription row's last applied event time (stored as `subscriptions.last_event_at`); older events mark `skipped`. Fixes the late-`updated`-after-`canceled` resurrection class.
 5. Processing exception ⇒ event `failed` + **HTTP 500** so Paddle retries (replacing the blind 200 at `webhooks.paddle.js:173-178`). Signature failure stays 401.
+
+*(T-1301, as implemented: `api/src/billing.js` — see `08` §13. The guard compares `occurred_at` with `subscriptions.last_event_at`; `transaction.completed` applies only when the user is not already entitled (`reason:'already_entitled'` otherwise); failed events answer 500 after being recorded. Paddle's notification URL is switched from the legacy `/api/webhooks/paddle` to `/api/v1/webhooks/paddle` at cutover — an operator step (`23`); until then the legacy handler serves and its dual-write mirrors `subscriptions`. Tests: `tests/billing-webhook.test.js` (42, real PostgreSQL).)*
 
 Event handling semantics preserved: created/updated/activated/resumed upsert full state; paused → status paused + drop to free; canceled → status canceled with period end; `transaction.completed` as the ordering safety net; `payment_failed` → past_due (grace via entitled statuses); customer.created/updated attaches `paddle_customer_id` by email.
 

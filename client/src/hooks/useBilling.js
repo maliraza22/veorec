@@ -24,12 +24,17 @@ export function useBilling() {
     setLoading(true);
     try {
       const safe = (p) => p.catch(() => null);
-      const [eRes, uRes, vRes] = await Promise.all([
+      const [eRes, uRes, vRes, veRes] = await Promise.all([
         safe(fetch(`${API}/api/me/entitlements`, { headers: authHeaders })),
         safe(fetch(`${API}/api/me/usage`, { headers: authHeaders })),
         safe(fetch(`${API}/api/v1/me/usage`, { headers: authHeaders })),
+        safe(fetch(`${API}/api/v1/me/entitlements`, { headers: authHeaders })),
       ]);
-      const ent = eRes && eRes.ok ? await eRes.json() : null;
+      // T-1303: the PostgreSQL-resolved entitlement wins when the v1 stack
+      // serves this account (same shape); 404/503/anything else → legacy.
+      const legacyEnt = eRes && eRes.ok ? await eRes.json() : null;
+      const v1Ent = veRes && veRes.ok ? await veRes.json().catch(() => null) : null;
+      const ent = v1Ent && v1Ent.plan ? { ...v1Ent, resolvedBy: 'v1' } : legacyEnt;
       const legacy = uRes && uRes.ok ? await uRes.json() : null;
       // 404 (v1 not mounted), 503 account_not_migrated, anything else → legacy.
       const v1 = vRes && vRes.ok ? await vRes.json().catch(() => null) : null;

@@ -442,7 +442,18 @@ if (process.env.V1_UPLOAD_API === 'true') {
       },
     }));
     // T-306: the caller's own dual quota meters (docs/16 §4.5).
-    app.use('/api/v1', createMeRouter({ repositories, requireAuth, quota, logger }));
+    // T-1303: the caller's entitlement resolved from PostgreSQL rows only
+    // (admin comp → entitled subscription → free), from the ONE plan catalog.
+    app.use('/api/v1', createMeRouter({ repositories, requireAuth, quota, plans, logger }));
+    // T-1301: the idempotent Paddle webhook ledger (docs/16 §6). Paddle's
+    // notification URL is switched to /api/v1/webhooks/paddle at cutover (an
+    // operator step, docs/23); until then the legacy handler keeps serving and
+    // its dual-write mirrors subscriptions. custom_data.userId is the legacy id.
+    {
+      const { idFor } = require('../db/src/legacy-ids.js');
+      const { createBillingWebhookRouter } = require('../api/src/index.js');
+      app.use('/api/v1', createBillingWebhookRouter({ repositories, withTransaction, secret: billingConfig.PADDLE.webhookSecret || null, plans, userIdFor: (id) => idFor('usr', id), logger }));
+    }
     // T-601: processing-job triage — GET /admin/jobs?status=failed, POST
     // /admin/jobs/:id/retry. Same admin allowlist as the legacy admin routes;
     // the API never touches Redis (a retry resets the row, the worker's outbox

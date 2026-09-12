@@ -18,6 +18,8 @@ const { createSharingRouter } = require('./sharing.router');
 const { createEngagementRouter } = require('./engagement.router');
 const { createWatchContext } = require('./watch-context');
 const { createAnalyticsRouter } = require('./analytics.router');
+const billing = require('./billing');
+const entitlements = require('./entitlements');
 const { createEditingRouter } = require('./editing.router');
 const paywall = require('./paywall');
 const authz = require('./authz');
@@ -45,6 +47,8 @@ module.exports = {
   createEngagementRouter, createWatchContext,
   // T-1002 / T-1003: owner analytics from view_sessions + the unified paywall events.
   createAnalyticsRouter, ...paywall,
+  // T-1301 / T-1303: the Paddle webhook ledger and entitlement resolution on PostgreSQL.
+  ...billing, ...entitlements,
   // T-1201: edit sessions, render enqueue, silence removal, stitch (the worker renders).
   createEditingRouter,
   ...identity,

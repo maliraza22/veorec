@@ -166,6 +166,10 @@ Clients poll `GET /recordings/:id/status` (or the transcript endpoint) — repla
 | POST `/billing/sync` / `/cancel` / `/resume` / `/change-plan` | ⚿ | as today via billing.service |
 | GET `/billing/portal` | ⚿ | portal session URL |
 | POST `/webhooks/paddle` | signature | **New behavior:** verify signature → insert `billing_events` (dup event id ⇒ 200 skip) → process in tx → 200; processing error ⇒ mark failed + **500** (Paddle retries). Never blind-200 (fixes `webhooks.paddle.js:173-178`) |
+| GET `/me/entitlements` | ⚿ | *(T-1303)* the client-safe summary `{plan, planSlug, isPaid, source:'comped'|'subscription'|'free', comped, subscription}` resolved from PostgreSQL rows only (`api/src/entitlements.js`: admin comp → entitled subscription — `canceled` keeps access until `current_period_end` — → free) |
+| GET `/me/subscription` | ⚿ | *(T-1303)* `{subscription: {id, status, planSlug, billingCycle, currentPeriodStart, currentPeriodEnd, cancelAtPeriodEnd, entitled, updatedAt} | null, planSlug, source}` — no Paddle identifiers |
+
+*(T-1301, as implemented — `api/src/billing.js`, `POST /api/v1/webhooks/paddle`: `paddle-signature` = `ts=…;h1=HMAC-SHA256(secret, "ts:rawBody")` compared timing-safe (401 otherwise, nothing recorded); `billing_events` insert `ON CONFLICT (paddle_event_id) DO NOTHING` → `200 {ok, duplicate:true}`; then ONE transaction: the user is resolved from `custom_data.userId` (the legacy id → `usr_<id>` via the identity bridge), else the Paddle subscription / customer id on `subscriptions`, else (customer events) the e-mail; the **out-of-order guard** skips any event older than the subscription's `last_event_at` (`skipped`, `error:'out_of_order'`); the ported semantics apply to `subscriptions` (+ `users.paddle_customer_id`); the event is marked `processed`. An unresolvable user or an unhandled type is `skipped` (200 — no retry storm); a processing exception is `failed` + **500**. Responses: `{ok, duplicate, status, reason}`. Failed rows are listable for the operator alert (`billingEvents.listFailedSystem`).)*
 | POST `/events/upgrade-intent` | ⚿ | writes `analytics_events(event:'paywall_hit')` |
 
 ## 14. Contact & misc

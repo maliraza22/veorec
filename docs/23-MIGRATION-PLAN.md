@@ -139,6 +139,13 @@ possible while an account may be unmirrored (an edit session needs the PostgreSQ
 so the cutover is the `V1_EDITOR` gate per account and the removal is Phase 14, gated on
 `deprecations.legacy{Trim,Compose,Stitch,Silence}Used` staying at zero.
 
+**Paddle webhook URL (T-1301).** The idempotent ledger handler is mounted at
+`POST /api/v1/webhooks/paddle` (`16` §6). Switching Paddle's notification destination
+from the legacy `/api/webhooks/paddle` to it is an **operator step at cutover** (Paddle
+dashboard → Notifications); both handlers verify the same secret, and until the switch the
+legacy handler keeps serving with its dual-write mirror of `subscriptions`. After the switch
+the legacy handler is dead code for Phase 14.
+
 ## Phase 4 — Local recovery (IndexedDB)
 - **Goal:** `05` fully: chunk persistence, sessions, recovery UI.
 - **Files:** extension `store/recorderStore.ts`, recovery card in recorder + popup badge.
