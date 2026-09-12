@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "VeoRec — Screen Recorder & Share",
-  "version": "1.13.0",
+  "version": "1.14.0",
   "minimum_chrome_version": "116",
   "description": "Record your screen, camera & mic, then get an instant shareable link with AI transcription. Free & fast — a Loom alternative.",
   "permissions": [
@@ -20,20 +20,35 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://veorec.com/*", "https://www.veorec.com/*"],
-      "js": ["bridge.js"],
+      "matches": [
+        "https://veorec.com/*",
+        "https://www.veorec.com/*"
+      ],
+      "js": [
+        "bridge.js"
+      ],
       "run_at": "document_idle"
     },
     {
-      "matches": ["https://mail.google.com/*"],
-      "js": ["gmail.js"],
+      "matches": [
+        "https://mail.google.com/*"
+      ],
+      "js": [
+        "gmail.js"
+      ],
       "run_at": "document_idle"
     }
   ],
   "web_accessible_resources": [
     {
-      "resources": ["bubble.html", "bubble.js"],
-      "matches": ["http://*/*", "https://*/*"]
+      "resources": [
+        "bubble.html",
+        "bubble.js"
+      ],
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ]
     }
   ],
   "action": {
