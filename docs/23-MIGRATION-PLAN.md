@@ -132,6 +132,13 @@ capability.**
 over a full observation window. It currently has no caller in the client or the
 extension — the counter is what turns that observation into evidence.
 
+**Legacy editing handlers (`trim`, `compose`, `stitch`, `remove-silences`).** T-1205
+keeps them functional and byte-identical and measures every use
+(`deprecated_editing_used`, `19` §8.3): aliasing them onto edit sessions is not
+possible while an account may be unmirrored (an edit session needs the PostgreSQL row),
+so the cutover is the `V1_EDITOR` gate per account and the removal is Phase 14, gated on
+`deprecations.legacy{Trim,Compose,Stitch,Silence}Used` staying at zero.
+
 ## Phase 4 — Local recovery (IndexedDB)
 - **Goal:** `05` fully: chunk persistence, sessions, recovery UI.
 - **Files:** extension `store/recorderStore.ts`, recovery card in recorder + popup badge.
