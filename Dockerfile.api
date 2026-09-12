@@ -1,0 +1,49 @@
+# VeoRec API — the v1 stack (server + api + db + storage packages).
+#
+# The legacy image (server/Dockerfile) builds whisper.cpp and uses server/ as
+# its build context, so it cannot see the sibling packages the v1 routers
+# require. This image uses the REPOSITORY ROOT as context and installs each
+# workspace package, which is what `V1_UPLOAD_API=true` needs at runtime.
+# Transcription runs in the worker on the v1 stack, so no whisper/ffmpeg here.
+
+# ── Stage 1: the SPA ─────────────────────────────────────────────────────────
+# Built from source inside the image so the deploy never depends on a local
+# `client/dist` (which is git-ignored and would not reach the build context).
+# No VITE_API_URL: the bundle calls relative paths, and stage 2 serves it from
+# the same origin as the API, so the browser makes no cross-origin request.
+FROM node:20-slim AS client
+WORKDIR /client
+COPY client/package*.json ./
+RUN npm install --no-audit --no-fund
+COPY client ./
+RUN npx vite build
+
+# ── Stage 2: the API ────────────────────────────────────────────────────────
+FROM node:20-slim
+
+WORKDIR /app
+ENV NODE_ENV=production
+
+# Manifests first so dependency layers cache across code changes.
+COPY db/package*.json ./db/
+COPY storage/package*.json ./storage/
+COPY api/package*.json ./api/
+COPY server/package*.json ./server/
+
+RUN cd /app/db      && npm install --omit=dev --no-audit --no-fund \
+ && cd /app/storage && npm install --omit=dev --no-audit --no-fund \
+ && cd /app/api     && npm install --omit=dev --no-audit --no-fund \
+ && cd /app/server  && npm install --omit=dev --no-audit --no-fund
+
+# Source. `db/migrations` ships with the image so `npm run db:migrate` can run
+# against the attached database from a one-off command.
+COPY db ./db
+COPY storage ./storage
+COPY api ./api
+COPY server ./server
+
+# server/index.js serves ../client/dist when it exists (one origin for app+API).
+COPY --from=client /client/dist ./client/dist
+
+EXPOSE 3000
+CMD ["node", "server/index.js"]

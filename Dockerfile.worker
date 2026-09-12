@@ -1,0 +1,25 @@
+# VeoRec worker — BullMQ consumers for the media, STT/AI and render queues.
+#
+# devDependencies ARE installed here on purpose: `ffmpeg-static` and
+# `ffprobe-static` provide the binaries `resolveBinaries()` falls back to, so
+# the image needs no apt ffmpeg. `server/plans.js` is the ONE plan catalog the
+# worker reads for storage verification; it depends only on fs/path.
+FROM node:20-slim
+
+WORKDIR /app
+ENV NODE_ENV=production
+
+COPY db/package*.json ./db/
+COPY storage/package*.json ./storage/
+COPY worker/package*.json ./worker/
+
+RUN cd /app/db      && npm install --omit=dev --no-audit --no-fund \
+ && cd /app/storage && npm install --omit=dev --no-audit --no-fund \
+ && cd /app/worker  && npm install --include=dev --no-audit --no-fund
+
+COPY db ./db
+COPY storage ./storage
+COPY worker ./worker
+COPY server/plans.js ./server/plans.js
+
+CMD ["node", "worker/src/main.js"]

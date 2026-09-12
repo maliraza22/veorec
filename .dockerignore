@@ -1,0 +1,13 @@
+# Build context hygiene for the monorepo images (Dockerfile.api / Dockerfile.worker).
+# node_modules are reinstalled inside the image for the correct platform, and
+# the SPA is built inside the image, so no local build output is required.
+**/node_modules
+**/dist
+.git
+docs
+tests
+store-screenshots
+extension
+*.zip
+*.crx
+*.pem
