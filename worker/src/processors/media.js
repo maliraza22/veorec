@@ -422,6 +422,78 @@ function registerMediaProcessors(registry) {
     return { assetId: cap.id, storageKey: cap.storageKey, transcriptId: transcript.id, cues: check.cues, language: transcript.language, sizeBytes: body.length };
   });
 
+  // ── media.hls (T-705, docs/09 §5) — never gates `ready` ──────────────────
+  const HLS_REASON = 'T-705 media worker: HLS renditions (optional enhancement, never gates ready)';
+  registry.register('hls', async ({ payload, job, signal, logger, deps, repositories }) => {
+    const repos = repositories();
+    const { storage, withTransaction, hlsPackager, keys } = deps;
+    if (!hlsPackager) throw new TransientError('packager_unavailable', 'No HLS packager (ffmpeg) configured on this worker.');
+    if (!storage || !keys) throw new TransientError('storage_unavailable', 'No storage provider / key builder configured on this worker.');
+    const recordingId = job.recordingId || (payload && payload.recordingId);
+    if (!recordingId) throw new TerminalError('invalid_payload', 'hls needs a recordingId');
+    const recording = await repos.recordings.getSystem(recordingId, HLS_REASON);
+    if (!recording || recording.deletedAt) throw new TerminalError('recording_gone', 'The recording no longer exists.');
+    if (NOT_PROCESSABLE.has(recording.status)) throw new TerminalError('recording_not_processable', `The recording is ${recording.status}.`);
+    const assets = await repos.assets.listByRecordingSystem(recordingId, HLS_REASON);
+    const source = assets.find((a) => a.kind === 'source' && a.status === 'ready');
+    if (!source) throw new TerminalError('no_source', 'The recording has no ready source asset.');
+    if (recording.duration == null || !source.codecVideo) throw new TerminalError('probe_required', 'The source has not been probed yet (facts missing).');
+
+    let hls = assets.find((a) => a.kind === 'hls');
+    if (hls && hls.status === 'ready' && !(payload && payload.force)) {
+      const exists = await storage.objectExists(hls.storageKey).catch(() => false);
+      if (exists) { logger.info({ recording_id: recordingId, asset_id: hls.id }, 'hls: already ready — skipped'); return { skipped: 'already_ready', assetId: hls.id }; }
+    }
+    if (!hls) {
+      const id = newId('asset');
+      hls = await repos.assets.createSystem({ id, recordingId, kind: 'hls', storageKey: keys.hlsMaster(recordingId, id), status: 'pending', immutable: false, countsTowardQuota: false, container: 'hls', createdByJobId: job.id }, HLS_REASON);
+    } else if (hls.status !== 'pending') {
+      await repos.assets.updateSystem(hls.id, { status: 'pending', createdByJobId: job.id }, HLS_REASON);
+    }
+
+    const dir = scratchDir(job.id);
+    const inPath = path.join(dir, `source${path.extname(source.storageKey) || ''}`);
+    const outDir = path.join(dir, 'hls');
+    let packaged;
+    const uploadedFiles = [];
+    try {
+      let head;
+      try { head = await storage.headObject(source.storageKey); }
+      catch (e) { if (e && e.code === 'object_not_found') throw new TerminalError('source_missing', 'The source object is missing from storage.'); throw new TransientError('storage_unavailable', `head failed: ${e.message}`); }
+      if (!scratchHasRoom(dir, 3 * Number(head.contentLength || 0))) throw new TransientError('scratch_full', 'not enough scratch space (need 3× source size for renditions)');
+      await download(storage, source.storageKey, inPath);
+      const sourceFacts = { durationSec: Number(recording.duration), audio: source.codecAudio ? { codec: source.codecAudio } : null, video: { codec: source.codecVideo, width: source.width, height: source.height } };
+      const timeoutMs = Math.max(10 * 60 * 1000, 3 * Number(recording.duration) * 1000);
+      let lastPersisted = -1;
+      packaged = await hlsPackager.packageHls(inPath, outDir, {
+        sourceFacts, signal, timeoutMs,
+        onProgress: (pct) => { if (pct - lastPersisted >= 5 || pct === 100) { lastPersisted = pct; repos.jobs.setProgressSystem(job.id, pct, HLS_REASON).catch(() => {}); } },
+      });
+      for (const f of packaged.files) {
+        const key = f.name === 'master.m3u8' ? hls.storageKey : keys.hlsSegment(recordingId, hls.id, f.name);
+        try { await storage.putObject(key, fs.createReadStream(f.path), { contentType: f.contentType, contentLength: f.bytes }); }
+        catch (e) { throw new TransientError('storage_unavailable', `upload failed (${f.name}): ${e.message}`); }
+        uploadedFiles.push({ name: f.name, key, bytes: f.bytes });
+      }
+    } catch (e) {
+      if (e && e.code === 'aborted') throw new TransientError('aborted', 'hls aborted');
+      if (e && e.code === 'timeout') throw new TransientError('hls_timeout', e.message);
+      if (e && e.code === 'ENOENT') throw new TransientError('ffmpeg_missing', `ffmpeg not found (${e.message})`);
+      if (e && e.code === 'tool_failed') throw new TransientError('ffmpeg_failed', e.message, { stderrTail: e.stderrTail });
+      if (e && e.code === 'output_invalid') throw new TransientError('output_invalid', e.message);
+      throw e;
+    } finally {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* scratch */ }
+    }
+    const top = packaged.variants.reduce((a, b) => (b.height > a.height ? b : a), packaged.variants[0]);
+    await withTransaction((tx) => tx.assets.updateSystem(hls.id, {
+      status: 'ready', sizeBytes: packaged.bytes, width: top.width, height: top.height, duration: String(recording.duration),
+      codecVideo: 'h264', codecAudio: packaged.hasAudio ? 'aac' : null, container: 'hls', createdByJobId: job.id,
+    }, HLS_REASON));
+    logger.info({ recording_id: recordingId, asset_id: hls.id, renditions: packaged.renditions.map((r) => r.name), files: uploadedFiles.length, bytes: packaged.bytes }, 'hls: renditions published (never gates ready)');
+    return { assetId: hls.id, master: hls.storageKey, renditions: packaged.variants.map((v) => ({ name: v.name, width: v.width, height: v.height, videoKbps: v.videoKbps })), files: uploadedFiles.length, sizeBytes: packaged.bytes, progress: 100 };
+  });
+
   return registry;
 }
 

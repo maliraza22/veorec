@@ -87,7 +87,7 @@ function createProber({ ffprobeBin = 'ffprobe', ffmpegBin = 'ffmpeg', logger = s
       durationSource,
       sizeBytes: Number.isFinite(Number(format.size)) ? Number(format.size) : sizeBytes,
       bitRate: Number.isFinite(Number(format.bit_rate)) ? Number(format.bit_rate) : null,
-      video: v ? { codec: String(v.codec_name || '').toLowerCase(), width: Number(v.width) || 0, height: Number(v.height) || 0, fps: fpsOf(v), pixFmt: v.pix_fmt || null } : null,
+      video: v ? { codec: String(v.codec_name || '').toLowerCase(), width: Number(v.width) || 0, height: Number(v.height) || 0, fps: fpsOf(v), pixFmt: v.pix_fmt || null, profile: v.profile || null, level: Number.isFinite(Number(v.level)) ? Number(v.level) : null } : null,
       audio: a ? { codec: String(a.codec_name || '').toLowerCase(), channels: Number(a.channels) || null, sampleRate: Number(a.sample_rate) || null } : null,
       streams: streams.map((s) => ({ type: s.codec_type, codec: s.codec_name })),
     };

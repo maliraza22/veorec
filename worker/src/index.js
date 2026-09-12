@@ -26,6 +26,7 @@ const thumbnail = require('./media/thumbnail');
 const playIcon = require('./media/play-icon');
 const audio = require('./media/audio');
 const captions = require('./media/captions');
+const hls = require('./media/hls');
 const mediaProcessors = require('./processors/media');
 const transcription = require('./stt/transcription');
 const { createAi } = require('./stt/ai');
@@ -63,4 +64,6 @@ module.exports = {
   previewClipStarts: thumbnail.previewClipStarts, renderPlayIconPng: playIcon.renderPlayIconPng,
   // T-704: audio extract + captions.
   createAudioExtractor: audio.createAudioExtractor, buildVtt: captions.buildVtt, validateVtt: captions.validateVtt,
+  // T-705: HLS renditions.
+  createHlsPackager: hls.createHlsPackager, renditionsFor: hls.renditionsFor, inspectPlaylists: hls.inspectPlaylists, avc1Codec: hls.avc1Codec, HLS_RENDITIONS: hls.RENDITIONS,
 };

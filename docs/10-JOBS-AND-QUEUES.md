@@ -52,6 +52,8 @@ For each: **input** (payload), **output**, **retry**, **timeout**, **idempotency
 ### `media.hls`
 - In: `{recordingId}`; conditional (>5min or >1080p); dedupe `hls:{recordingId}`. Retry 3× / long timeout. Fail: non-fatal (MP4 remains the playback path).
 
+> **As implemented (T-705):** `09` §5.1 — per-rendition passes into flat asset-scoped keys, self-written master, verification by init-segment probe + full null decode, never touches `recordings.status`; attempts exhausted leave the recording exactly as it was (MP4 remains the playback path) and the failed row sits in the dead-letter set.
+
 ### `media.audio_extract`
 - In: `{recordingId}`; dedupe `audio:{recordingId}`. Out: audio asset; chains `stt.transcribe` when auto-processing is on. Retry 3× / 10m. Fail: transcript status `failed(audio_extract_failed)`.
 

@@ -70,7 +70,7 @@ sequenceDiagram
 - Never expose raw bucket URLs; bucket is private (invariant: leaked URL ≤ TTL exposure, vs. today's forever-public Cloudinary URL).
 
 ### 5.2 HLS specifics
-Master playlist is fetched via presigned URL; variant playlists/segments: the API rewrites playlists at request time (`/watch/:id/hls/*` proxy for playlists **only** — tiny text files, not media bytes) embedding presigned segment URLs; segments go direct to R2. Alternative (preferred when adopted): CDN edge token covering the `derived/{recordingId}/…/hls/` prefix. Decision recorded per deployment in ops docs; both satisfy "API serves no video bytes".
+Master playlist is fetched via presigned URL; variant playlists/segments: the API rewrites playlists at request time (`/watch/:id/hls/*` proxy for playlists **only** — tiny text files, not media bytes) embedding presigned segment URLs; segments go direct to R2. *(T-705: every playlist references siblings by bare file name — `720p_index.m3u8`, `720p_init.mp4`, `720p_seg_00001.m4s` — all under the asset's `hls/` prefix, so the rewrite is a one-level name → presigned-URL substitution; the worker stores them with their content types. The proxy/rewrite itself is T-801.)* Alternative (preferred when adopted): CDN edge token covering the `derived/{recordingId}/…/hls/` prefix. Decision recorded per deployment in ops docs; both satisfy "API serves no video bytes".
 
 ### 5.3 Download
 `GET /watch/:id/media?disposition=attachment` → presigned GET with `response-content-disposition: attachment; filename="<safe-title>.mp4"`; allowed only when `audience.download` or owner.
