@@ -157,6 +157,60 @@ module.exports = function recordingsRepo(db) {
       return row;
     },
 
+    // ── T-706: legacy re-processing backfill ────────────────────────────────
+
+    /**
+     * Progress numbers for the pipeline dashboard: active recordings, those
+     * with an R2 source, those complete (ready MP4 + ready poster), pending,
+     * failed, rejected, and probe jobs in flight.
+     */
+    async pipelineStatsSystem(reason) {
+      requireSystemReason(reason);
+      const res = await exec('recording', () => db.execute(sql`
+        with active as (
+          select r.id, r.status, r.failure_code,
+            exists (select 1 from video_assets a where a.recording_id = r.id and a.kind = 'source' and a.status = 'ready') as has_source,
+            exists (select 1 from video_assets a where a.recording_id = r.id and a.kind = 'mp4' and a.status = 'ready') as has_mp4,
+            exists (select 1 from video_assets a where a.recording_id = r.id and a.kind = 'poster' and a.status = 'ready') as has_poster,
+            exists (select 1 from processing_jobs j where j.recording_id = r.id and j.queue = 'probe' and j.status in ('queued','active')) as probe_in_flight
+          from recordings r
+          where r.deleted_at is null and r.status in ('uploaded','processing','ready','failed','rejected_limit')
+        )
+        select
+          count(*)::int as total_active,
+          count(*) filter (where has_source)::int as with_source,
+          count(*) filter (where has_source and has_mp4 and has_poster)::int as complete,
+          count(*) filter (where has_source and not (has_mp4 and has_poster) and status in ('uploaded','processing','ready'))::int as pending,
+          count(*) filter (where status = 'failed')::int as failed,
+          count(*) filter (where status = 'rejected_limit')::int as rejected,
+          count(*) filter (where probe_in_flight)::int as probe_in_flight
+        from active`));
+      const row = res.rows[0] || {};
+      return {
+        totalActive: Number(row.total_active || 0), withSource: Number(row.with_source || 0), complete: Number(row.complete || 0),
+        pending: Number(row.pending || 0), failed: Number(row.failed || 0), rejected: Number(row.rejected || 0), probeInFlight: Number(row.probe_in_flight || 0),
+      };
+    },
+
+    /**
+     * Recordings with a ready source but no ready MP4 + poster, not deleted,
+     * not rejected, with no probe job already queued/active — oldest first.
+     * `includeFailed` adds failed(probe_invalid|transcode_failed) rows.
+     */
+    async listPipelineGapsSystem({ limit = 100, includeFailed = false } = {}, reason) {
+      requireSystemReason(reason);
+      const statuses = includeFailed ? ['uploaded', 'processing', 'ready', 'failed'] : ['uploaded', 'processing', 'ready'];
+      return exec('recording', () => db.select().from(recordings).where(and(
+        isNull(recordings.deletedAt),
+        inArray(recordings.status, statuses),
+        sql`exists (select 1 from video_assets a where a.recording_id = ${recordings.id} and a.kind = 'source' and a.status = 'ready')`,
+        sql`not (exists (select 1 from video_assets a where a.recording_id = ${recordings.id} and a.kind = 'mp4' and a.status = 'ready')
+                 and exists (select 1 from video_assets a where a.recording_id = ${recordings.id} and a.kind = 'poster' and a.status = 'ready'))`,
+        sql`not exists (select 1 from processing_jobs j where j.recording_id = ${recordings.id} and j.queue = 'probe' and j.status in ('queued','active'))`,
+        includeFailed ? sql`(${recordings.status} <> 'failed' or ${recordings.failureCode} in ('probe_invalid','transcode_failed'))` : sql`true`,
+      )).orderBy(recordings.createdAt).limit(limit));
+    },
+
     /** Cleanup job: soft-deleted rows past their retention window. */
     async listPurgeableSystem({ before, limit = 100 }, reason) {
       requireSystemReason(reason);

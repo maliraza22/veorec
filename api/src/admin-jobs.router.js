@@ -12,6 +12,7 @@
 // admins are decided (T-1302 replaces the resolver, not this contract).
 'use strict';
 
+const path = require('path');
 const express = require('express');
 const { errorHandler, badRequest, forbidden, notFound, conflict } = require('./errors');
 
@@ -38,8 +39,11 @@ function project(row) {
  * @param {(req) => boolean} deps.isAdmin    admin predicate for the authenticated caller
  * @param {object} [deps.logger]
  */
-function createAdminJobsRouter({ repositories, requireAuth, isAdmin, logger = console }) {
+function createAdminJobsRouter({ repositories, withTransaction = null, requireAuth, isAdmin, logger = console }) {
   if (typeof isAdmin !== 'function') throw new Error('createAdminJobsRouter: isAdmin(req) is required');
+  // T-706: the pipeline progress numbers + the throttled backfill trigger are
+  // plain @veorec/db maintenance functions (repository-based, no SQL here).
+  const { pipelineStats, queueFill } = require(path.join(__dirname, '..', '..', 'db', 'src', 'maintenance', 'pipeline-backfill.js'));
   const router = express.Router();
   // Scoped to /admin: routers share the /api/v1 mount, so an unscoped `use`
   // would gate every sibling route (recordings, uploads) behind the allowlist.
@@ -73,6 +77,24 @@ function createAdminJobsRouter({ repositories, requireAuth, isAdmin, logger = co
     logger.info({ job_id: job.id, queue: job.queue, recording_id: job.recordingId || undefined, admin_user_id: req.userId }, 'T-601: admin retried a failed job');
     res.set('Cache-Control', 'no-store');
     return res.json({ ok: true, job: project(job) });
+  }));
+
+  // ── T-706: pipeline progress + backfill trigger (docs/23 Phase 7) ────────
+  router.get('/admin/pipeline', asyncRoute(async (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    return res.json(await pipelineStats({ repositories }));
+  }));
+
+  router.post('/admin/pipeline/backfill', asyncRoute(async (req, res) => {
+    if (!withTransaction) throw badRequest('invalid_request', 'backfill is not available on this deployment');
+    const body = req.body || {};
+    const limit = body.limit === undefined ? 100 : body.limit;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 5000) throw badRequest('invalid_request', 'limit must be an integer between 1 and 5000');
+    const apply = body.apply === true;
+    const report = await queueFill({ repositories, withTransaction, limit, apply, includeFailed: body.includeFailed === true, logger });
+    logger.info({ admin_user_id: req.userId, limit, apply, include_failed: body.includeFailed === true, scanned: report.scanned, enqueued: report.enqueued, requeued: report.requeued }, 'T-706: pipeline backfill requested');
+    res.set('Cache-Control', 'no-store');
+    return res.status(apply ? 202 : 200).json(report);
   }));
 
   router.use(errorHandler(logger));

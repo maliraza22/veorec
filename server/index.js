@@ -393,7 +393,7 @@ if (process.env.V1_UPLOAD_API === 'true') {
     // the API never touches Redis (a retry resets the row, the worker's outbox
     // relay hands it to the transport).
     app.use('/api/v1', createAdminJobsRouter({
-      repositories, requireAuth, logger,
+      repositories, withTransaction, requireAuth, logger,
       isAdmin: (req) => isAdmin(users.findById(req.userId)),
     }));
     // T-602: the PostgreSQL maintenance jobs (usage_sync, upload_expiry,
