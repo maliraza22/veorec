@@ -79,7 +79,7 @@ Error (every non-2xx):
 
 | Method & path | Auth | Response |
 |---|---|---|
-| GET `/recordings/:id/status` | ⚿ owner (or public shape via watch) | `{status, failureCode, jobs:[{queue,status,progress}], assets:[{kind,variant,status}]}` — the watch page polls this while `status!='ready'` |
+| GET `/recordings/:id/status` | ⚿ owner (or public shape via watch) | `{status, failureCode, aiStatus, jobs:[{id,queue,status,attempts,progress,error}], assets:[{kind,variant,status}], transcript:{status,error,note}, ai:{status, failed:[{queue,jobId,error,attempts}], active:[{queue,jobId,status,progress}]}}` — the watch page polls this while `status!='ready'`; the owner's AI status strip (T-1103) reads `transcript` + `ai` (the latest row per AI queue; `note:'no_speech'` for a done transcript without segments; `error` = the docs/18 §8 taxonomy code) |
 | POST `/recordings/:id/reprocess` | ⚿ owner | re-enqueue failed pipeline stages (dedupe keys prevent duplicates) → `{ok}` — *delivered by T-703 on `/api/v1`: requeues the `probe:{id}` job (attempts reset; the probe re-establishes facts, re-applies the entitlement and requeues the derived jobs) → `202 {ok, jobId, status, reused}`; 409 `not_reprocessable` before the media landed or without a source* |
 
 ## 7. Watch (public, privacy-aware — enforcement per `12`)

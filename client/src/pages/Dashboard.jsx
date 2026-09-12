@@ -306,6 +306,11 @@ function Thumb({ r, small }) {
           {r.status === 'failed' || r.status === 'rejected_limit' ? 'Failed' : 'Processing…'}
         </span>
       )}
+      {isV1 && r.status === 'ready' && (r.ai_status === 'failed' || r.ai_status === 'queued' || r.ai_status === 'running') && (
+        <span className={styles.duration} style={{ left: 8, right: 'auto', background: r.ai_status === 'failed' ? '#7f1d1d' : '#3b3b8f' }} data-ai-status={r.ai_status} title={r.ai_status === 'failed' ? 'An AI step failed — open the video to retry' : 'AI is working on this video'}>
+          {r.ai_status === 'failed' ? 'AI failed' : 'AI…'}
+        </span>
+      )}
       <div className={styles.duration}>{fmtDur(r.duration)}</div>
       {r.privacy && r.privacy !== 'public' && <div className={styles.lock}>{r.privacy === 'password' ? <Lock size={12} /> : <UsersIcon size={12} />}</div>}
       {!hover && !small && <span className={styles.playOverlay}><Play size={20} fill="#fff" /></span>}

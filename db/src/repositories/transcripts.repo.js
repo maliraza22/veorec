@@ -5,7 +5,7 @@
 // rather than trusting the caller.
 'use strict';
 
-const { and, eq, isNull, asc } = require('drizzle-orm');
+const { and, eq, isNull, asc, count } = require('drizzle-orm');
 const { transcripts, transcriptSegments, transcriptTranslations, recordings } = require('../schema');
 const { newId } = require('../ids');
 const { exec, NotFoundError, InvalidStateError } = require('./errors');
@@ -36,6 +36,13 @@ module.exports = function transcriptsRepo(db) {
     async listSegments(transcriptId) {
       return exec('transcript_segment', () => db.select().from(transcriptSegments)
         .where(eq(transcriptSegments.transcriptId, transcriptId)).orderBy(asc(transcriptSegments.idx)));
+    },
+
+    /** T-1103: segment count without loading rows (the no_speech note on the owner's status). */
+    async countSegments(transcriptId) {
+      const [row] = await exec('transcript_segment', () => db.select({ n: count() }).from(transcriptSegments)
+        .where(eq(transcriptSegments.transcriptId, transcriptId)));
+      return Number(row ? row.n : 0);
     },
 
     /** One current transcript per recording — re-running upserts in place. */

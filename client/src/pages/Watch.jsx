@@ -13,6 +13,9 @@ import { useToast } from '../components/Toast';
 import VideoPlayer from '../components/VideoPlayer';
 import { createWatchClient, fetchWatchConfig, watchIsV1, stateFor } from '../lib/watchApi.mjs';
 import { createEditorClient } from '../lib/editorApi.mjs';
+import { aiFailureCopy } from '../lib/aiStatus.mjs';
+import { useAiStatus } from './watch/useAiStatus';
+import { AiStatusPanel } from './watch/AiStatus';
 import { useWatchMedia } from './watch/useWatchMedia';
 import { useStatusPolling } from './watch/useStatusPolling';
 import { ProcessingPanel, FailedPanel, NotFoundPanel, LoadingPanel, LoginGate, LinkExpiredPanel, ErrorPanel, PasswordGate, EmailGate, PlaybackErrorPanel } from './watch/Panels';
@@ -184,6 +187,10 @@ export default function Watch() {
 
   // Processing → ready/failed is a fact the server reports (polled, backed off).
   const { jobs } = useStatusPolling({ client, rec, API, authHeaders, enabled: pageState === 'processing', onUpdate: applyRec });
+  // T-1103: the owner's AI status (transcript + AI jobs with reasons and retries) on v1 recordings.
+  const aiBusyHint = transcribing || autoTitling || summarizing || chaptering;
+  const { summary: aiSummaryState, refresh: refreshAiStatus } = useAiStatus({ API, authHeaders, rec, enabled: isV1 && isOwner && pageState === 'ready', busyHint: aiBusyHint });
+  const retryAi = (kind) => { if (kind === 'transcribe') return generateTranscript(); if (kind === 'title') return autoTitle(); if (kind === 'summary') return aiSummary(); if (kind === 'chapters') return genChapters(); return undefined; };
 
   // Media URLs (signed, refreshed before expiry) once the page is ready.
   const { media, gate: mediaGate, onNeedRefresh, reload: reloadMedia } = useWatchMedia({ client, rec, enabled: pageState === 'ready' });
@@ -399,8 +406,9 @@ export default function Watch() {
         toast.info(`${kind} is being generated — this takes a moment.`);
         const next = await waitForAi();
         if (!next) toast.error(`${kind} is taking longer than expected. It will appear when ready.`);
-        else if (next.ai_status === 'failed') toast.error(`${kind} could not be generated.`);
+        else if (next.ai_status === 'failed') toast.error(`${kind} could not be generated — see AI status for the reason.`);
         else { onDone(null, next); toast.success(`${kind} ready.`); }
+        refreshAiStatus();
         return;
       }
       onDone(d, null);
@@ -868,6 +876,8 @@ export default function Watch() {
         </button>
       )}
 
+      {isV1 && <AiStatusPanel summary={aiSummaryState} onRetry={retryAi} retrying={{ transcribe: transcribing, title: autoTitling, summary: summarizing, chapters: chaptering }} />}
+
       <div className={styles.panelLabel} style={{ marginTop: 20 }}>Take action</div>
       <button className={styles.action} onClick={autoTitle} disabled={autoTitling}>
         <span className={styles.actionIcon}>{autoTitling ? <Loader2 size={18} className={styles.spin} /> : <Sparkles size={18} />}</span>
@@ -1052,6 +1062,9 @@ export default function Watch() {
         <div className={styles.tEmpty}>
           <FileText size={26} />
           <strong>No transcript yet</strong>
+          {isOwner && transcript && transcript.status === 'failed' && (
+            <span style={{ color: '#f87171' }} data-testid="transcript-failed">{aiFailureCopy(transcript.error).message}{aiFailureCopy(transcript.error).retryable ? ' You can try again.' : ''}</span>
+          )}
           {isOwner ? (
             !canTranscribe ? (
               <>

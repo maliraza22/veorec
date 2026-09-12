@@ -175,6 +175,16 @@ const silent = { info() {}, warn() {}, error() {}, debug() {} };
     ok(st.status === 200 && st.body.status === 'uploaded' && st.body.aiStatus === 'queued' && st.body.transcript.status === 'done', 'status projects recording status, ai_status and transcript status');
     ok(st.body.jobs.some((j) => j.queue === 'transcribe' && j.status === 'completed') && st.body.jobs.some((j) => j.queue === 'ai_title' && j.status === 'queued') && st.body.assets.some((a) => a.kind === 'source' && a.status === 'ready'), 'jobs and assets are listed (no storage keys, no payloads)');
     ok(st.body.jobs.every((j) => j.payload === undefined) && JSON.stringify(st.body).indexOf('sources/') === -1, 'nothing internal leaks');
+    // T-1103: the AI block and the transcript's reason.
+    ok(st.body.ai && st.body.ai.status === 'queued' && st.body.ai.active.some((a) => a.queue === 'ai_title' && a.status === 'queued') && st.body.ai.failed.length === 0 && st.body.transcript.error === null && st.body.transcript.note === null, 'T-1103: the ai block lists the queued AI jobs; a done transcript with segments has no note');
+    const titleRow = await job(`ai_title:${A}`);
+    await repos.jobs.markActiveSystem(titleRow.id, REASON);
+    await repos.jobs.markFailedSystem(titleRow.id, 'no_llm: no model configured', REASON, { terminal: true });
+    const st2 = await api('GET', `/recordings/${A}/status`, { as: legacy.alice });
+    ok(st2.body.ai.failed.some((f) => f.queue === 'ai_title' && /no_llm/.test(f.error) && f.jobId === titleRow.id) && !st2.body.ai.active.some((a) => a.queue === 'ai_title'), 'T-1103: a failed AI job is listed with its taxonomy reason (the owner retries from it)');
+    await repos.transcripts.upsertSystem(A, { status: 'failed', error: 'audio_decode_failed' }, REASON);
+    ok((await api('GET', `/recordings/${A}/status`, { as: legacy.alice })).body.transcript.error === 'audio_decode_failed', 'T-1103: a failed transcript carries its reason');
+    await repos.transcripts.upsertSystem(A, { status: 'done', error: null }, REASON);
 
     console.log('\nG2. POST /reprocess (T-703)');
     const rp = await api('POST', `/recordings/${A}/reprocess`, { as: legacy.alice });

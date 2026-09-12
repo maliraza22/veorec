@@ -20,6 +20,19 @@ const LANG_RE = /^[a-z]{2,3}(-[A-Za-z]{2,8})?$/;
 const TRANSCRIBABLE = new Set(['uploaded', 'processing', 'ready']);
 const SETTLED = ['completed', 'failed', 'cancelled'];
 
+/** T-1103: the latest row per AI queue → {status, failed[], active[]} for the owner's status strip. */
+const AI_QUEUES = ['transcribe', 'ai_title', 'ai_summary', 'ai_chapters', 'captions', 'translate'];
+function aiBlock(aiStatus, jobRows) {
+  const latest = {};
+  for (const j of jobRows) if (AI_QUEUES.includes(j.queue) && (!latest[j.queue] || j.id > latest[j.queue].id)) latest[j.queue] = j;
+  const rows = Object.values(latest);
+  return {
+    status: aiStatus || 'none',
+    failed: rows.filter((j) => j.status === 'failed').map((j) => ({ queue: j.queue, jobId: j.id, error: j.error, attempts: j.attempts })),
+    active: rows.filter((j) => j.status === 'queued' || j.status === 'active').map((j) => ({ queue: j.queue, jobId: j.id, status: j.status, progress: j.progress })),
+  };
+}
+
 function transcriptBody(t, segments, configured) {
   const status = t ? t.status : 'none';
   return {
@@ -194,13 +207,18 @@ function createAiRouter({ repositories, withTransaction, requireAuth, entitlemen
       repos.transcripts.getForRecording(scope, recording.id),
     ]);
     res.set('Cache-Control', 'no-store');
+    const jobRows = jobs.map((j) => ({ id: j.id, queue: j.queue, status: j.status, attempts: j.attempts, progress: j.result && typeof j.result.progress === 'number' ? j.result.progress : null, error: j.status === 'failed' ? (j.lastError || null) : null }));
+    // T-1103 (docs/15 §7): a transcript that is done with no segments is the
+    // valid no_speech outcome; a failed one carries its taxonomy code.
+    const segCount = t && t.status === 'done' ? await repos.transcripts.countSegments(t.id) : null;
     return res.json({
       status: recording.status,
       failureCode: recording.failureCode ?? null,
       aiStatus: recording.aiStatus,
-      jobs: jobs.map((j) => ({ id: j.id, queue: j.queue, status: j.status, attempts: j.attempts, progress: j.result && typeof j.result.progress === 'number' ? j.result.progress : null, error: j.status === 'failed' ? (j.lastError || null) : null })),
+      jobs: jobRows,
       assets: assets.map((a) => ({ kind: a.kind, variant: a.variant ?? null, status: a.status })),
-      transcript: { status: t ? t.status : 'none' },
+      transcript: { status: t ? t.status : 'none', error: t && t.status === 'failed' ? (t.error || null) : null, note: t && t.status === 'done' && segCount === 0 ? 'no_speech' : null },
+      ai: aiBlock(recording.aiStatus, jobRows),
     });
   }));
 
@@ -208,4 +226,4 @@ function createAiRouter({ repositories, withTransaction, requireAuth, entitlemen
   return router;
 }
 
-module.exports = { createAiRouter, transcriptBody, LANG_RE };
+module.exports = { createAiRouter, transcriptBody, aiBlock, LANG_RE };
