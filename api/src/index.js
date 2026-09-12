@@ -15,6 +15,8 @@ const { createWatchRouter } = require('./watch.router');
 const { createFoldersRouter } = require('./folders.router');
 const { createNotificationsRouter } = require('./notifications.router');
 const { createSharingRouter } = require('./sharing.router');
+const { createEngagementRouter } = require('./engagement.router');
+const { createWatchContext } = require('./watch-context');
 const authz = require('./authz');
 const rateLimit = require('./rate-limit');
 const quota = require('./quota');
@@ -36,6 +38,8 @@ module.exports = {
   createFoldersRouter, createNotificationsRouter,
   // T-901: managed share links + Slack share (gate resolution lives in authz / the watch router).
   createSharingRouter,
+  // T-1001: engagement (views / progress / comments / reactions) on PostgreSQL, sharing the watch context.
+  createEngagementRouter, createWatchContext,
   ...identity,
   ...errors,
 };

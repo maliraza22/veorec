@@ -381,7 +381,7 @@ app.get('/api/client-config/public', (req, res) => {
 // every current client uses.
 if (process.env.V1_UPLOAD_API === 'true') {
   try {
-    const { createUploadRouter, createRecordingsRouter, createMeRouter, createAdminJobsRouter, createAiRouter, createWatchRouter, createFoldersRouter, createNotificationsRouter, createSharingRouter, authz: v1authz, createQuota } = require('../api/src/index.js');
+    const { createUploadRouter, createRecordingsRouter, createMeRouter, createAdminJobsRouter, createAiRouter, createWatchRouter, createFoldersRouter, createNotificationsRouter, createSharingRouter, createEngagementRouter, authz: v1authz, createQuota } = require('../api/src/index.js');
     const { repositories, withTransaction } = require('../db/src/index.js');
     const storagePkg = require('../storage/src/index.js');
     // T-306: the quota ledger. Limits come from the ONE plan catalog
@@ -480,15 +480,25 @@ if (process.env.V1_UPLOAD_API === 'true') {
       const { idFor } = require('../db/src/legacy-ids.js');
       // Watch access tokens are HMAC-signed with their own secret; when none is configured a key is DERIVED from the JWT secret (never the raw secret, never shorter than the router accepts).
       const watchSecret = process.env.WATCH_ACCESS_SECRET || crypto.createHash('sha256').update('veorec-watch-access:' + (process.env.JWT_SECRET || 'screenrec-dev-secret-change-in-prod')).digest('hex');
+      // ONE optional-auth resolver for every public route: the legacy Bearer →
+      // the PostgreSQL viewer (canonical id mapping) or anonymous.
+      const watchViewer = async (req) => {
+        const u = viewerFromAuth(req);
+        if (!u) return null;
+        return { id: idFor('usr', u.id), isAdmin: isAdmin(u) };
+      };
+      // T-1001: engagement on PostgreSQL only — views / progress / comments /
+      // reactions through the same watch authorisation. Anonymous IPs are
+      // stored only as a salted daily hash.
+      app.use('/api/v1', createEngagementRouter({
+        repositories, logger, accessSecret: watchSecret, viewer: watchViewer,
+        ipSalt: process.env.VIEW_KEY_SALT || crypto.createHash('sha256').update('veorec-view-key:' + watchSecret).digest('hex'),
+      }));
       app.use('/api/v1', createWatchRouter({
         repositories, logger,
         storage: storagePkg.storageProvider(), keys: storagePkg.keys,
         accessSecret: watchSecret,
-        viewer: async (req) => {
-          const u = viewerFromAuth(req);
-          if (!u) return null;
-          return { id: idFor('usr', u.id), isAdmin: isAdmin(u) };
-        },
+        viewer: watchViewer,
         verifyPassword: v1authz.createPasswordVerifier({ bcryptCompare: (p, h) => bcrypt.compare(p, h) }),
         configured: () => transcription.isConfigured(),
         publicBaseUrl: process.env.PUBLIC_API_URL ? `${String(process.env.PUBLIC_API_URL).replace(/[/]+$/, '')}/api/v1` : null,

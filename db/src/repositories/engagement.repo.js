@@ -94,6 +94,22 @@ module.exports = function engagementRepos(db) {
           .where(and(eq(comments.recordingId, recordingId), isNull(comments.deletedAt)))
           .orderBy(comments.createdAt).limit(limit));
       },
+      /** T-1001: one comment on THIS recording (deleted ones included, so replies/moderation can see them). */
+      async getForRecording(recordingId, id) {
+        const [row] = await exec('comment', () => db.select().from(comments)
+          .where(and(eq(comments.recordingId, recordingId), eq(comments.id, id))).limit(1));
+        return row || null;
+      },
+      /**
+       * T-1001: soft delete after the ROUTER established the actor may (the
+       * recording owner/admin, or the signed-in author). Reason required.
+       */
+      async softDeleteSystem(id, reason) {
+        requireSystemReason(reason);
+        const [row] = await exec('comment', () => db.update(comments)
+          .set({ deletedAt: new Date() }).where(and(eq(comments.id, id), isNull(comments.deletedAt))).returning());
+        return row || null;
+      },
       /** Moderation: the recording owner may remove any comment on it. */
       async softDeleteAsOwner(scope, commentId) {
         const { userId } = requireScope(scope);

@@ -174,7 +174,7 @@ export default function Watch() {
         if (!alive) return;
         if (r.gate) { setGateTitle(r.gate.title || ''); setPageState(r.gate.state); setLoadError(r.gate.state === 'error' ? 'The server could not load this video.' : ''); return; }
         applyRec(r.rec);
-        if (r.rec.source === 'legacy') afterLoadLegacy();
+        afterLoad();
       } catch (e) { if (alive) { setPageState('error'); setLoadError('Network error — please check your connection.'); } }
     })();
     return () => { alive = false; };
@@ -248,8 +248,9 @@ export default function Watch() {
   const [videoTime, setVideoTime] = useState(0);
   const activeSegRef = useRef(null);
 
-  // Engagement routes exist only on the legacy API until Phase 10.
-  const engagementAvailable = isLegacy;
+  // T-1001: engagement (views / comments / reactions / progress) is served on
+  // both APIs through the data layer — PostgreSQL for v1 recordings.
+  const engagementAvailable = !!rec;
 
   // Owner detection: explicit on the v1 payload (docs/11 §4); the legacy
   // probe (owner-only endpoint 200s only for the owner) stays for legacy rows.
@@ -318,13 +319,9 @@ export default function Watch() {
   async function postDockComment() {
     if (!commentText.trim()) return;
     const t = Math.floor(videoTime);
-    const res = await fetch(`${API}/api/watch/${id}/comment`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() },
-      body: JSON.stringify({ text: commentText, name: commentName, t }),
-    });
-    const c = await res.json().catch(() => ({}));
-    if (res.ok && c.id) { setComments(cs => [...cs, c]); setCommentText(''); setCommentDockOpen(false); }
-    else toast.error(errMessage(c, 'Could not post comment.'));
+    const r = await client.comment({ text: commentText, name: commentName, t });
+    if (r.comment && r.comment.id) { setComments(cs => [...cs, r.comment]); setCommentText(''); setCommentDockOpen(false); }
+    else toast.error(r.error || 'Could not post comment.');
   }
   function loadViewers() {
     if (!isLegacy) { setViewers([]); return; }
@@ -625,16 +622,11 @@ export default function Watch() {
     return m.sort((a, b) => a.t - b.t);
   }, [comments, reactions]);
 
-  // Legacy engagement (views / reactions / comments) — legacy recordings only until Phase 10.
-  function afterLoadLegacy() {
-    fetch(`${API}/api/watch/${id}/view`, {
-      method: 'POST', headers: { ...authHeaders(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ visitorId: getVisitorId() }),
-    })
-      .then(r => r.json()).then(d => setViews(d.views)).catch(() => {});
-    fetch(`${API}/api/watch/${id}/engagement`)
-      .then(r => r.json()).then(d => { setViews(d.views); setReactions(d.reactions || []); setComments(d.comments || []); })
-      .catch(() => {});
+  // Engagement (views / reactions / comments) through the data layer — the
+  // legacy routes for legacy recordings, /api/v1 (PostgreSQL) for v1 ones.
+  function afterLoad() {
+    client.view({ visitorId: getVisitorId() }).then((d) => { if (d) setViews(d.views); }).catch(() => {});
+    client.engagement().then((d) => { if (d) { setViews(d.views); setReactions(d.reactions); setComments(d.comments); } }).catch(() => {});
   }
 
   // Legacy-only readiness overlay (docs/11 §1): a legacy recording may still be
@@ -665,7 +657,7 @@ export default function Watch() {
     const onTime = () => { if (v.duration > 0) maxFrac = Math.max(maxFrac, v.currentTime / v.duration); };
     const report = () => {
       if (sent || maxFrac < 0.02) return; sent = true;
-      try { navigator.sendBeacon(`${API}/api/watch/${id}/progress`, new Blob([JSON.stringify({ pct: maxFrac })], { type: 'application/json' })); } catch {}
+      try { const b = client.progressBeacon(maxFrac, { visitorId: getVisitorId() }); navigator.sendBeacon(b.url, b.blob); } catch {}
     };
     const onHide = () => { if (document.visibilityState === 'hidden') report(); };
     v.addEventListener('timeupdate', onTime);
@@ -681,7 +673,7 @@ export default function Watch() {
       const r = await client.unlock(password);
       if (r.error) { setPwErr(r.error); return; }
       applyRec(r.rec);
-      if (r.rec.source === 'legacy') afterLoadLegacy();
+      afterLoad();
     } catch { setPwErr('Network error — please try again.'); }
     finally { setPwBusy(false); }
   }
@@ -714,24 +706,16 @@ export default function Watch() {
 
   async function react(emoji) {
     const t = videoRef.current ? Math.floor(videoRef.current.currentTime) : null;
-    const res = await fetch(`${API}/api/watch/${id}/react`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() },
-      body: JSON.stringify({ emoji, t, name: commentName }),
-    });
-    const d = await res.json().catch(() => ({}));
-    if (res.ok) setReactions(d.reactions); else toast.error(errMessage(d, 'Could not react.'));
+    const r = await client.react({ emoji, t, name: commentName });
+    if (r.reactions) setReactions(r.reactions); else toast.error(r.error);
   }
 
   async function addComment(e) {
     e.preventDefault();
     if (!commentText.trim()) return;
     const t = atTime && videoRef.current ? Math.floor(videoRef.current.currentTime) : null;
-    const res = await fetch(`${API}/api/watch/${id}/comment`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() },
-      body: JSON.stringify({ text: commentText, name: commentName, t }),
-    });
-    const c = await res.json().catch(() => ({}));
-    if (res.ok) { setComments(cs => [...cs, c]); setCommentText(''); } else toast.error(errMessage(c, 'Could not post comment.'));
+    const r = await client.comment({ text: commentText, name: commentName, t });
+    if (r.comment) { setComments(cs => [...cs, r.comment]); setCommentText(''); } else toast.error(r.error);
   }
 
   function seekTo(t) {
@@ -770,9 +754,7 @@ export default function Watch() {
   const activityPanel = (
     <div className={styles.panel}>
       <div className={styles.panelLabel}>Comments ({comments.length})</div>
-      {!engagementAvailable ? (
-        <p className={styles.noComments}>Comments and reactions arrive for this video with the next update.</p>
-      ) : rec.audience?.comments !== false ? (
+      {rec.audience?.comments !== false ? (
         <form onSubmit={addComment} className={styles.commentForm}>
           {!user && (
             <input className={styles.commentName} value={commentName}

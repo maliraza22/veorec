@@ -11,7 +11,7 @@
 - Anonymous commenting allowed when `audience.comments=true` (product decision preserved); `authorName` from the form; signed-in users always use their account name and get `userId` set. Analytics/notifications distinguish **verified** (userId) from unverified names.
 - Moderation: recording owner can delete any comment on their recording (soft `deleted_at`, renders as "removed"); authors can delete their own (signed-in only).
 - Timeline markers: comments with `t` render on the progress bar (unchanged UX).
-- Rate limits: 30/min·IP + 200/day·IP per recording; body sanitized (plain text, links auto-linked client-side only).
+- Rate limits: 30/min·IP + 200/day·IP per recording; body sanitized (plain text, links auto-linked client-side only). *(T-1001 ✅: everything above except the 200/day·IP window — the per-process fixed-window limiter (`api/src/rate-limit.js`) has one window per route class; the daily cap lands with the Redis limiter, T-1304. Comments and reactions write to PostgreSQL only — no JSON store, no dual-write — through the shared watch authorisation (`api/src/watch-context.js`), so privacy and share links gate engagement exactly like playback.)*
 
 ## 2. Reactions
 

@@ -236,6 +236,40 @@ export function createWatchClient({ API, id, authHeaders = () => ({}), shareToke
       return { ok: true };
     },
 
+    // ── engagement (T-1001): the same routes on both APIs, PostgreSQL on v1 ──
+    async view({ visitorId } = {}) {
+      const r = this._source === 'legacy'
+        ? await legacy('/view', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ visitorId }) })
+        : await v1('/view', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ visitorId }) });
+      const body = await safeJson(r);
+      return r.ok && body ? { views: body.views ?? 0, self: !!body.self } : null;
+    },
+    async engagement() {
+      const r = this._source === 'legacy' ? await legacy('/engagement') : await v1('/engagement');
+      const body = await safeJson(r);
+      if (!r.ok || !body) return null;
+      return { views: body.views ?? 0, reactions: Array.isArray(body.reactions) ? body.reactions : [], comments: Array.isArray(body.comments) ? body.comments : [] };
+    },
+    async comment({ text, name, t, parentId }) {
+      const init = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, name, t, parentId }) };
+      const r = this._source === 'legacy' ? await legacy('/comment', init) : await v1('/comment', init);
+      const body = await safeJson(r);
+      if (!r.ok) return { error: errMessage(body, 'Could not post comment.'), code: errCode(body) };
+      return { comment: body };
+    },
+    async react({ emoji, t, name }) {
+      const init = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ emoji, t, name }) };
+      const r = this._source === 'legacy' ? await legacy('/react', init) : await v1('/react', init);
+      const body = await safeJson(r);
+      if (!r.ok) return { error: errMessage(body, 'Could not react.'), code: errCode(body) };
+      return { reactions: Array.isArray(body.reactions) ? body.reactions : [] };
+    },
+    /** What `navigator.sendBeacon` needs for the view-through beacon (no headers possible). */
+    progressBeacon(pct, { visitorId } = {}) {
+      const target = this._source === 'legacy' ? `${API}/api/watch/${encodeURIComponent(id)}/progress` : url('/progress');
+      return { url: target, blob: new Blob([JSON.stringify({ pct, visitorId })], { type: 'application/json' }) };
+    },
+
     /** Re-fetch the payload for status polling (viewers and owners alike). */
     async poll() {
       const r = await (this._source === 'legacy' ? legacy('') : v1(''));
