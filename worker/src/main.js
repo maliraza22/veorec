@@ -24,6 +24,7 @@ const { resolveBinaries } = require('./media/exec');
 const { createProber } = require('./media/probe');
 const { createTranscoder } = require('./media/transcode');
 const { createThumbnailer } = require('./media/thumbnail');
+const { createAudioExtractor } = require('./media/audio');
 
 const DB_DIR = path.join(__dirname, '..', '..', 'db', 'src');
 const STORAGE_DIR = path.join(__dirname, '..', '..', 'storage', 'src');
@@ -71,10 +72,12 @@ async function main() {
   const transcoder = createTranscoder({ ffmpegBin: bins.ffmpegBin, prober, logger });
   // T-703: posters / thumbnails / previews.
   const thumbnailer = createThumbnailer({ ffmpegBin: bins.ffmpegBin, prober, logger });
+  // T-704: audio extraction (the STT input) — captions need no binary.
+  const audioExtractor = createAudioExtractor({ ffmpegBin: bins.ffmpegBin, prober, logger });
   let keys = null;
   try { keys = require(path.join(STORAGE_DIR, 'index.js')).keys; } catch { /* no storage package → media jobs fail transiently */ }
   logger.info({ stt_configured: transcriber.isConfigured(), whisper_model: transcriber.hasWhisperModel(), llm_configured: ai.isLLMConfigured(), rate_gate: rateGate.kind, ffmpeg: bins.ffmpegBin, ffprobe: bins.ffprobeBin }, 'stt/ai/media providers');
-  const app = createWorkerApp({ config, logger, repositories, withTransaction: tx, storage, jobQueue, registry, deps: { resolveLimits, transcriber, ai, rateGate, prober, transcoder, thumbnailer, keys } });
+  const app = createWorkerApp({ config, logger, repositories, withTransaction: tx, storage, jobQueue, registry, deps: { resolveLimits, transcriber, ai, rateGate, prober, transcoder, thumbnailer, audioExtractor, keys } });
 
   logger.info({ app_env: config.appEnv, redis: config.inline ? 'inline' : redactRedisUrl(config.redisUrl), prefix: config.prefix }, 'worker booting');
   await app.start();

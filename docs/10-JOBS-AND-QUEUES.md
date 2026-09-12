@@ -55,6 +55,8 @@ For each: **input** (payload), **output**, **retry**, **timeout**, **idempotency
 ### `media.audio_extract`
 - In: `{recordingId}`; dedupe `audio:{recordingId}`. Out: audio asset; chains `stt.transcribe` when auto-processing is on. Retry 3× / 10m. Fail: transcript status `failed(audio_extract_failed)`.
 
+> **As implemented (T-704):** `09` §7.1 — the audio asset is published for the STT path but does NOT chain `stt.transcribe`: the upload completion already enqueues it (T-603, `stt:{id}` dedupes) and the transcriber falls back to the source when the audio asset is not there yet, so a failed extraction never blocks or fails a transcript (`audio_extract_failed` is therefore not a transcript outcome in this implementation). `captions` jobs are keyed `captions:{id}:{updated_at}` and enqueued by `stt.transcribe` itself.
+
 ### `stt.transcribe`
 - In: `{recordingId, language?, trigger:'auto'|'manual'}`; dedupe `stt:{recordingId}`.
 - Out: `transcripts` + `transcript_segments`; chains `media.captions` + (auto mode) `ai.title`/`ai.summary`/`ai.chapters` per entitlements — the current auto-process behavior (`index.js:340-370`) reproduced as a job chain.

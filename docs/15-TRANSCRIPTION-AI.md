@@ -40,7 +40,7 @@ As above (per-chunk auto-detect is the language detection mechanism; there is de
 
 ## 4. Timestamped segments & captions
 
-Segments `{idx, start_s, end_s, text, language}`; consumed by: transcript tab (search + follow-along), captions VTT asset (`09` §7), silence-removal ranges (`14` §7), chapter generation. Segment times refer to the **current active video timeline**; after an overwrite render, transcripts are flagged stale (`14` §4).
+Segments `{idx, start_s, end_s, text, language}`; consumed by: transcript tab (search + follow-along), captions VTT asset (`09` §7), silence-removal ranges (`14` §7), chapter generation. *(T-704: the captions asset is regenerated from these rows for every transcript version — `09` §7.1.)* Segment times refer to the **current active video timeline**; after an overwrite render, transcripts are flagged stale (`14` §4).
 
 ## 5. Translation (`stt.translate` job)
 

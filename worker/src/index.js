@@ -24,6 +24,8 @@ const transcode = require('./media/transcode');
 const ready = require('./media/ready');
 const thumbnail = require('./media/thumbnail');
 const playIcon = require('./media/play-icon');
+const audio = require('./media/audio');
+const captions = require('./media/captions');
 const mediaProcessors = require('./processors/media');
 const transcription = require('./stt/transcription');
 const { createAi } = require('./stt/ai');
@@ -59,4 +61,6 @@ module.exports = {
   // T-703: posters / thumbnails / previews.
   createThumbnailer: thumbnail.createThumbnailer, basePosterTime: thumbnail.basePosterTime, posterCandidates: thumbnail.posterCandidates,
   previewClipStarts: thumbnail.previewClipStarts, renderPlayIconPng: playIcon.renderPlayIconPng,
+  // T-704: audio extract + captions.
+  createAudioExtractor: audio.createAudioExtractor, buildVtt: captions.buildVtt, validateVtt: captions.validateVtt,
 };

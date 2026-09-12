@@ -11,6 +11,7 @@ const path = require('path');
 const { pipeline } = require('stream/promises');
 const { TransientError, TerminalError } = require('../errors');
 const { maybeMarkReady } = require('../media/ready');
+const { buildVtt, validateVtt } = require('../media/captions');
 const { newId } = require(path.join(__dirname, '..', '..', '..', 'db', 'src', 'ids.js'));
 
 const REASON = 'T-701 media worker: probe facts, post-probe entitlement, fan-out';
@@ -336,6 +337,89 @@ function registerMediaProcessors(registry) {
       const ready = await deps.withTransaction((tx) => maybeMarkReady({ tx, recordingId, logger }));
       if (logger) logger.warn({ recording_id: recordingId, job_id: job.id, promoted: ready.promoted, reason: ready.reason }, 'thumbnail: attempts exhausted — placeholder poster path');
     },
+  });
+
+  // ── media.audio_extract (T-704, docs/09 §6) ──────────────────────────────
+  const AX_REASON = 'T-704 media worker: audio extract (STT input)';
+  registry.register('audio_extract', async ({ payload, job, signal, logger, deps, repositories }) => {
+    const repos = repositories();
+    const { storage, withTransaction, audioExtractor, keys } = deps;
+    if (!audioExtractor) throw new TransientError('extractor_unavailable', 'No audio extractor (ffmpeg) configured on this worker.');
+    if (!storage || !keys) throw new TransientError('storage_unavailable', 'No storage provider / key builder configured on this worker.');
+    const recordingId = job.recordingId || (payload && payload.recordingId);
+    if (!recordingId) throw new TerminalError('invalid_payload', 'audio_extract needs a recordingId');
+    const recording = await repos.recordings.getSystem(recordingId, AX_REASON);
+    if (!recording || recording.deletedAt) throw new TerminalError('recording_gone', 'The recording no longer exists.');
+    if (NOT_PROCESSABLE.has(recording.status)) throw new TerminalError('recording_not_processable', `The recording is ${recording.status}.`);
+    const assets = await repos.assets.listByRecordingSystem(recordingId, AX_REASON);
+    const source = assets.find((a) => a.kind === 'source' && a.status === 'ready');
+    if (!source) throw new TerminalError('no_source', 'The recording has no ready source asset.');
+    if (recording.duration == null || !source.codecVideo) throw new TerminalError('probe_required', 'The source has not been probed yet (facts missing).');
+    if (!source.codecAudio) {
+      logger.info({ recording_id: recordingId }, 'audio_extract: video-only source — nothing to extract');
+      return { skipped: 'no_audio' };
+    }
+    let audio = assets.find((a) => a.kind === 'audio');
+    if (!audio) audio = await repos.assets.createSystem({ recordingId, kind: 'audio', storageKey: keys.audio(recordingId), status: 'pending', immutable: false, countsTowardQuota: false, container: 'm4a', createdByJobId: job.id }, AX_REASON);
+
+    const dir = scratchDir(job.id);
+    const inPath = path.join(dir, `source${path.extname(source.storageKey) || ''}`);
+    const outPath = path.join(dir, 'audio.m4a');
+    let verified, uploaded;
+    try {
+      let head;
+      try { head = await storage.headObject(source.storageKey); }
+      catch (e) { if (e && e.code === 'object_not_found') throw new TerminalError('source_missing', 'The source object is missing from storage.'); throw new TransientError('storage_unavailable', `head failed: ${e.message}`); }
+      if (!scratchHasRoom(dir, Number(head.contentLength || 0))) throw new TransientError('scratch_full', 'not enough scratch space (need 2× source size)');
+      await download(storage, source.storageKey, inPath);
+      verified = await audioExtractor.extract(inPath, outPath, { sourceFacts: { durationSec: Number(recording.duration) }, signal, timeoutMs: Math.max(10 * 60 * 1000, 3 * Number(recording.duration) * 1000) });
+      try { uploaded = await storage.putObject(audio.storageKey, fs.createReadStream(outPath), { contentType: 'audio/mp4', contentLength: verified.bytes }); }
+      catch (e) { throw new TransientError('storage_unavailable', `upload failed: ${e.message}`); }
+    } catch (e) {
+      if (e && e.code === 'aborted') throw new TransientError('aborted', 'audio_extract aborted');
+      if (e && e.code === 'timeout') throw new TransientError('audio_timeout', e.message);
+      if (e && e.code === 'ENOENT') throw new TransientError('ffmpeg_missing', `ffmpeg not found (${e.message})`);
+      if (e && e.code === 'tool_failed') throw new TransientError('ffmpeg_failed', e.message, { stderrTail: e.stderrTail });
+      if (e && e.code === 'output_invalid') throw new TransientError('output_invalid', e.message);
+      throw e;
+    } finally {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* scratch */ }
+    }
+    await withTransaction((tx) => tx.assets.updateSystem(audio.id, { status: 'ready', sizeBytes: verified.bytes, duration: String(verified.facts.durationSec), codecAudio: 'aac', container: 'm4a', checksum: uploaded.etag || null, createdByJobId: job.id }, AX_REASON));
+    logger.info({ recording_id: recordingId, asset_id: audio.id, bytes: verified.bytes, duration_sec: verified.facts.durationSec }, 'audio_extract: audio published');
+    return { assetId: audio.id, storageKey: audio.storageKey, sizeBytes: verified.bytes, duration: verified.facts.durationSec };
+  });
+
+  // ── media.captions (T-704, docs/09 §7) ───────────────────────────────────
+  const CAP_REASON = 'T-704 media worker: captions VTT from transcript segments';
+  registry.register('captions', async ({ payload, job, logger, deps, repositories }) => {
+    const repos = repositories();
+    const { storage, withTransaction, keys } = deps;
+    if (!storage || !keys) throw new TransientError('storage_unavailable', 'No storage provider / key builder configured on this worker.');
+    const recordingId = job.recordingId || (payload && payload.recordingId);
+    if (!recordingId) throw new TerminalError('invalid_payload', 'captions needs a recordingId');
+    const recording = await repos.recordings.getSystem(recordingId, CAP_REASON);
+    if (!recording || recording.deletedAt) throw new TerminalError('recording_gone', 'The recording no longer exists.');
+    const transcript = await repos.transcripts.getForPublicWatch(recordingId);
+    if (!transcript || transcript.status !== 'done') throw new TerminalError('transcript_required', 'The recording has no completed transcript.');
+    const segments = await repos.transcripts.listSegments(transcript.id);
+    if (!segments.length) return { skipped: 'no_segments', transcriptId: transcript.id };
+    const vtt = buildVtt(segments.map((s) => ({ idx: s.idx, start: Number(s.startS), end: Number(s.endS), text: s.text })), { language: transcript.language || undefined, title: recording.title });
+    const check = validateVtt(vtt);
+    if (!check.ok) throw new TerminalError('captions_invalid', check.reason);
+    const assets = await repos.assets.listByRecordingSystem(recordingId, CAP_REASON);
+    let cap = assets.find((a) => a.kind === 'captions_vtt');
+    if (!cap) {
+      const id = newId('asset');
+      cap = await repos.assets.createSystem({ id, recordingId, kind: 'captions_vtt', storageKey: keys.captions(recordingId, id), status: 'pending', immutable: false, countsTowardQuota: false, container: 'vtt', createdByJobId: job.id }, CAP_REASON);
+    }
+    const body = Buffer.from(vtt, 'utf8');
+    let uploaded;
+    try { uploaded = await storage.putObject(cap.storageKey, body, { contentType: 'text/vtt', contentLength: body.length }); }
+    catch (e) { throw new TransientError('storage_unavailable', `upload failed: ${e.message}`); }
+    await withTransaction((tx) => tx.assets.updateSystem(cap.id, { status: 'ready', sizeBytes: body.length, container: 'vtt', checksum: uploaded.etag || null, createdByJobId: job.id }, CAP_REASON));
+    logger.info({ recording_id: recordingId, asset_id: cap.id, transcript_id: transcript.id, cues: check.cues, language: transcript.language }, 'captions: VTT published');
+    return { assetId: cap.id, storageKey: cap.storageKey, transcriptId: transcript.id, cues: check.cues, language: transcript.language, sizeBytes: body.length };
   });
 
   return registry;

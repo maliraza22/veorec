@@ -158,7 +158,11 @@ const near = (a, b, tol) => Math.abs(Number(a) - Number(b)) <= tol;
         const prefix = `t701${RUN}`;
         const q = W.createBullJobQueue({ redisUrl: REDIS_URL, prefix, logger: silent, stalledIntervalMs: 500, lockDurationMs: 1000 });
         const config = W.loadWorkerConfig({ REDIS_URL, QUEUE_PREFIX: prefix, OUTBOX_INTERVAL_MS: '100', RECONCILE_INTERVAL_MS: '600000', WORKER_SCHEDULER: 'false', WORKER_DEFER_MS: '100' }, { appEnv: 'test' });
-        const app = W.createWorkerApp({ config, logger: silent, repositories, jobQueue: q, registry: W.createDefaultRegistry({ maintenance: false, stt: false }), deps });
+        // A probe-ONLY worker: proves the fan-out rows wait in the transport for
+        // workers that carry the other processors (deferred, not consumed).
+        const probeOnly = W.createRegistry();
+        probeOnly.register('probe', registry.get('probe').handler);
+        const app = W.createWorkerApp({ config, logger: silent, repositories, jobQueue: q, registry: probeOnly, deps });
         await app.start();
         ok(app.status().queues.join() === 'media', 'a media-only worker subscribes to the media queue');
         await enqueueProbe(A);

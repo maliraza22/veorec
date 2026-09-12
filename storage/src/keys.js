@@ -177,6 +177,13 @@ const keys = {
     return assertKey(`${PREFIX.derived}/${recordingId}/${assetId}/${file}`);
   },
 
+  /** Captions (WebVTT) from the transcript (T-704). `derived/{recordingId}/{assetId}/captions.vtt` */
+  captions(recordingId, assetId) {
+    assertId(recordingId, 'recordingId');
+    assertId(assetId, 'assetId');
+    return assertKey(`${PREFIX.derived}/${recordingId}/${assetId}/captions.vtt`);
+  },
+
   /** Extracted audio for STT. `audio/{recordingId}/audio.m4a` */
   audio(recordingId) {
     assertId(recordingId, 'recordingId');

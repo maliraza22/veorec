@@ -120,6 +120,11 @@ function registerSttProcessors(registry) {
         spokenLangOverride: language || null, error: null,
       }, REASON);
       await tx.transcripts.replaceSegmentsSystem(t.id, result.segments.map((s, i) => ({ idx: i, start: s.start, end: s.end, text: s.text, language: s.language || result.language || null })), REASON);
+      // docs/09 §7 (T-704): captions are part of the MEDIA pipeline, regenerated
+      // for every transcript version — the dedupe key carries updated_at.
+      if (!noSpeech) {
+        await tx.jobs.enqueue({ queue: 'captions', dedupeKey: `captions:${recordingId}:${new Date(t.updatedAt).getTime()}`, recordingId, payload: { recordingId, transcriptId: t.id }, maxAttempts: 3 });
+      }
       // Chain (docs/15 §6): title always; summary + chapters when the user has
       // AI docs (decided by the API at enqueue time — the worker has no plan store).
       if (payload.chain !== false && !noSpeech) {
