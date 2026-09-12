@@ -128,6 +128,30 @@ module.exports = function assetsRepo(db) {
       return row;
     },
 
+    /**
+     * T-1202 overwrite render: the recording's active MP4 row is RE-POINTED at
+     * the rendered output. The old object becomes an orphan for the weekly
+     * cleanup (docs/14 §4: kept, then cleaned); the source is never touched.
+     */
+    async repointSystem(id, patch, reason) {
+      requireSystemReason(reason);
+      if (!patch || !patch.storageKey) throw new NotFoundError('video_asset');
+      const allowed = ['storageKey', 'status', 'sizeBytes', 'width', 'height', 'duration', 'codecVideo', 'codecAudio', 'container', 'checksum', 'createdByJobId'];
+      const values = Object.fromEntries(Object.entries(patch).filter(([k, v]) => allowed.includes(k) && v !== undefined));
+      const [row] = await exec('video_asset', () =>
+        db.update(videoAssets).set({ ...values, updatedAt: new Date() }).where(eq(videoAssets.id, id)).returning());
+      if (!row) throw new NotFoundError('video_asset');
+      return row;
+    },
+
+    /** T-1202: derived rows that no longer describe the media (HLS/captions/audio after an overwrite). Never a source. */
+    async deleteSystem(id, reason) {
+      requireSystemReason(reason);
+      const rows = await exec('video_asset', () => db.delete(videoAssets)
+        .where(and(eq(videoAssets.id, id), eq(videoAssets.immutable, false))).returning({ id: videoAssets.id }));
+      return rows.length > 0;
+    },
+
     async listByRecordingSystem(recordingId, reason) {
       requireSystemReason(reason);
       return exec('video_asset', () =>

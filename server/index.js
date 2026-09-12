@@ -355,7 +355,29 @@ app.get('/api/client-config', requireAuth, async (req, res) => {
     library = { path: 'legacy', decision: rollout.LIBRARY_DECISION.legacyDisabled };
   }
   kpi.libraryDecision(req, library);
-  res.json(rollout.clientConfigBody(decision, web, rollout.decideWatch(), library));
+
+  // T-1201: the EDITOR's decision (edit sessions / render jobs / silence
+  // removal on PostgreSQL) — its own gate, the same mirror rule.
+  let editor;
+  try {
+    if (rollout.editorEnabled()) {
+      let hasMirror = null;
+      try {
+        const { repositories } = require('../db/src/index.js');
+        const { idFor } = require('../db/src/legacy-ids.js');
+        hasMirror = !!(await repositories().users.findById(idFor('usr', req.userId)));
+      } catch (e) {
+        hasMirror = false;
+      }
+      editor = rollout.decideEditor({ hasPostgresMirror: hasMirror });
+    } else {
+      editor = rollout.decideEditor();
+    }
+  } catch (e) {
+    editor = { path: 'legacy', decision: rollout.EDITOR_DECISION.legacyDisabled };
+  }
+  kpi.editorDecision(req, editor);
+  res.json(rollout.clientConfigBody(decision, web, rollout.decideWatch(), library, editor));
 });
 
 // T-802: the PUBLIC client configuration — what an ANONYMOUS viewer may know.
@@ -381,7 +403,7 @@ app.get('/api/client-config/public', (req, res) => {
 // every current client uses.
 if (process.env.V1_UPLOAD_API === 'true') {
   try {
-    const { createUploadRouter, createRecordingsRouter, createMeRouter, createAdminJobsRouter, createAiRouter, createWatchRouter, createFoldersRouter, createNotificationsRouter, createSharingRouter, createEngagementRouter, createAnalyticsRouter, authz: v1authz, createQuota } = require('../api/src/index.js');
+    const { createUploadRouter, createRecordingsRouter, createMeRouter, createAdminJobsRouter, createAiRouter, createWatchRouter, createFoldersRouter, createNotificationsRouter, createSharingRouter, createEngagementRouter, createAnalyticsRouter, createEditingRouter, authz: v1authz, createQuota } = require('../api/src/index.js');
     const { repositories, withTransaction } = require('../db/src/index.js');
     const storagePkg = require('../storage/src/index.js');
     // T-306: the quota ledger. Limits come from the ONE plan catalog
@@ -454,6 +476,24 @@ if (process.env.V1_UPLOAD_API === 'true') {
     // client switches on the `library` block of /api/client-config (V1_LIBRARY).
     app.use('/api/v1', createFoldersRouter({ repositories, requireAuth, logger }));
     app.use('/api/v1', createNotificationsRouter({ repositories, requireAuth, logger }));
+    // T-1201: edit sessions + render enqueue + silence removal + stitch (docs/08
+    // §11, docs/14). Multi-clip renders are Pro (the legacy stitch permission);
+    // the output-duration check is the legacy canRecord; a copy render takes
+    // the same quota reservation as an upload. The worker renders.
+    app.use('/api/v1', createEditingRouter({
+      repositories, withTransaction, requireAuth, logger, quota,
+      entitlements: {
+        isFeatureEnabled: async (feature, ctx) => {
+          const u = users.findById((ctx.req && (ctx.req.legacyUserId || ctx.req.userId)) || null);
+          return feature === 'clipStitchEnabled' ? permissions.canStitchClips(u).allowed : false;
+        },
+        canRecordDuration: async (durationSec, ctx) => {
+          const u = users.findById((ctx.req && (ctx.req.legacyUserId || ctx.req.userId)) || null);
+          const v = permissions.canRecord(u, durationSec);
+          return v && v.allowed === false ? { allowed: false, code: 'recording_limit', message: v.reason, meta: v.meta } : { allowed: true };
+        },
+      },
+    }));
     // T-1002: owner analytics from view_sessions (docs/08 §9, docs/13 §5), Pro
     // gated by the legacy analytics permission; a locked account's attempt is
     // recorded as a canonical paywall event (T-1003).

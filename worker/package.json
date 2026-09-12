@@ -11,7 +11,7 @@
   "scripts": {
     "start": "node src/main.js",
     "worker": "node src/main.js",
-    "test": "node ../tests/job-queue.test.js && node ../tests/outbox.test.js && node ../tests/maintenance-jobs.test.js && node ../tests/stt.test.js && node ../tests/probe.test.js && node ../tests/transcode.test.js && node ../tests/thumbnail.test.js && node ../tests/audio-captions.test.js && node ../tests/hls.test.js",
+    "test": "node ../tests/job-queue.test.js && node ../tests/outbox.test.js && node ../tests/maintenance-jobs.test.js && node ../tests/stt.test.js && node ../tests/probe.test.js && node ../tests/transcode.test.js && node ../tests/thumbnail.test.js && node ../tests/audio-captions.test.js && node ../tests/hls.test.js && node ../tests/render.test.js",
     "test:queue": "node ../tests/job-queue.test.js",
     "test:outbox": "node ../tests/outbox.test.js",
     "test:maintenance": "node ../tests/maintenance-jobs.test.js",
@@ -20,7 +20,8 @@
     "test:transcode": "node ../tests/transcode.test.js",
     "test:thumbnail": "node ../tests/thumbnail.test.js",
     "test:audio": "node ../tests/audio-captions.test.js",
-    "test:hls": "node ../tests/hls.test.js"
+    "test:hls": "node ../tests/hls.test.js",
+    "test:render": "node ../tests/render.test.js"
   },
   "dependencies": {
     "bullmq": "^6.3.4",

@@ -497,4 +497,4 @@ function registerMediaProcessors(registry) {
   return registry;
 }
 
-module.exports = { registerMediaProcessors, scratchDir, scratchHasRoom, DURATION_GRACE_SEC, HLS_MIN_DURATION_SEC, HLS_MIN_HEIGHT, REASON };
+module.exports = { registerMediaProcessors, scratchDir, scratchHasRoom, download, DURATION_GRACE_SEC, HLS_MIN_DURATION_SEC, HLS_MIN_HEIGHT, REASON };

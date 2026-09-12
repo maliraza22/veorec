@@ -119,8 +119,8 @@ function fakeRepos() {
     ok(reg.missing().includes('transcode') && !reg.missing().includes('probe'), 'missing() lists the catalog types without a processor');
     off(); ok(!reg.has('probe') && reg.queues().join() === 'stt', 'unregistering removes the type and its queue');
     const shipped = W.createDefaultRegistry({ logger: silent });
-    ok(shipped.types().sort().join() === 'ai_chapters,ai_summary,ai_title,audio_extract,captions,cleanup,hls,probe,thumbnail,transcode,transcribe,translate,upload_expiry,usage_sync' && shipped.queues().sort().join() === 'ai,maintenance,media,stt', 'the shipped registry carries the T-602 maintenance, T-603 stt/ai and T-701–T-705 media processors (render is Phase 12)');
-    const bare = W.createDefaultRegistry({ logger: silent, maintenance: false, stt: false, media: false });
+    ok(shipped.types().sort().join() === 'ai_chapters,ai_summary,ai_title,audio_extract,captions,cleanup,hls,probe,render,silence_detect,thumbnail,transcode,transcribe,translate,upload_expiry,usage_sync' && shipped.queues().sort().join() === 'ai,maintenance,media,render,stt', 'the shipped registry carries the T-602 maintenance, T-603 stt/ai, T-701–T-705 media and T-1202/T-1204 editing processors');
+    const bare = W.createDefaultRegistry({ logger: silent, maintenance: false, stt: false, media: false, editing: false });
     ok(bare.types().length === 0 && bare.queues().length === 0, 'maintenance:false yields the empty T-601 registry');
   }
 

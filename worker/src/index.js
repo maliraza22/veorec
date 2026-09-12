@@ -27,7 +27,9 @@ const playIcon = require('./media/play-icon');
 const audio = require('./media/audio');
 const captions = require('./media/captions');
 const hls = require('./media/hls');
+const render = require('./media/render');
 const mediaProcessors = require('./processors/media');
+const editingProcessors = require('./processors/render');
 const transcription = require('./stt/transcription');
 const { createAi } = require('./stt/ai');
 const { createRateGate } = require('./stt/rate-gate');
@@ -66,4 +68,8 @@ module.exports = {
   createAudioExtractor: audio.createAudioExtractor, buildVtt: captions.buildVtt, validateVtt: captions.validateVtt,
   // T-705: HLS renditions.
   createHlsPackager: hls.createHlsPackager, renditionsFor: hls.renditionsFor, inspectPlaylists: hls.inspectPlaylists, avc1Codec: hls.avc1Codec, HLS_RENDITIONS: hls.RENDITIONS,
+  // T-1202/T-1203/T-1204: the editor's renderer + the render / silence_detect processors.
+  createRenderer: render.createRenderer, planCanvas: render.planCanvas, planStrategy: render.planStrategy, buildEncodeArgs: render.buildEncodeArgs,
+  keepRangesFromSilences: render.keepRangesFromSilences, keepRangesFromTranscript: render.keepRangesFromTranscript,
+  registerEditingProcessors: editingProcessors.registerEditingProcessors, parseSilenceDetect: editingProcessors.parseSilenceDetect,
 };

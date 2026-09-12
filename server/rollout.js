@@ -186,6 +186,27 @@ function decideLibrary({ env = process.env, hasPostgresMirror = null } = {}) {
   return { path: 'v1', decision: LIBRARY_DECISION.v1Enabled };
 }
 
+// ── T-1201: the EDITOR gate (edit sessions / render jobs / silence removal) ──
+// A fifth independent on/off gate for the editor page, with the same mirror
+// rule as the library: an account with no PostgreSQL row cannot have edit
+// sessions there, and that reason is recorded.
+const EDITOR_DECISION = {
+  legacyDisabled: 'editor_legacy_disabled',
+  v1Enabled: 'editor_v1_enabled',
+  accountNotMigrated: 'account_not_migrated',
+};
+
+/** Only the literal 'true' enables the v1 editor, and only while the v1 API is on. */
+function editorEnabled(env = process.env) {
+  return env.V1_EDITOR === 'true' && v1ApiEnabled(env);
+}
+
+function decideEditor({ env = process.env, hasPostgresMirror = null } = {}) {
+  if (!editorEnabled(env)) return { path: 'legacy', decision: EDITOR_DECISION.legacyDisabled };
+  if (hasPostgresMirror === false) return { path: 'legacy', decision: EDITOR_DECISION.accountNotMigrated };
+  return { path: 'v1', decision: EDITOR_DECISION.v1Enabled };
+}
+
 /** The wire body for GET /api/client-config/public — no auth, no identifiers. */
 function publicConfigBody(watchDecision = { path: 'legacy' }) {
   return {
@@ -195,8 +216,13 @@ function publicConfigBody(watchDecision = { path: 'legacy' }) {
 }
 
 /** The wire body for GET /api/client-config. Contains no identifiers. */
-function clientConfigBody(decision, webDecision = { path: 'legacy' }, watchDecision = { path: 'legacy' }, libraryDecision = { path: 'legacy' }) {
+function clientConfigBody(decision, webDecision = { path: 'legacy' }, watchDecision = { path: 'legacy' }, libraryDecision = { path: 'legacy' }, editorDecision = { path: 'legacy' }) {
   return {
+    // T-1201: the editor page's decision (edit sessions + render jobs + silence removal on PostgreSQL).
+    editor: {
+      path: editorDecision.path,
+      v1Enabled: editorDecision.path === 'v1',
+    },
     // T-803: the signed-in library pages' decision (dashboard / folders / notifications).
     library: {
       path: libraryDecision.path,
@@ -228,5 +254,6 @@ module.exports = {
   decideWeb, webUploadEnabled, WEB_DECISION,
   decideWatch, watchPageEnabled, publicConfigBody, WATCH_DECISION,
   decideLibrary, libraryEnabled, LIBRARY_DECISION,
+  decideEditor, editorEnabled, EDITOR_DECISION,
   DECISION, SALT, BUCKETS,
 };

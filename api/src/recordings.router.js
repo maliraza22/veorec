@@ -173,12 +173,17 @@ function createRecordingsRouter(deps) {
 
     // Signed, short-lived, and minted only AFTER the scoped read proved
     // ownership — never derived from a stored public URL.
-    let playbackUrl = null;
+    let playbackUrl = null, mediaUrl = null;
     const source = assets.find((a) => a.kind === 'source' && a.status === 'ready');
     if (source && storage) {
       playbackUrl = await storage.getSignedDownloadUrl(source.storageKey,
         { expiresIn: SIGNED_URL_TTL_SECONDS }).catch(() => null);
     }
+    // T-1201: the ACTIVE media for the editor's preview — the normalised MP4
+    // (which an overwrite render re-points) when it exists, else the source.
+    const mainMp4 = assets.find((a) => a.kind === 'mp4' && a.variant === 'main' && a.status === 'ready');
+    if (mainMp4 && storage) mediaUrl = await storage.getSignedDownloadUrl(mainMp4.storageKey, { expiresIn: SIGNED_URL_TTL_SECONDS }).catch(() => null);
+    if (!mediaUrl) mediaUrl = playbackUrl;
 
     return res.json({
       ...summary(recording, null),
@@ -201,6 +206,7 @@ function createRecordingsRouter(deps) {
         // The storage KEY is internal. Callers get a signed URL or nothing.
       })),
       playbackUrl,
+      mediaUrl,
       // Capability flags the dashboard renders from, rather than guessing.
       canTranscribe: recording.status === 'ready' || recording.status === 'uploaded',
       canStitch: recording.status === 'ready',

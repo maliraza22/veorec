@@ -26,6 +26,7 @@ const { createTranscoder } = require('./media/transcode');
 const { createThumbnailer } = require('./media/thumbnail');
 const { createAudioExtractor } = require('./media/audio');
 const { createHlsPackager } = require('./media/hls');
+const { createRenderer } = require('./media/render');
 
 const DB_DIR = path.join(__dirname, '..', '..', 'db', 'src');
 const STORAGE_DIR = path.join(__dirname, '..', '..', 'storage', 'src');
@@ -77,10 +78,12 @@ async function main() {
   const audioExtractor = createAudioExtractor({ ffmpegBin: bins.ffmpegBin, prober, logger });
   // T-705: HLS renditions (optional; never gates ready).
   const hlsPackager = createHlsPackager({ ffmpegBin: bins.ffmpegBin, prober, logger });
+  // T-1202: the editor's renderer (stream copy when possible, else a re-encode on a common canvas).
+  const renderer = createRenderer({ ffmpegBin: bins.ffmpegBin, prober, logger });
   let keys = null;
   try { keys = require(path.join(STORAGE_DIR, 'index.js')).keys; } catch { /* no storage package → media jobs fail transiently */ }
   logger.info({ stt_configured: transcriber.isConfigured(), whisper_model: transcriber.hasWhisperModel(), llm_configured: ai.isLLMConfigured(), rate_gate: rateGate.kind, ffmpeg: bins.ffmpegBin, ffprobe: bins.ffprobeBin }, 'stt/ai/media providers');
-  const app = createWorkerApp({ config, logger, repositories, withTransaction: tx, storage, jobQueue, registry, deps: { resolveLimits, transcriber, ai, rateGate, prober, transcoder, thumbnailer, audioExtractor, hlsPackager, keys } });
+  const app = createWorkerApp({ config, logger, repositories, withTransaction: tx, storage, jobQueue, registry, deps: { resolveLimits, transcriber, ai, rateGate, prober, transcoder, thumbnailer, audioExtractor, hlsPackager, renderer, ffmpegBin: bins.ffmpegBin, keys } });
 
   logger.info({ app_env: config.appEnv, redis: config.inline ? 'inline' : redactRedisUrl(config.redisUrl), prefix: config.prefix }, 'worker booting');
   await app.start();

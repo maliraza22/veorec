@@ -1,13 +1,16 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
-import { Play, Pause, Scissors, RotateCcw, ArrowLeft, Save, SkipBack, SkipForward, Plus, Upload, Film, X } from 'lucide-react';
+import { Play, Pause, Scissors, RotateCcw, ArrowLeft, Save, SkipBack, SkipForward, Plus, Upload, Film, X, Undo2, Redo2, AudioLines } from 'lucide-react';
 import { useAuth } from '../AuthContext';
 import API from '../api';
 import { fetchClientConfig, webUploadIsV1, preflightSingle, uploadSingle, measureDuration, V1UploadError } from '../lib/v1Upload';
+import { useEditorClient } from '../hooks/useEditorClient';
+import { isFullLength, isSingleSource, timelineFromRecording } from '../lib/editorApi.mjs';
+import { useToast } from '../components/Toast';
 import s from './Editor.module.css';
 
-// T-305: shown when a timeline holds a clip uploaded through the new storage.
-// Composition of such a clip waits for the processing/render pipeline.
+// T-305: shown when a LEGACY timeline holds a clip uploaded through the new storage.
+// (On the v1 editor every owned, ready recording is composable — the worker renders.)
 const NOT_COMPOSABLE_MSG = 'One of these clips was uploaded to the new storage and cannot be combined with other videos yet. You can still play it here — combining will be available once the new processing pipeline ships.';
 
 function fmt(t) {
@@ -20,57 +23,95 @@ let KEY = 1;
 const mkKey = () => 'c' + (KEY++);
 
 // Gallery card thumbnail — static poster + muted autoplay video on hover (matches
-// the library's animated thumbnail).
+// the library's animated thumbnail). A v1 row has no full-file URL: poster only.
 function GalThumb({ v }) {
   const [hover, setHover] = useState(false);
   return (
     <span className={s.galThumb} onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)}>
       {v.thumbnail ? <img src={v.thumbnail} alt="" loading="lazy" /> : <span className={s.galPh} />}
-      {hover && <video src={v.filename} muted autoPlay loop playsInline />}
+      {hover && v.filename && <video src={v.filename} muted autoPlay loop playsInline />}
       <span className={s.galDur}>{fmt(v.duration || 0)}</span>
     </span>
   );
 }
 
+/** What the current timeline means for "Save" (docs/14 §4). */
+function saveKindFor(clips, rec) {
+  if (!rec) return null;
+  if (isFullLength(clips, rec)) return 'clear';                 // whole video → clears the virtual edit
+  if (isSingleSource(clips, rec.id)) return 'single';            // cuts on this video only → virtual or bake
+  return 'multi';                                                // several videos → bake (Pro)
+}
+
 // The editor is a horizontal multi-clip timeline. Each clip is {id, in, out} from
-// some owned video. You can reorder (drag), split, delete and add clips. Saving
-// trims (base-only) or composes (multi-video) server-side via Cloudinary.
+// some owned video. You can reorder (drag), split, delete and add clips, undo /
+// redo, and remove silences. Saving is instant (a virtual edit on the recording)
+// or a RENDER in the worker (edit session → render job with real progress) —
+// which API answers is the server's decision (T-1201; legacy = Cloudinary as before).
 export default function Editor() {
   const { id } = useParams();
   const { authFetch } = useAuth();
   const navigate = useNavigate();
+  const toast = useToast();
+  const { client, ready: clientReady, useV1 } = useEditorClient();
   const videoRef = useRef(null);
   const trackRef = useRef(null);
   const loadedKey = useRef(null);
+  const renderAbort = useRef(null);
 
   const [rec, setRec] = useState(null);
-  const [clips, setClips] = useState([]); // [{key,id,src,title,dur,in,out}]
+  const [loadError, setLoadError] = useState('');
+  const [clips, setClipsRaw] = useState([]); // [{key,id,src,title,dur,in,out}]
+  const [history, setHistory] = useState({ past: [], future: [] });
   const [playhead, setPlayhead] = useState(0); // global seconds
   const [playing, setPlaying] = useState(false);
   const [selKey, setSelKey] = useState(null);
   const [dragKey, setDragKey] = useState(null);
+  const dragStart = useRef(null);
   const [saving, setSaving] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [progress, setProgress] = useState(0);
   const [exportMsg, setExportMsg] = useState('');
+  const [exportNote, setExportNote] = useState('');
   const [indeterminate, setIndeterminate] = useState(false);
+  const [exportFailed, setExportFailed] = useState(false);
   const [chooser, setChooser] = useState(false);
   const [picker, setPicker] = useState(null); // { tab, videos, uploading }
+  const [desilencing, setDesilencing] = useState(false);
+
+  /** Every edit goes through here so undo/redo see it. */
+  function commit(next) {
+    setHistory((h) => ({ past: [...h.past.slice(-49), clips], future: [] }));
+    setClipsRaw(next);
+  }
+  function undo() {
+    if (!history.past.length) return;
+    const prev = history.past[history.past.length - 1];
+    setHistory({ past: history.past.slice(0, -1), future: [clips, ...history.future].slice(0, 50) });
+    setClipsRaw(prev); loadedKey.current = null; setPlayhead(0);
+  }
+  function redo() {
+    if (!history.future.length) return;
+    const next = history.future[0];
+    setHistory({ past: [...history.past, clips].slice(-50), future: history.future.slice(1) });
+    setClipsRaw(next); loadedKey.current = null; setPlayhead(0);
+  }
+  const clipsRef = useRef(clips); clipsRef.current = clips;
+  const baseClips = (d) => timelineFromRecording(d).map((c) => ({ key: mkKey(), id: d.id, src: d.filename, title: d.title, dur: d.duration || 0, in: c.start, out: c.end }));
 
   useEffect(() => {
-    authFetch(`${API}/api/recordings/${id}`).then((r) => r.json()).then((d) => {
-      setRec(d);
-      const dur = d.duration || 0;
-      let init;
-      if (Array.isArray(d.segments) && d.segments.length) {
-        init = d.segments.map((sg) => ({ key: mkKey(), id, src: d.filename, title: d.title, dur, in: sg.start, out: sg.end }));
-      } else {
-        const st = d.trimStart != null ? d.trimStart : 0, en = d.trimEnd != null ? d.trimEnd : dur;
-        init = [{ key: mkKey(), id, src: d.filename, title: d.title, dur, in: st, out: en || dur }];
-      }
-      setClips(init);
-    }).catch(() => {});
-  }, [id]);
+    if (!client) return;
+    let alive = true;
+    client.loadRecording(id).then((r) => {
+      if (!alive) return;
+      if (r.error || !r.rec) { setLoadError(r.error || 'Could not load this video.'); return; }
+      setRec(r.rec);
+      setClipsRaw(baseClips(r.rec));
+      setHistory({ past: [], future: [] });
+    }).catch(() => { if (alive) setLoadError('Could not load this video.'); });
+    return () => { alive = false; };
+    // eslint-disable-next-line
+  }, [id, client]);
 
   const len = (c) => Math.max(0, c.out - c.in);
   const total = useMemo(() => clips.reduce((a, c) => a + len(c), 0), [clips]);
@@ -134,37 +175,41 @@ export default function Editor() {
   function splitAtPlayhead() {
     const { i, off } = locate(playhead);
     if (!clips[i] || off < 0.2 || off > len(clips[i]) - 0.2) return;
-    setClips((cs) => {
-      const c = cs[i]; const next = [...cs];
-      next.splice(i, 1, { ...c, key: mkKey(), out: c.in + off }, { ...c, key: mkKey(), in: c.in + off });
-      return next;
-    });
+    const c = clips[i]; const next = [...clips];
+    next.splice(i, 1, { ...c, key: mkKey(), out: c.in + off }, { ...c, key: mkKey(), in: c.in + off });
+    commit(next);
   }
   function delClip(key) {
-    setClips((cs) => (cs.length <= 1 ? cs : cs.filter((c) => c.key !== key)));
+    if (clips.length <= 1) return;
+    commit(clips.filter((c) => c.key !== key));
     if (selKey === key) setSelKey(null);
   }
   function resetEdits() {
     if (!rec) return;
-    const dur = rec.duration || 0;
     loadedKey.current = null;
-    setClips([{ key: mkKey(), id, src: rec.filename, title: rec.title, dur, in: 0, out: dur }]);
+    commit([{ key: mkKey(), id, src: rec.filename, title: rec.title, dur: rec.duration || 0, in: 0, out: rec.duration || 0 }]);
     setPlayhead(0);
   }
 
-  // Pointer drag to reorder a clip on the timeline.
+  // Pointer drag to reorder a clip on the timeline (one undo step per drag).
   useEffect(() => {
     if (!dragKey) return;
+    dragStart.current = clips;
     function move(e) {
       const g = clientXToGlobal(e.clientX);
       const { i: target } = locate(g);
-      setClips((cs) => {
+      setClipsRaw((cs) => {
         const from = cs.findIndex((c) => c.key === dragKey);
         if (from === -1 || from === target) return cs;
         const next = [...cs]; const [m] = next.splice(from, 1); next.splice(target, 0, m); return next;
       });
     }
-    function up() { setDragKey(null); }
+    function up() {
+      setDragKey(null);
+      const before = dragStart.current; dragStart.current = null;
+      const after = clipsRef.current;
+      if (before && before.map((c) => c.key).join() !== after.map((c) => c.key).join()) setHistory((h) => ({ past: [...h.past.slice(-49), before], future: [] }));
+    }
     window.addEventListener('mousemove', move);
     window.addEventListener('mouseup', up);
     return () => { window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up); };
@@ -175,15 +220,21 @@ export default function Editor() {
   function openPicker() {
     if (rec && rec.canStitch === false) { if (window.confirm('Adding clips is a Pro feature. Open pricing to upgrade?')) navigate('/pricing'); return; }
     setPicker({ tab: 'gallery', videos: null, uploading: false });
-    authFetch(`${API}/api/recordings`).then((r) => (r.ok ? r.json() : []))
-      .then((d) => setPicker((p) => p && { ...p, videos: Array.isArray(d) ? d.filter((v) => v.id !== id) : [] }))
+    client.listGallery(id)
+      .then((videos) => setPicker((p) => p && { ...p, videos }))
       .catch(() => setPicker((p) => p && { ...p, videos: [] }));
   }
   function addClip(vid, src, title, dur, extra = {}) {
-    setClips((cs) => [...cs, { key: mkKey(), id: vid, src, title, dur: dur || 0, in: 0, out: dur || 0, ...extra }]);
+    commit([...clips, { key: mkKey(), id: vid, src, title, dur: dur || 0, in: 0, out: dur || 0, ...extra }]);
     setPicker(null);
   }
-  function addFromGallery(v) { addClip(v.id, v.filename, v.title, v.duration || 0); }
+  async function addFromGallery(v) {
+    if (!useV1) { addClip(v.id, v.filename, v.title, v.duration || 0); return; }
+    // A v1 row carries no media URL: fetch the detail for its signed, active media.
+    const r = await client.loadRecording(v.id);
+    if (r.error || !r.rec || !r.rec.filename) { toast.error(r.error || 'That video cannot be previewed right now.'); return; }
+    addClip(v.id, r.rec.filename, r.rec.title, r.rec.duration || v.duration || 0);
+  }
   async function uploadClip(file) {
     if (!file) return;
     setPicker((p) => p && { ...p, uploading: true });
@@ -199,15 +250,17 @@ export default function Editor() {
         try {
           const r = await uploadSingle({ API, authFetch, file, title: name });
           const dur = await measureDuration(file);
-          // Marked v1: it plays from a signed URL, and it cannot be composed
-          // by the current Cloudinary pipeline (see saveCompose).
-          addClip(r.recordingId, r.playbackUrl || '', name, dur, { v1: true });
+          // On the v1 editor the upload is composable once its pipeline is done
+          // (the render refuses a clip that is not ready, honestly); on the
+          // legacy editor it is marked so compose says why (T-305).
+          addClip(r.recordingId, r.playbackUrl || '', name, dur, useV1 ? { fresh: true } : { v1: true });
+          if (useV1) toast.info('Your upload is processing — it can be combined as soon as it is ready.', { ttl: 6000 });
           return;
         } catch (e) {
           // Fallback to legacy is allowed ONLY before a v1 session existed.
           // After that, falling back would upload the same file twice.
           if (!(e instanceof V1UploadError) || !e.fallbackAllowed) {
-            alert((e && e.userMessage) || 'Upload failed — please try again.');
+            toast.error((e && e.userMessage) || 'Upload failed — please try again.');
             setPicker((p) => p && { ...p, uploading: false });
             return;
           }
@@ -220,65 +273,95 @@ export default function Editor() {
       form.append('title', name); form.append('duration', '0');
       const res = await authFetch(`${API}/api/upload`, { method: 'POST', body: form });
       const d = await res.json().catch(() => ({}));
-      if (!res.ok || !d.id) { alert(d.error || 'Could not upload that clip.'); setPicker((p) => p && { ...p, uploading: false }); return; }
+      if (!res.ok || !d.id) { toast.error(d.error || 'Could not upload that clip.'); setPicker((p) => p && { ...p, uploading: false }); return; }
       // grab the playable URL + measured duration of the new asset
       let meta = {};
       try { meta = await authFetch(`${API}/api/recordings/${d.id}`).then((x) => x.json()); } catch (e) {}
       addClip(d.id, meta.filename || '', name, meta.duration || 0);
-    } catch (e) { alert('Upload failed — please try again.'); setPicker((p) => p && { ...p, uploading: false }); }
+    } catch (e) { toast.error('Upload failed — please try again.'); setPicker((p) => p && { ...p, uploading: false }); }
+  }
+
+  // ── Remove silences (T-1204: a worker job on v1; the legacy route otherwise) ──
+  async function removeSilences() {
+    if (!rec || desilencing) return;
+    if (useV1 && rec.ready === false) { toast.info('Silence removal needs a fully processed video — try again once it is ready.'); return; }
+    setDesilencing(true);
+    try {
+      const r = await client.removeSilences(id);
+      if (r.error) { toast.error(r.error); return; }
+      const next = (r.segments || []).map((sg) => ({ key: mkKey(), id, src: rec.filename, title: rec.title, dur: rec.duration || 0, in: sg.start, out: sg.end }));
+      if (!next.length) { toast.info('No silences to remove.'); return; }
+      loadedKey.current = null; commit(next); setPlayhead(0);
+      setRec((x) => ({ ...x, segments: r.segments }));
+      toast.success(`Removed ~${r.removedSeconds}s of silence (kept ${r.keptSeconds}s). The player now skips the quiet gaps — save to bake it permanently.`, { ttl: 8000 });
+    } catch { toast.error('Network error — please try again.'); }
+    finally { setDesilencing(false); }
   }
 
   // ── Save ──────────────────────────────────────────────────────────────────────
   const hasOther = clips.some((c) => c.id !== id);
+  const saveKind = saveKindFor(clips, rec);
   function onSaveClick() {
-    const baseFull = !hasOther && clips.length === 1 && clips[0].in <= 0.05 && clips[0].out >= (rec.duration || 0) - 0.05;
-    if (baseFull) { saveTrim('overwrite'); return; }
+    if (saveKind === 'clear') { saveVirtual(null); return; }
     setChooser(true);
   }
-  function doSave(mode) { setChooser(false); if (hasOther) saveCompose(mode); else saveTrim(mode); }
-  async function saveCompose(mode) {
-    if (rec.canStitch === false) { if (window.confirm('Adding clips is a Pro feature. Upgrade?')) navigate('/pricing'); return; }
-    // T-305: a v1-uploaded clip cannot be composed by the current pipeline.
-    // Say so plainly here rather than sending a request that will be refused.
-    if (clips.some((c) => c.v1)) { alert(NOT_COMPOSABLE_MSG); return; }
-    try { videoRef.current && videoRef.current.pause(); } catch (e) {}
-    setExporting(true); setIndeterminate(true); setProgress(0);
-    setExportMsg(mode === 'copy' ? 'Building your video into a new copy…' : 'Building your video on our servers…');
+  function doSave(mode) { setChooser(false); if (mode === 'virtual') saveVirtual(clips.map((c) => ({ start: c.in, end: c.out }))); else saveRender(mode); }
+  async function saveVirtual(segments) {
+    setSaving(true);
     try {
-      const res = await authFetch(`${API}/api/recordings/${id}/compose`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ clips: clips.map((c) => ({ id: c.id, start: c.in, end: c.out })), mode }),
-      });
-      const d = await res.json().catch(() => ({}));
-      if (res.ok) { setIndeterminate(false); setProgress(1); setExportMsg('Saved ✓ Your video is ready.'); setTimeout(() => navigate(d.id ? `/watch/${d.id}` : '/'), 1100); return; }
-      if (res.status === 403 && d.code === 'feature_locked') { setExporting(false); if (window.confirm('Adding clips is a Pro feature. Upgrade?')) navigate('/pricing'); return; }
-      // T-305: the server's own refusal for a v1 clip — a plain explanation, never a generic failure.
-      if (res.status === 409 && d.code === 'clip_not_composable') { setExporting(false); alert(NOT_COMPOSABLE_MSG); return; }
-      throw new Error(d.error || 'Save failed');
-    } catch (e) { setIndeterminate(false); setExportMsg('Could not save: ' + (e.message || 'error')); setTimeout(() => setExporting(false), 2800); }
+      const r = await client.saveVirtual(id, { segments, trimStart: null, trimEnd: null });
+      if (r.error) { toast.error(r.error); return; }
+      toast.success(segments ? 'Saved — the player skips the cut parts instantly.' : 'Edits cleared.');
+      setTimeout(() => navigate(useV1 ? `/watch/${id}` : '/'), 800);
+    } catch { toast.error('Network error — please try again.'); }
+    finally { setSaving(false); }
   }
-  async function saveTrim(mode) {
-    const segments = clips.map((c) => ({ start: c.in, end: c.out }));
-    const isFull = clips.length === 1 && segments[0].start <= 0.05 && segments[0].end >= (rec.duration || 0) - 0.05;
-    if (isFull) {
-      setSaving(true);
-      await authFetch(`${API}/api/recordings/${id}/meta`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ segments: null, trimStart: null, trimEnd: null }) });
-      setSaving(false); setTimeout(() => navigate('/'), 800); return;
-    }
+  function upgradePrompt(message) {
+    setExporting(false);
+    if (window.confirm(`${message || 'This is a Pro feature.'} Open pricing to upgrade?`)) navigate('/pricing');
+  }
+  async function saveRender(mode) {
+    if (hasOther && rec.canStitch === false) { upgradePrompt('Adding clips is a Pro feature.'); return; }
+    // T-305: a v1-uploaded clip cannot be composed by the LEGACY pipeline.
+    if (!useV1 && clips.some((c) => c.v1)) { toast.error(NOT_COMPOSABLE_MSG, { ttl: 8000 }); return; }
     try { videoRef.current && videoRef.current.pause(); } catch (e) {}
-    setExporting(true); setIndeterminate(true); setProgress(0);
-    setExportMsg(mode === 'copy' ? 'Creating a trimmed copy…' : 'Trimming your video…');
+    setPlaying(false);
+    setExporting(true); setExportFailed(false); setIndeterminate(true); setProgress(0);
+    setExportMsg(mode === 'copy' ? 'Building your video into a new copy…' : 'Building your video on our servers…');
+    setExportNote(useV1 ? 'Your clips are being cut and stitched by our render workers. The original is never touched — you can leave this page; the render continues.' : 'Our servers are cutting and stitching your clips — this is usually quick.');
     try {
-      const res = await authFetch(`${API}/api/recordings/${id}/trim`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ segments, mode }) });
-      const d = await res.json().catch(() => ({}));
-      if (res.ok) { setIndeterminate(false); setProgress(1); setExportMsg('Saved ✓'); setTimeout(() => navigate('/'), 1100); return; }
-      throw new Error(d.error || 'Trim failed');
-    } catch (e) { setIndeterminate(false); setExportMsg('Could not trim: ' + (e.message || 'error')); setTimeout(() => setExporting(false), 2800); }
+      const r = await client.startRender({ recordingId: id, clips, mode });
+      if (r.error) {
+        if (r.code === 'feature_locked' || r.upgradeRequired) return upgradePrompt(r.error);
+        if (r.code === 'render_in_progress') { setExporting(false); toast.info('A render of this video is already running — check back in a moment.'); return; }
+        if (r.code === 'clip_not_composable') { setExporting(false); toast.error(NOT_COMPOSABLE_MSG, { ttl: 8000 }); return; }
+        throw new Error(r.error);
+      }
+      if (r.done) { setIndeterminate(false); setProgress(1); setExportMsg('Saved ✓ Your video is ready.'); setTimeout(() => navigate(hasOther && r.id ? `/watch/${r.id}` : '/'), 1100); return; }
+      // v1: the worker renders; the progress bar is the job's real progress.
+      setIndeterminate(false);
+      renderAbort.current = new AbortController();
+      const job = await client.waitForRender(r.renderJobId, { onProgress: (p) => setProgress(p / 100), signal: renderAbort.current.signal });
+      if (job.status === 'done') {
+        setProgress(1); setExportMsg(mode === 'copy' ? 'Saved ✓ Your new copy is processing and will be ready shortly.' : 'Saved ✓ Your video is ready.');
+        setTimeout(() => navigate(`/watch/${r.outputRecordingId || id}`), 1100); return;
+      }
+      if (job.status === 'aborted') return;
+      throw new Error(job.error || 'The render failed. Your edit is kept — you can try again.');
+    } catch (e) {
+      setIndeterminate(false); setExportFailed(true);
+      setExportMsg('Could not save: ' + (e.message || 'error'));
+      setExportNote('Nothing was changed. Your timeline is still here — adjust it or try again.');
+    }
   }
 
-  if (!rec) return <div className={s.loading}>Loading editor…</div>;
+  if (loadError) return <div className={s.loading}>{loadError} <Link to="/">Back to library</Link></div>;
+  if (!clientReady || !rec) return <div className={s.loading}>Loading editor…</div>;
   const pctL = (i) => (total ? (startOf(i) / total) * 100 : 0);
   const pctW = (c) => (total ? (len(c) / total) * 100 : 0);
+  const modeHint = saveKind === 'clear' ? 'Whole video — saving clears your edits'
+    : saveKind === 'single' ? 'Cuts on this video — save instantly (virtual) or bake a new file'
+    : `${clips.length} clips — saving renders a new file${rec.canStitch === false ? ' (Pro)' : ''}`;
 
   return (
     <div className={s.page}>
@@ -286,6 +369,8 @@ export default function Editor() {
         <Link to="/" className={s.back}><ArrowLeft size={16} /> Back to library</Link>
         <div className={s.title}>{rec.title}</div>
         <div className={s.topActions}>
+          <button className={s.ghost} onClick={undo} disabled={!history.past.length} title="Undo (the last edit)"><Undo2 size={15} /> Undo</button>
+          <button className={s.ghost} onClick={redo} disabled={!history.future.length} title="Redo"><Redo2 size={15} /> Redo</button>
           <button className={s.ghost} onClick={resetEdits}><RotateCcw size={15} /> Reset</button>
           <button className={s.primary} onClick={onSaveClick} disabled={saving}>
             <Save size={15} /> {saving ? 'Saving…' : 'Save changes'}
@@ -304,6 +389,9 @@ export default function Editor() {
         <button className={s.tbtn} onClick={() => seekGlobal(playhead + 5)} title="Forward 5s"><SkipForward size={18} /></button>
         <div className={s.time}>{fmt(playhead)} <span>/ {fmt(total)}</span></div>
         <div className={s.spacer} />
+        <button className={s.tbtn} onClick={removeSilences} disabled={desilencing} title="Detect the quiet gaps and cut them (you can undo)">
+          <AudioLines size={17} /> {desilencing ? 'Finding silences…' : 'Remove silences'}
+        </button>
         <button className={s.tbtn} onClick={openPicker} title="Add a video clip">
           <Plus size={17} /> Add video{rec.canStitch === false && <span className={s.proTag}>Pro</span>}
         </button>
@@ -332,6 +420,7 @@ export default function Editor() {
         </div>
         <div className={s.tlMeta}>
           <span>Drag a clip to reorder · Split &amp; delete to cut · Add video to append</span>
+          <span className={s.modeHint} data-kind={saveKind}>{modeHint}</span>
           <span>Final length: <strong>{fmt(total)}</strong></span>
         </div>
       </div>
@@ -375,9 +464,15 @@ export default function Editor() {
           <div className={s.chooserCard} onClick={(e) => e.stopPropagation()}>
             <div className={s.chooserTitle}>How do you want to save?</div>
             <div className={s.chooserSub}>Final length <strong>{fmt(total)}</strong>{hasOther ? ` · ${clips.length} clips` : ''}</div>
+            {saveKind === 'single' && (
+              <button className={s.chooserOpt} onClick={() => doSave('virtual')}>
+                <span className={s.chooserOptIcon}>⚡</span>
+                <span className={s.chooserOptText}><strong>Save instantly</strong><em>The player skips the cut parts. Free, immediate and reversible — nothing is re-encoded.</em></span>
+              </button>
+            )}
             <button className={s.chooserOpt} onClick={() => doSave('overwrite')}>
               <span className={s.chooserOptIcon}>♻️</span>
-              <span className={s.chooserOptText}><strong>Overwrite original</strong><em>Replace this video with the edited version.</em></span>
+              <span className={s.chooserOptText}><strong>Overwrite original</strong><em>{useV1 ? 'Render a new file and make it this video (the original recording is kept safe).' : 'Replace this video with the edited version.'}</em></span>
             </button>
             <button className={s.chooserOpt} onClick={() => doSave('copy')}>
               <span className={s.chooserOptIcon}>➕</span>
@@ -397,7 +492,11 @@ export default function Editor() {
             ) : (
               <><div className={s.exportBar}><div className={s.exportFill} style={{ width: `${Math.round(progress * 100)}%` }} /></div><div className={s.exportPct}>{Math.round(progress * 100)}%</div></>
             )}
-            <div className={s.exportNote}>Our servers are cutting and stitching your clips — this is usually quick.</div>
+            <div className={s.exportNote}>{exportNote}</div>
+            {exportFailed && <button className={s.ghost} onClick={() => setExporting(false)} style={{ marginTop: 14 }}>Back to the editor</button>}
+            {!exportFailed && useV1 && progress < 1 && !indeterminate && (
+              <button className={s.ghost} onClick={() => { if (renderAbort.current) renderAbort.current.abort(); setExporting(false); toast.info('The render continues in the background — the result appears in your library when it is done.', { ttl: 7000 }); }} style={{ marginTop: 14 }}>Continue in background</button>
+            )}
           </div>
         </div>
       )}

@@ -22,6 +22,7 @@ const JOB_TYPES = Object.freeze({
   ai_summary:        { queue: 'ai',          attempts: 2, timeoutMs: 5 * MIN },
   ai_chapters:       { queue: 'ai',          attempts: 2, timeoutMs: 5 * MIN },
   render:            { queue: 'render',      attempts: 2, timeoutMs: 15 * MIN },
+  silence_detect:    { queue: 'media',       attempts: 2, timeoutMs: 20 * MIN },   // T-1204: audio-based silence → virtual edit
   cleanup:           { queue: 'maintenance', attempts: 3, timeoutMs: 60 * MIN },
   usage_sync:        { queue: 'maintenance', attempts: 3, timeoutMs: 30 * MIN },
   subscription_sync: { queue: 'maintenance', attempts: 3, timeoutMs: 30 * MIN },

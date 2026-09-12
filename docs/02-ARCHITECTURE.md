@@ -585,6 +585,10 @@ dashboard *can* render from v1 behind the flag, but nothing points at it yet.
 
 `client/src/lib/watchApi.mjs` is the ONE client module that knows which watch API is in use: the server's public decision (`V1_WATCH_PAGE`) selects `/api/v1/watch/*` or the untouched legacy `/api/watch/*`; a v1 miss for an id falls back to legacy once (a legacy recording the T-204 backfill has not reached). Page state is driven by the payload (`11` §1); media URLs are signed and refreshed before expiry; HLS plays through hls.js against the T-801 playlist proxy; captions attach as a native `<track>`. Cloudinary URL logic exists only in the legacy media resolver.
 
+### 2.7.5c The editor on v1 (delivered by T-1201 – T-1204)
+
+`client/src/lib/editorApi.mjs` is the ONE client module that knows which editing API is in use: the server's decision (`editor.path` on the authed `/api/client-config`, `V1_EDITOR` with the PostgreSQL-mirror rule) selects the edit-session / render-job / silence-job routes on `/api/v1` or the untouched legacy Cloudinary handlers. On v1 nothing is rendered in the API process: an edit session is an edit decision list over immutable sources; `POST …/render` answers 202 and the worker's `render` job (stream copy when a single-source timeline allows it, else a re-encode on the base's canvas) publishes the output — a copy becomes a new recording's immutable source (with the upload's quota reservation) and goes through the normal pipeline; an overwrite re-points the recording's `mp4/main` asset. Silence removal is the `silence_detect` job applied as a virtual edit. The editor shows the job's real progress and keeps the timeline on failure.
+
 ### 2.7.6 Legacy → PostgreSQL identity bridge (prerequisite for T-304)
 
 The legacy JWT carries the **legacy** user id. Every PostgreSQL row the T-104

@@ -113,6 +113,8 @@ Generate WebVTT from `transcript_segments` → asset `kind='captions_vtt'`; the 
 
 Render jobs (trim/splice/silence-cut) are specified in `14` §5 — they run in the same worker fleet, consume **source or MP4 assets** (never mutate them), and publish `render_output` assets. Concat strategy: same-source segment cuts use stream-copy where cut points align with keyframes (`-ss/-to -c copy` per segment + concat demuxer) and re-encode otherwise; cross-video composition always re-encodes on a common canvas (letterbox pad — port the logic and MAX_EDGE lessons from `index.js:1204-1240`).
 
+> **As implemented (T-1202/T-1203):** `worker/src/media/render.js` + `worker/src/processors/render.js` — see `10` §3 `render` and `14` §9. The concat strategy above is what shipped: same-source cuts try the stream copy and are verified; anything the copy cannot land within tolerance, and every cross-video composition, is re-encoded on the common canvas.
+
 ## 9. Worker architecture & resource rules
 
 - Concurrency per worker process: transcode/hls/render = 1 (CPU-bound; scale by adding worker replicas); probe/thumbnail/audio = 4; transcribe = 1 with Groq rate-limit group (`10` §6).

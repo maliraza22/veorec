@@ -12,6 +12,7 @@ import { useBilling } from '../hooks/useBilling';
 import { useToast } from '../components/Toast';
 import VideoPlayer from '../components/VideoPlayer';
 import { createWatchClient, fetchWatchConfig, watchIsV1, stateFor } from '../lib/watchApi.mjs';
+import { createEditorClient } from '../lib/editorApi.mjs';
 import { useWatchMedia } from './watch/useWatchMedia';
 import { useStatusPolling } from './watch/useStatusPolling';
 import { ProcessingPanel, FailedPanel, NotFoundPanel, LoadingPanel, LoginGate, LinkExpiredPanel, ErrorPanel, PasswordGate, EmailGate, PlaybackErrorPanel } from './watch/Panels';
@@ -413,28 +414,27 @@ export default function Watch() {
   const genChapters = () => aiAction({ kind: 'Chapters', path: 'chapters', setBusy: setChaptering, defaultErr: 'Could not generate chapters.',
     onDone: (d, next) => { const ch = d ? d.chapters : (next ? next.chapters : null); if (Array.isArray(ch)) setRec(r => ({ ...r, chapters: ch })); } });
 
+  // T-1201/T-1204: a v1 recording's edits (silence removal, combine) go through
+  // the editor data layer — the worker does the work, the page polls the job.
+  const editorClient = useMemo(() => createEditorClient({ API, useV1: isV1, authFetch: (url, init = {}) => fetch(url, { ...init, headers: { ...authHeaders(), ...(init.headers || {}) } }) }), [isV1]);
+
   async function removeSilences() {
-    if (!isLegacy) { toast.info('Silence removal is coming to migrated recordings soon.'); return; }
+    if (isV1 && rec.status !== 'ready') { toast.info('Silence removal needs a fully processed video — try again once it is ready.'); return; }
     setDesilencing(true);
     try {
-      const res = await fetch(`${API}/api/recordings/${id}/remove-silences`, { method: 'POST', headers: authHeaders() });
-      const d = await res.json().catch(() => ({}));
-      if (res.ok && d.segments) {
+      const d = await editorClient.removeSilences(id);
+      if (!d.error && d.segments) {
         setRec(r => ({ ...r, segments: d.segments }));
         toast.success(`Removed ~${d.removedSeconds}s of silence (kept ${d.keptSeconds}s). The player now skips the quiet gaps — open “Edit & trim video” to save it permanently.`, { ttl: 8000 });
-      } else toast.error(errMessage(d, 'Could not remove silences.'));
+      } else toast.error(d.error || 'Could not remove silences.');
     } catch { toast.error('Network error — please try again.'); }
     finally { setDesilencing(false); }
   }
 
   function openCombine() {
-    if (!isLegacy) { toast.info('Combining is coming to migrated recordings soon.'); return; }
     setCombineOpen(o => !o);
     if (myVideos == null) {
-      fetch(`${API}/api/recordings`, { headers: authHeaders() })
-        .then(r => (r.ok ? r.json() : []))
-        .then(d => setMyVideos(Array.isArray(d) ? d.filter(v => v.id !== id) : []))
-        .catch(() => setMyVideos([]));
+      editorClient.listGallery(id).then(setMyVideos).catch(() => setMyVideos([]));
     }
   }
   function togglePick(vid) {
@@ -444,13 +444,16 @@ export default function Watch() {
     if (!pickedIds.length) return;
     setCombining(true);
     try {
-      const res = await fetch(`${API}/api/recordings/stitch`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() },
-        body: JSON.stringify({ ids: [id, ...pickedIds] }),
-      });
-      const d = await res.json().catch(() => ({}));
-      if (res.ok && d.id) navigate(`/watch/${d.id}`);
-      else toast.error(errMessage(d, 'Could not combine the videos.'));
+      const d = await editorClient.stitch([id, ...pickedIds]);
+      if (d.error) {
+        if (d.code === 'feature_locked' || d.upgradeRequired) { if (window.confirm(`${d.error} Open pricing to upgrade?`)) navigate('/pricing'); }
+        else toast.error(d.error);
+      } else if (d.done) navigate(`/watch/${d.id}`);
+      else {
+        // v1: the worker renders the combined copy; its watch page shows the progress.
+        toast.success('Combining your videos — the new copy is processing and will appear in your library.', { ttl: 6000 });
+        navigate(`/watch/${d.outputRecordingId}`);
+      }
     } catch { toast.error('Network error — please try again.'); }
     finally { setCombining(false); }
   }
@@ -855,12 +858,12 @@ export default function Watch() {
           )}
         </div>
       )}
-      {isLegacy && (
+      {(isLegacy || isV1) && (
         <button className={styles.action} onClick={removeSilences} disabled={desilencing}>
           <span className={styles.actionIcon}>{desilencing ? <Loader2 size={18} className={styles.spin} /> : <Scissors size={18} />}</span>
           <span className={styles.actionText}>
             <strong>{desilencing ? 'Removing silences…' : 'Remove silences'}</strong>
-            <span>Auto-skip the quiet gaps from the transcript — free.</span>
+            <span>{isV1 ? 'Auto-skip the quiet gaps (detected from the audio) — free.' : 'Auto-skip the quiet gaps from the transcript — free.'}</span>
           </span>
         </button>
       )}

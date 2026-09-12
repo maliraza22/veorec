@@ -29,6 +29,13 @@
       "when": 1788221201512,
       "tag": "0003_backfill_checklist",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1788221261512,
+      "tag": "0004_editing_jobs",
+      "breakpoints": true
     }
   ]
 }

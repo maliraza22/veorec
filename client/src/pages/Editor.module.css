@@ -125,3 +125,11 @@
 .uploadZone:hover { border-color: #5b5bf6; color: #fff; background: #16161f; }
 .uploadZone strong { font-size: 15.5px; color: #fff; }
 .uploadZone span { font-size: 12.5px; color: #8a8aa0; max-width: 320px; }
+
+/* ── T-1201: undo/redo, the save-mode hint, render overlay actions ────────── */
+.ghost:disabled { opacity: .45; cursor: not-allowed; }
+.tbtn:disabled { opacity: .55; cursor: wait; }
+.modeHint { font-size: 12px; font-weight: 600; color: #8a8aa0; padding: 2px 9px; border-radius: 6px; background: #1c1c28; border: 1px solid #2a2a3a; }
+.modeHint[data-kind="single"] { color: #9ad0ff; border-color: #23405a; }
+.modeHint[data-kind="multi"] { color: #ffd28a; border-color: #4a3a1e; }
+.modeHint[data-kind="clear"] { color: #a8e6b0; border-color: #1f4a2a; }

@@ -178,8 +178,8 @@ const RUN = crypto.randomBytes(4).toString('hex');
   // Composition protection in the editor.
   ok(/clips\.some\(\(c\) => c\.v1\)/.test(editor) && /NOT_COMPOSABLE_MSG/.test(editor),
     'the editor explains, before sending, that a v1 clip cannot be composed');
-  ok(/d\.code === 'clip_not_composable'/.test(editor), "and handles the server's own 409 clip_not_composable");
-  ok(/addClip\(r\.recordingId, r\.playbackUrl \|\| '', name, dur, \{ v1: true \}\)/.test(editor),
+  ok(/r\.code === 'clip_not_composable'/.test(editor), "and handles the server's own 409 clip_not_composable");
+  ok(/addClip\(r\.recordingId, r\.playbackUrl \|\| '', name, dur, useV1 \? \{ fresh: true \} : \{ v1: true \}\)/.test(editor),
     'a v1 clip enters the timeline playing from its signed playbackUrl');
 
   // ── D. Live server ───────────────────────────────────────────────────────

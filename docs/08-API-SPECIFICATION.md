@@ -126,14 +126,19 @@ CRUD as today: GET/POST `/folders`, PATCH/DELETE `/folders/:id` (⚿ owner; name
 
 | Method & path | Auth | Request → Response |
 |---|---|---|
-| POST `/recordings/:id/edit-sessions` | ⚿ owner | `{timeline}` → `{editSessionId}` (draft) |
-| PATCH `/edit-sessions/:id` | ⚿ owner | `{timeline}` / `{op}` append → updated |
-| POST `/edit-sessions/:id/render` | ⚿ owner | `{mode:'overwrite'|'copy'}` → `{renderJobId}` (202) — multi-clip requires Pro `clipStitchEnabled`; enqueues render job |
-| GET `/render-jobs/:id` | ⚿ owner | `{status,progress,outputRecordingId?}` — editor polls |
-| POST `/recordings/:id/remove-silences` | ⚿ owner | → `202 {jobId}` then `{segments,keptSeconds,removedSeconds}` via job result (async — today it blocks on transcription) |
-| POST `/recordings/stitch` | ⚿, Pro | `{ids[2..10], title?}` → `{editSessionId, renderJobId}` (sugar over edit-sessions) |
+| POST `/recordings/:id/edit-sessions` | ⚿ owner | `{timeline?}` → `201 {editSessionId, status:'draft', timeline, ops:[]}` — no timeline = the whole video (honouring an existing virtual edit) |
+| GET `/edit-sessions/:id` | ⚿ owner | the session (timeline, status, mode, ops, the render jobs) |
+| PATCH `/edit-sessions/:id` | ⚿ owner | `{timeline, op?}` → the updated draft (the op is appended to `edit_operations`); `409 invalid_state` once it is rendering/applied/discarded |
+| POST `/edit-sessions/:id/discard` | ⚿ owner | → `{ok}` (a rendering session cannot be discarded) |
+| POST `/edit-sessions/:id/render` | ⚿ owner | `{mode:'overwrite'|'copy'}` → `202 {renderJobId, editSessionId, status:'rendering', outputRecordingId (copy), durationSec}` — multi-clip requires Pro `clipStitchEnabled` (`403 feature_locked`, paywall recorded); the output duration is checked by the plan (`403 recording_limit`); a copy takes the upload's atomic quota reservation (`403 video_limit`/`storage_limit`, recorded); one render per recording (`409 render_in_progress`) |
+| GET `/render-jobs/:id` | ⚿ owner | `{renderJobId, editSessionId, recordingId, mode, status:'queued'|'running'|'done'|'failed', progress 0–100, outputRecordingId, error}` — the editor polls (progress = `processing_jobs.result.progress`) |
+| POST `/recordings/:id/remove-silences` | ⚿ owner | → `202 {jobId, status, reused}` (`silence_detect` job, dedupe `silence:{id}`, pad 0.2 s / minGap 0.8 s); `409 recording_not_ready` |
+| GET `/recordings/:id/remove-silences` | ⚿ owner | `{jobId, status, result: {segments, keptSeconds, removedSeconds, method:'audio'|'transcript'} | null, error}` — the editor / watch page poll after the 202; `404 job_not_found` until requested |
+| POST `/recordings/stitch` | ⚿, Pro | `{ids[2..10], title?}` → `202 {editSessionId, renderJobId, outputRecordingId}` (sugar over a whole-video edit session + a copy render) |
 
 Virtual trim stays synchronous via PATCH `/recordings/:id/meta` (no render needed).
+
+*(As implemented, T-1201: `api/src/editing.router.js`. Every referenced clip must be OWNED (another owner's recording is `404`, never confirmed) and `ready` (`409 recording_not_ready`); bounds are validated against the probed duration (50 ms tolerance), clips ≥ 100 ms, ≤ 40 clips (`400 invalid_request`). The copy render pre-creates the output recording (`source_kind='render'`, status `processing`, title "<base> (edited)", the base's folder and privacy) in the same transaction as the reservation and the job row — a refused reservation rolls everything back and records the paywall. The worker (`10` §3 `render`) renders; the client data layer is `client/src/lib/editorApi.mjs`.)*
 
 ## 12. Transcription & AI (all async; full job specs `10`, `15`)
 
@@ -202,6 +207,8 @@ client cannot opt into the rollout.
   toward the path production already runs.
 
 *(T-803: `/api/client-config` gained a fourth independent block `library: { path: 'v1'|'legacy', v1Enabled }` for the signed-in library pages (dashboard, folders, notifications) — `V1_LIBRARY` exactly `'true'` while `V1_UPLOAD_API` is on, the same PostgreSQL-mirror rule as the web editor (`account_not_migrated` under its own reason), KPI `library_decision`. It is never served on the public route.)*
+
+*(T-1201: a fifth block `editor: { path: 'v1'|'legacy', v1Enabled }` for the editor page (edit sessions, render jobs, silence removal, stitch) — `V1_EDITOR` exactly `'true'` while `V1_UPLOAD_API` is on, the same mirror rule (`account_not_migrated`), KPI `editor_decision`. Never on the public route. OFF = the legacy Cloudinary `/trim`, `/compose`, `/stitch` and `/remove-silences` handlers exactly as before.)*
 
 ### 14b. Public client configuration (T-802)
 

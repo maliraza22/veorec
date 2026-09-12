@@ -12,7 +12,7 @@ const { tsCol, createdAt, updatedAt, lazyRef } = require('./_types');
 const QUEUES = [
   'probe', 'transcode', 'thumbnail', 'hls', 'audio_extract', 'captions',
   'transcribe', 'translate', 'ai_title', 'ai_summary', 'ai_chapters',
-  'render', 'cleanup', 'usage_sync', 'subscription_sync', 'upload_expiry', 'email',
+  'render', 'silence_detect', 'cleanup', 'usage_sync', 'subscription_sync', 'upload_expiry', 'email',
 ];
 
 const processingJobs = pgTable('processing_jobs', {
@@ -42,7 +42,7 @@ const processingJobs = pgTable('processing_jobs', {
   index('processing_jobs_queue_status_idx').on(t.queue, t.status),
   // Outbox relay scan: rows committed but not yet handed to the queue.
   index('processing_jobs_outbox_idx').on(t.createdAt).where(sql`enqueued_at IS NULL AND status = 'queued'`),
-  check('processing_jobs_queue_chk', sql`${t.queue} IN ('probe','transcode','thumbnail','hls','audio_extract','captions','transcribe','translate','ai_title','ai_summary','ai_chapters','render','cleanup','usage_sync','subscription_sync','upload_expiry','email')`),
+  check('processing_jobs_queue_chk', sql`${t.queue} IN ('probe','transcode','thumbnail','hls','audio_extract','captions','transcribe','translate','ai_title','ai_summary','ai_chapters','render','silence_detect','cleanup','usage_sync','subscription_sync','upload_expiry','email')`),
   check('processing_jobs_status_chk', sql`${t.status} IN ('queued','active','completed','failed','cancelled')`),
   check('processing_jobs_attempts_chk', sql`${t.attempts} >= 0 AND ${t.maxAttempts} >= 1`),
 ]);

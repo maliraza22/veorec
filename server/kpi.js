@@ -108,6 +108,10 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
     libraryV1Selected: 0,
     libraryLegacySelected: 0,
     libraryAccountNotMigrated: 0,
+    // T-1201: the editor gate (edit sessions / renders / silence removal).
+    editorV1Selected: 0,
+    editorLegacySelected: 0,
+    editorAccountNotMigrated: 0,
     // T-305 deprecation signal: each use of the legacy memory-multer
     // POST /api/recordings/:id/replace. This number is what decides whether
     // Phase 14 may remove the route — zero over a full observation window.
@@ -258,6 +262,18 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
     }, `kpi: watch page ${decision.decision}`);
   }
 
+  /** T-1201: one line per authed client-config lookup for the editor gate. */
+  function editorDecision(req, decision) {
+    if (decision.path === 'v1') counters.editorV1Selected++;
+    else counters.editorLegacySelected++;
+    if (decision.decision === 'account_not_migrated') counters.editorAccountNotMigrated++;
+    logOf(req).info({
+      kpi: 'editor_decision',
+      editor_path: decision.path,
+      decision: decision.decision,
+    }, `kpi: editor ${decision.decision}`);
+  }
+
   /** T-803: one line per authed client-config lookup for the library gate. */
   function libraryDecision(req, decision) {
     if (decision.path === 'v1') counters.libraryV1Selected++;
@@ -377,6 +393,13 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
           legacySelected: counters.libraryLegacySelected,
           accountNotMigrated: counters.libraryAccountNotMigrated,
         },
+        // T-1201: the editor gate.
+        editor: {
+          enabled: process.env.V1_EDITOR === 'true' && process.env.V1_UPLOAD_API === 'true',
+          v1Selected: counters.editorV1Selected,
+          legacySelected: counters.editorLegacySelected,
+          accountNotMigrated: counters.editorAccountNotMigrated,
+        },
       },
       // T-305: deprecated routes still in use. Phase 14 removal is gated on
       // these staying at zero.
@@ -419,7 +442,7 @@ function createKpi(logger, { snapshotIntervalMs = SNAPSHOT_INTERVAL_MS } = {}) {
   }
 
   return {
-    uploadStarted, uploadFinished, rolloutDecision, webUploadDecision, watchDecision, libraryDecision, legacyReplaceUsed,
+    uploadStarted, uploadFinished, rolloutDecision, webUploadDecision, watchDecision, libraryDecision, editorDecision, legacyReplaceUsed,
     watchMiss, watchHit, requestError, snapshot,
     counters,                                  // mutated by the dual-write mirror
     _counters: counters,                       // test introspection only

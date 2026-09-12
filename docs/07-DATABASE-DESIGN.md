@@ -154,7 +154,7 @@ Overwrite mode never touches the source asset: it produces a new `render_output`
 | column | type |
 |---|---|
 | id text PK `job_` |
-| queue | text NOT NULL ('probe','transcode','thumbnail','hls','transcribe','translate','ai_title','ai_summary','ai_chapters','render','cleanup','usage_sync','subscription_sync') |
+| queue | text NOT NULL CHECK in ('probe','transcode','thumbnail','hls','audio_extract','captions','transcribe','translate','ai_title','ai_summary','ai_chapters','render','silence_detect','cleanup','usage_sync','subscription_sync','upload_expiry','email') — the twin of `worker/src/catalog.js` (asserted identical); `silence_detect` added by migration `0004_editing_jobs` (T-1204) |
 | recording_id | FK NULL CASCADE |
 | dedupe_key | text UNIQUE NOT NULL (e.g. `probe:rec_x`, `transcode:rec_x:mp4:1080`) |
 | payload | jsonb NOT NULL |

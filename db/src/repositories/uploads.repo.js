@@ -127,6 +127,15 @@ module.exports = function uploadsRepo(db) {
       return row || null;
     },
 
+    /** T-1202: the copy render's reservation (docs/16 §4.3 — the same mechanism as an upload). */
+    async findReservationByRenderJob(scope, renderJobId) {
+      const { userId } = requireScope(scope);
+      const [row] = await exec('storage_reservation', () => db.select().from(storageReservations)
+        .where(and(eq(storageReservations.userId, userId),
+          eq(storageReservations.renderJobId, renderJobId))).limit(1));
+      return row || null;
+    },
+
     /** Terminal transition: 'reconciled' | 'released' | 'expired'. */
     async settleReservation(scope, id, status, { reconciledBytes = null } = {}) {
       const { userId } = requireScope(scope);

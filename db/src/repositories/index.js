@@ -48,6 +48,7 @@ const jobsRepo = require('./jobs.repo');
 const billingRepos = require('./billing.repo');
 const auditRepo = require('./audit.repo');
 const notificationsRepo = require('./notifications.repo');
+const editingRepos = require('./editing.repo');
 
 /**
  * Build the repository set bound to one executor.
@@ -78,6 +79,7 @@ function createRepositories(db) {
     billingEvents: billing.billingEvents,
     audit: auditRepo(db),
     notifications: notificationsRepo(db),   // T-803: query-derived feed + read marker
+    ...editingRepos(db),                     // T-1201: editSessions, renderJobs
   };
 }
 

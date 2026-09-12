@@ -18,6 +18,7 @@ const { createSharingRouter } = require('./sharing.router');
 const { createEngagementRouter } = require('./engagement.router');
 const { createWatchContext } = require('./watch-context');
 const { createAnalyticsRouter } = require('./analytics.router');
+const { createEditingRouter } = require('./editing.router');
 const paywall = require('./paywall');
 const authz = require('./authz');
 const rateLimit = require('./rate-limit');
@@ -44,6 +45,8 @@ module.exports = {
   createEngagementRouter, createWatchContext,
   // T-1002 / T-1003: owner analytics from view_sessions + the unified paywall events.
   createAnalyticsRouter, ...paywall,
+  // T-1201: edit sessions, render enqueue, silence removal, stitch (the worker renders).
+  createEditingRouter,
   ...identity,
   ...errors,
 };
