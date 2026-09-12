@@ -381,7 +381,7 @@ app.get('/api/client-config/public', (req, res) => {
 // every current client uses.
 if (process.env.V1_UPLOAD_API === 'true') {
   try {
-    const { createUploadRouter, createRecordingsRouter, createMeRouter, createAdminJobsRouter, createAiRouter, createWatchRouter, createFoldersRouter, createNotificationsRouter, authz: v1authz, createQuota } = require('../api/src/index.js');
+    const { createUploadRouter, createRecordingsRouter, createMeRouter, createAdminJobsRouter, createAiRouter, createWatchRouter, createFoldersRouter, createNotificationsRouter, createSharingRouter, authz: v1authz, createQuota } = require('../api/src/index.js');
     const { repositories, withTransaction } = require('../db/src/index.js');
     const storagePkg = require('../storage/src/index.js');
     // T-306: the quota ledger. Limits come from the ONE plan catalog
@@ -454,6 +454,22 @@ if (process.env.V1_UPLOAD_API === 'true') {
     // client switches on the `library` block of /api/client-config (V1_LIBRARY).
     app.use('/api/v1', createFoldersRouter({ repositories, requireAuth, logger }));
     app.use('/api/v1', createNotificationsRouter({ repositories, requireAuth, logger }));
+    // T-901: managed share links + Slack share on v1 recordings (docs/08 §8,
+    // docs/12 §3). Pro gates come from the legacy permission checks (the
+    // entitlement source during the migration window); the watch URL uses the
+    // same CLIENT_URL the legacy Slack share uses.
+    app.use('/api/v1', createSharingRouter({
+      repositories, requireAuth, logger,
+      clientBase: process.env.CLIENT_URL || process.env.PUBLIC_URL || 'https://veorec.com',
+      entitlements: {
+        isFeatureEnabled: async (feature, ctx) => {
+          const u = users.findById((ctx.req && (ctx.req.legacyUserId || ctx.req.userId)) || null);
+          if (feature === 'passwordProtection') return permissions.canUsePasswordProtectedVideos(u).allowed;
+          if (feature === 'slackEnabled') return permissions.canUseSlack(u).allowed;
+          return false;
+        },
+      },
+    }));
     // T-801: the public watch read path (docs/08 §7, docs/12). Auth is
     // OPTIONAL: a legacy Bearer resolves to the viewer's PostgreSQL id (the
     // canonical mapping) or to anonymous; the privacy level decides. Media

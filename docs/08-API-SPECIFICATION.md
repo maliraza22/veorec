@@ -104,10 +104,10 @@ Error (every non-2xx):
 
 | Method & path | Auth | Request → Response |
 |---|---|---|
-| GET `/recordings/:id/share-links` | ⚿ owner | list |
-| POST `/recordings/:id/share-links` | ⚿ owner | `{label?,password?,expiresAt?,maxViews?}` → `{id, url}` (token shown once) |
-| DELETE `/share-links/:id` | ⚿ owner | revoke (sets revoked_at); idempotent |
-| POST `/recordings/:id/share/slack` | ⚿ owner, Pro `slackEnabled` | → `{ok}`; 400 `needsWebhook`; 502 slack errors (as today) |
+| GET `/recordings/:id/share-links` | ⚿ owner | list *(T-901 ✅: `{items:[{id,label,expiresAt,maxViews,viewCount,revokedAt,hasPassword,createdAt}], url}` — never the token or its hash)* |
+| POST `/recordings/:id/share-links` | ⚿ owner | `{label?,password?,expiresAt?,maxViews?}` → `{id, url}` (token shown once) *(T-901 ✅: `201 {…, token, url:'<CLIENT_URL>/watch/:id?s=<token>'}`; 128-bit base64url token, sha256 hash stored; label ≤ 80, `expiresAt` a future ISO timestamp, `maxViews` 1–1,000,000, `password` ≥ 4 chars and Pro-gated `passwordProtection` (`403 feature_locked` + `upgradeRequired`, never silently dropped))* |
+| DELETE `/share-links/:id` | ⚿ owner | revoke (sets revoked_at); idempotent *(T-901 ✅: `{ok, revoked, revokedAt}`; a repeat re-stamps; another owner's or an unknown id is `404 share_link_not_found`)* |
+| POST `/recordings/:id/share/slack` | ⚿ owner, Pro `slackEnabled` | → `{ok}`; 400 `needsWebhook`; 502 slack errors (as today) *(T-901 ✅: `403 feature_locked`; `400 needs_webhook` (+`meta.needsWebhook`) when the account has no `hooks.slack.com` webhook — a webhook on any other host is refused, never posted to; the message is the title and the watch URL only; `502 slack_rejected` on a non-2xx, `502 slack_unreachable` on a network failure)* |
 
 ## 9. Analytics & notifications
 

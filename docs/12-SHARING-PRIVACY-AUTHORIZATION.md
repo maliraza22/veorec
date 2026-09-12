@@ -37,7 +37,7 @@ Enforcement is centralized: `authorize(actor, action, resource)` in one module (
 - Default sharing stays the recording URL `/watch/:recId` gated by `privacy`.
 - Managed links add: per-link **password**, **expiry** (`expires_at`), **max views** (`max_views` vs `view_count`), **revocation** (`revoked_at`), labels ("sent to client X" — free-text).
 - URL: `/watch/:recId?s=<token>` (token: 128-bit random, base64url; **hash stored**, plaintext shown once at creation).
-- Resolution order on watch: valid share token satisfies privacy (even for `login`/`password`-level recordings if the link itself has no password); expired/revoked/over-max → `403 link_expired` regardless of recording privacy (a dead link never falls back to a more permissive default).
+- Resolution order on watch: valid share token satisfies privacy (even for `login`/`password`-level recordings if the link itself has no password); expired/revoked/over-max → `403 link_expired` regardless of recording privacy (a dead link never falls back to a more permissive default). *(T-901 ✅: the owner side — `api/src/sharing.router.js` creates and revokes links (`08` §8) and the watch Settings tab of a v1 recording manages them (`client/src/pages/watch/ShareLinks.jsx`: label, expiry, view cap, Pro password, revoke; the URL is shown once and copied from the panel). Resolution itself has been in `authz.resolveWatchAccess` since T-801, so the gate is exercised end-to-end here: a fresh link opens a login-only recording anonymously, the view count moves, a link password unlocks, the cap and revocation make the link `link_expired`.)*
 
 ## 4. Authorization flow
 

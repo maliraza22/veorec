@@ -15,6 +15,7 @@ import { createWatchClient, fetchWatchConfig, watchIsV1, stateFor } from '../lib
 import { useWatchMedia } from './watch/useWatchMedia';
 import { useStatusPolling } from './watch/useStatusPolling';
 import { ProcessingPanel, FailedPanel, NotFoundPanel, LoadingPanel, LoginGate, LinkExpiredPanel, ErrorPanel, PasswordGate, EmailGate, PlaybackErrorPanel } from './watch/Panels';
+import ShareLinks from './watch/ShareLinks';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // T-802 — WatchPage (docs/11 §1–§8).
@@ -997,6 +998,13 @@ export default function Watch() {
           <button className="btn-ghost" style={{ width: '100%' }} onClick={() => copy('embed', embedCode)}>
             {copied === 'embed' ? '✓ Copied!' : <><Code2 size={14} /> Copy embed code</>}
           </button>
+          {isV1 && (
+            <>
+              <div className={styles.audDivider} />
+              {/* T-901: managed share links (password / expiry / view cap / revoke) — v1 recordings only */}
+              <ShareLinks recordingId={id} canPassword={isPaid} onUpgrade={(feature, reason) => toast.info(reason || 'Password-protected links are a Pro feature.')} />
+            </>
+          )}
         </>
       ) : (
         <>

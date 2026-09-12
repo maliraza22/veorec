@@ -14,6 +14,7 @@ const { createAiRouter } = require('./ai.router');
 const { createWatchRouter } = require('./watch.router');
 const { createFoldersRouter } = require('./folders.router');
 const { createNotificationsRouter } = require('./notifications.router');
+const { createSharingRouter } = require('./sharing.router');
 const authz = require('./authz');
 const rateLimit = require('./rate-limit');
 const quota = require('./quota');
@@ -33,6 +34,8 @@ module.exports = {
   createWatchRouter, authz, ...rateLimit,
   // T-803: the signed-in library — folders CRUD and the query-derived notifications feed.
   createFoldersRouter, createNotificationsRouter,
+  // T-901: managed share links + Slack share (gate resolution lives in authz / the watch router).
+  createSharingRouter,
   ...identity,
   ...errors,
 };
