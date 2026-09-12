@@ -79,7 +79,7 @@ Indexes: `(user_id, created_at desc) where deleted_at is null`, `(user_id, folde
 |---|---|---|
 | id | text PK `ast_` | |
 | recording_id | FK→recordings ON DELETE CASCADE | |
-| kind | text CHECK in ('source','mp4','hls','poster','thumbnail','preview_gif','audio','captions_vtt','render_output') NOT NULL | |
+| kind | text CHECK in ('source','mp4','hls','poster','thumbnail','preview_gif','audio','captions_vtt','render_output') NOT NULL — *T-703: `preview_gif` holds the animated hover preview whatever its container (`container='webp'` today, key `…/preview.webp`); `poster` has `variant='play'` for the play-overlay variant* | |
 | storage_key | text NOT NULL UNIQUE | R2 key |
 | status | text CHECK in ('pending','ready','failed') NOT NULL | |
 | size_bytes | bigint NULL, width int, height int, duration numeric(10,3) | probed facts |

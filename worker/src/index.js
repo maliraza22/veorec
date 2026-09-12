@@ -22,6 +22,8 @@ const mediaExec = require('./media/exec');
 const probe = require('./media/probe');
 const transcode = require('./media/transcode');
 const ready = require('./media/ready');
+const thumbnail = require('./media/thumbnail');
+const playIcon = require('./media/play-icon');
 const mediaProcessors = require('./processors/media');
 const transcription = require('./stt/transcription');
 const { createAi } = require('./stt/ai');
@@ -54,4 +56,7 @@ module.exports = {
   // T-702: transcode + maybe_mark_ready.
   createTranscoder: transcode.createTranscoder, buildTranscodeArgs: transcode.buildArgs, parseProgress: transcode.parseProgress, hasFaststart: transcode.hasFaststart,
   maybeMarkReady: ready.maybeMarkReady,
+  // T-703: posters / thumbnails / previews.
+  createThumbnailer: thumbnail.createThumbnailer, basePosterTime: thumbnail.basePosterTime, posterCandidates: thumbnail.posterCandidates,
+  previewClipStarts: thumbnail.previewClipStarts, renderPlayIconPng: playIcon.renderPlayIconPng,
 };

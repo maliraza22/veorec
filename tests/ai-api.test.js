@@ -176,6 +176,21 @@ const silent = { info() {}, warn() {}, error() {}, debug() {} };
     ok(st.body.jobs.some((j) => j.queue === 'transcribe' && j.status === 'completed') && st.body.jobs.some((j) => j.queue === 'ai_title' && j.status === 'queued') && st.body.assets.some((a) => a.kind === 'source' && a.status === 'ready'), 'jobs and assets are listed (no storage keys, no payloads)');
     ok(st.body.jobs.every((j) => j.payload === undefined) && JSON.stringify(st.body).indexOf('sources/') === -1, 'nothing internal leaks');
 
+    console.log('\nG2. POST /reprocess (T-703)');
+    const rp = await api('POST', `/recordings/${A}/reprocess`, { as: legacy.alice });
+    const probeRow = await job(`probe:${A}`);
+    ok(rp.status === 202 && rp.body.ok === true && rp.body.jobId === probeRow.id && probeRow.status === 'queued' && probeRow.payload.trigger === 'reprocess' && probeRow.maxAttempts === 5, 'reprocess → 202 with a queued probe job (the probe re-derives everything)');
+    ok((await api('POST', `/recordings/${A}/reprocess`, { as: legacy.alice })).body.reused === true, 'a queued reprocess is reused, not duplicated');
+    await repos.jobs.markActiveSystem(probeRow.id, REASON); await repos.jobs.markFailedSystem(probeRow.id, 'probe_invalid: corrupt', REASON, { terminal: true });
+    await repos.recordings.updateSystem(A, { status: 'failed', failureCode: 'probe_invalid' }, REASON);
+    const rp2 = await api('POST', `/recordings/${A}/reprocess`, { as: legacy.alice });
+    const probeRow2 = await job(`probe:${A}`);
+    ok(rp2.status === 202 && probeRow2.id === probeRow.id && probeRow2.status === 'queued' && probeRow2.attempts === 0 && probeRow2.enqueuedAt === null, 'a failed recording can be reprocessed: the same probe row is requeued with attempts reset');
+    await repos.recordings.updateSystem(A, { status: 'uploaded', failureCode: null }, REASON);
+    ok((await api('POST', `/recordings/${R}/reprocess`, { as: legacy.alice })).body.error.code === 'not_reprocessable', 'a recording still being recorded cannot be reprocessed');
+    ok((await api('POST', `/recordings/${NS}/reprocess`, { as: legacy.alice })).body.error.code === 'not_reprocessable', 'no source media → 409');
+    ok((await api('POST', `/recordings/${A}/reprocess`, { as: legacy.bob })).status === 404, 'reprocess is owner-only (404 for others)');
+
     console.log('\nH. Auto-processing chain after a v1 upload (rows only)');
     let storageUp = false;
     try { storageUp = (await fetch(`${MINIO}/minio/health/live`, { signal: AbortSignal.timeout(2000) })).ok; } catch {}

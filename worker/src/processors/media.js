@@ -247,6 +247,97 @@ function registerMediaProcessors(registry) {
     },
   });
 
+  // ── media.thumbnail (T-703, docs/09 §4) ──────────────────────────────────
+  const TH_REASON = 'T-703 media worker: poster / thumbnail / preview + maybe_mark_ready';
+  const IMAGE_ROWS = [
+    { key: 'poster', kind: 'poster', variant: null, imageKind: 'poster', contentType: 'image/jpeg', container: 'jpg' },
+    { key: 'posterPlay', kind: 'poster', variant: 'play', imageKind: 'poster', contentType: 'image/jpeg', container: 'jpg' },
+    { key: 'thumb', kind: 'thumbnail', variant: null, imageKind: 'thumb', contentType: 'image/jpeg', container: 'jpg' },
+    { key: 'preview', kind: 'preview_gif', variant: null, imageKind: 'preview_webp', contentType: 'image/webp', container: 'webp' },
+  ];
+  registry.register('thumbnail', async ({ payload, job, signal, logger, deps, repositories }) => {
+    const repos = repositories();
+    const { storage, withTransaction, thumbnailer, keys } = deps;
+    if (!thumbnailer) throw new TransientError('thumbnailer_unavailable', 'No thumbnailer (ffmpeg) configured on this worker.');
+    if (!storage || !keys) throw new TransientError('storage_unavailable', 'No storage provider / key builder configured on this worker.');
+    const recordingId = job.recordingId || (payload && payload.recordingId);
+    if (!recordingId) throw new TerminalError('invalid_payload', 'thumbnail needs a recordingId');
+    const recording = await repos.recordings.getSystem(recordingId, TH_REASON);
+    if (!recording || recording.deletedAt) throw new TerminalError('recording_gone', 'The recording no longer exists.');
+    if (NOT_PROCESSABLE.has(recording.status)) throw new TerminalError('recording_not_processable', `The recording is ${recording.status}.`);
+    const assets = await repos.assets.listByRecordingSystem(recordingId, TH_REASON);
+    const source = assets.find((a) => a.kind === 'source' && a.status === 'ready');
+    if (!source) throw new TerminalError('no_source', 'The recording has no ready source asset.');
+    if (recording.duration == null || !source.codecVideo) throw new TerminalError('probe_required', 'The source has not been probed yet (facts missing).');
+
+    // One row per PRODUCED image (find-or-create, asset-id-scoped key); a
+    // custom uploaded thumbnail (variant='custom') is a separate row and is
+    // never touched here. A clip under 10 s simply gets no preview row.
+    const rows = {};
+    const rowFor = async (spec) => {
+      let row = assets.find((a) => a.kind === spec.kind && (a.variant || null) === spec.variant);
+      if (!row) {
+        const id = newId('asset');
+        row = await repos.assets.createSystem({ id, recordingId, kind: spec.kind, variant: spec.variant, storageKey: keys.image(recordingId, id, spec.imageKind), status: 'pending', immutable: false, countsTowardQuota: false, container: spec.container, createdByJobId: job.id }, TH_REASON);
+      }
+      rows[spec.key] = row;
+      return row;
+    };
+
+    const dir = scratchDir(job.id);
+    const inPath = path.join(dir, `source${path.extname(source.storageKey) || ''}`);
+    let out;
+    const uploaded = {};
+    try {
+      let head;
+      try { head = await storage.headObject(source.storageKey); }
+      catch (e) { if (e && e.code === 'object_not_found') throw new TerminalError('source_missing', 'The source object is missing from storage.'); throw new TransientError('storage_unavailable', `head failed: ${e.message}`); }
+      if (!scratchHasRoom(dir, Number(head.contentLength || 0))) throw new TransientError('scratch_full', 'not enough scratch space (need 2× source size)');
+      await download(storage, source.storageKey, inPath);
+      out = await thumbnailer.generateAll(inPath, dir, { durationSec: Number(recording.duration), signal });
+      for (const spec of IMAGE_ROWS) {
+        const img = out[spec.key];
+        if (!img) continue;                                     // no preview under 10 s
+        await rowFor(spec);
+        try {
+          const size = fs.statSync(img.path).size;
+          const r = await storage.putObject(rows[spec.key].storageKey, fs.createReadStream(img.path), { contentType: spec.contentType, contentLength: size });
+          uploaded[spec.key] = { size, etag: r.etag, width: img.width, height: img.height };
+        } catch (e) { throw new TransientError('storage_unavailable', `upload failed: ${e.message}`); }
+      }
+    } catch (e) {
+      if (e && e.code === 'aborted') throw new TransientError('aborted', 'thumbnail aborted');
+      if (e && e.code === 'timeout') throw new TransientError('thumbnail_timeout', e.message);
+      if (e && e.code === 'ENOENT') throw new TransientError('ffmpeg_missing', `ffmpeg not found (${e.message})`);
+      if (e && e.code === 'tool_failed') throw new TransientError('ffmpeg_failed', e.message, { stderrTail: e.stderrTail });
+      if (e && e.code === 'output_invalid') throw new TransientError('output_invalid', e.message);
+      throw e;
+    } finally {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* scratch */ }
+    }
+
+    const ready = await withTransaction(async (tx) => {
+      for (const spec of IMAGE_ROWS) {
+        const up = uploaded[spec.key];
+        if (up) await tx.assets.updateSystem(rows[spec.key].id, { status: 'ready', sizeBytes: up.size, width: up.width || null, height: up.height || null, container: spec.container, checksum: up.etag || null, createdByJobId: job.id }, TH_REASON);
+      }
+      return maybeMarkReady({ tx, recordingId, logger });
+    });
+    const produced = IMAGE_ROWS.filter((s) => uploaded[s.key]).map((s) => ({ kind: s.kind, variant: s.variant, id: rows[s.key].id }));
+    logger.info({ recording_id: recordingId, poster_t: out.time.t, poster_luma: out.time.luma, dark: out.time.dark, preview: !!out.preview, promoted: ready.promoted, ready_reason: ready.reason }, 'thumbnail: images published');
+    return { time: out.time, assets: produced, preview: !!out.preview, ready };
+  }, {
+    // Attempts exhausted: the poster is a placeholder (docs/09 §4) — promote
+    // if the MP4 is already there, otherwise transcode will promote later.
+    async onSettled({ status, job, repositories, deps, logger }) {
+      if (status !== 'failed' || !deps || !deps.withTransaction) return;
+      const recordingId = job.recordingId || (job.payload && job.payload.recordingId);
+      if (!recordingId) return;
+      const ready = await deps.withTransaction((tx) => maybeMarkReady({ tx, recordingId, logger }));
+      if (logger) logger.warn({ recording_id: recordingId, job_id: job.id, promoted: ready.promoted, reason: ready.reason }, 'thumbnail: attempts exhausted — placeholder poster path');
+    },
+  });
+
   return registry;
 }
 

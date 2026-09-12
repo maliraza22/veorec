@@ -160,6 +160,27 @@ function createAiRouter({ repositories, withTransaction, requireAuth, entitlemen
   aiTrigger('/recordings/:id/summary', 'ai_summary', 'aiDocsEnabled');
   aiTrigger('/recordings/:id/chapters', 'ai_chapters', 'aiDocsEnabled');
 
+  // ── POST /recordings/:id/reprocess (docs/08 §5, T-703) ─────────────────
+  // Re-runs the media pipeline from the probe: the probe re-establishes the
+  // facts, re-applies the entitlement (an upgrade rescues a rejected_limit
+  // recording) and requeues the derived jobs — dedupe keys prevent doubles.
+  const REPROCESSABLE = new Set(['uploaded', 'processing', 'ready', 'failed', 'rejected_limit']);
+  router.post('/recordings/:id/reprocess', asyncRoute(async (req, res) => {
+    const scope = scopeOf(req);
+    const repos = repositories();
+    const recording = await mustGet(repos, scope, req.params.id);
+    if (!REPROCESSABLE.has(recording.status)) throw conflict('not_reprocessable', `A recording can be reprocessed once its media has landed (status is ${recording.status}).`);
+    const assets = await repos.assets.listForRecording(scope, recording.id);
+    if (!assets.some((a) => a.kind === 'source')) throw conflict('not_reprocessable', 'The recording has no source media.');
+    const out = await withTransaction((tx) => enqueueOrRequeue(tx, {
+      queue: 'probe', dedupeKey: `probe:${recording.id}`, recordingId: recording.id,
+      payload: { recordingId: recording.id, trigger: 'reprocess' }, maxAttempts: 5,
+    }));
+    logger.info({ recording_id: recording.id, job_id: out.job.id, reused: out.reused, status: recording.status }, 'T-703: reprocess requested');
+    res.set('Cache-Control', 'no-store');
+    return res.status(202).json({ ok: true, jobId: out.job.id, status: out.reused ? out.job.status : 'queued', reused: out.reused });
+  }));
+
   // ── GET /recordings/:id/status (docs/08 §5) ────────────────────────────
   router.get('/recordings/:id/status', asyncRoute(async (req, res) => {
     const scope = scopeOf(req);

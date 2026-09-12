@@ -47,6 +47,8 @@ For each: **input** (payload), **output**, **retry**, **timeout**, **idempotency
 ### `media.thumbnail`
 - In: `{recordingId}`; dedupe `thumb:{recordingId}`. Out: poster/thumb/preview assets. Retry 3× / 3m. Fail: non-fatal — a placeholder poster is served; job flagged for triage (does NOT block `ready` if the MP4 is done and poster generation failed 3× → promote with `poster:'placeholder'`; pragmatism over purity, logged loudly).
 
+> **As implemented (T-703):** `09` §4.1 — non-black frame selection, poster + play-overlay + thumbnail + WebP preview as asset-id-scoped rows, promotion via `maybe_mark_ready` in the publishing transaction, and the placeholder promotion from the post-settlement hook when attempts are exhausted.
+
 ### `media.hls`
 - In: `{recordingId}`; conditional (>5min or >1080p); dedupe `hls:{recordingId}`. Retry 3× / long timeout. Fail: non-fatal (MP4 remains the playback path).
 

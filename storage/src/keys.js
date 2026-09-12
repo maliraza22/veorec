@@ -167,7 +167,9 @@ const keys = {
   image(recordingId, assetId, kind) {
     assertId(recordingId, 'recordingId');
     assertId(assetId, 'assetId');
-    const allowed = { poster: 'poster.jpg', thumb: 'thumb.jpg', preview: 'preview.gif' };
+    // T-703: the hover preview is an animated WebP (docs/09 §4); `preview`
+    // (gif) stays for compatibility with anything already keyed that way.
+    const allowed = { poster: 'poster.jpg', thumb: 'thumb.jpg', preview: 'preview.gif', preview_webp: 'preview.webp' };
     const file = allowed[kind];
     if (!file) {
       throw new InvalidRequestError(`invalid image kind (allowed: ${Object.keys(allowed).join(', ')})`);
