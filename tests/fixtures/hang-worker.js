@@ -19,7 +19,8 @@ const DB = require(path.join(__dirname, '..', '..', 'db', 'src', 'index.js'));
     stalledIntervalMs: config.stalledIntervalMs, lockDurationMs: config.lockDurationMs,
   });
   const registry = W.createRegistry();
-  registry.register('probe', async ({ job }) => {
+  // HANG_TYPE selects the job type (probe by default; transcribe for T-603).
+  registry.register(process.env.HANG_TYPE || 'probe', async ({ job }) => {
     process.stdout.write(`STARTED ${job.id} attempt=${job.attempts}\n`);
     await new Promise(() => {});           // hang forever — the lock keeps renewing while alive
   });

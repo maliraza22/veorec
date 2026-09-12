@@ -17,7 +17,11 @@ const { createRegistry } = require('./registry');
 const { createJobRunner } = require('./run-job');
 const { createOutboxRelay } = require('./outbox');
 const { createWorkerApp, createChildRegistry } = require('./app');
-const { createDefaultRegistry, registerMaintenanceProcessors } = require('./processors');
+const { createDefaultRegistry, registerMaintenanceProcessors, registerSttProcessors } = require('./processors');
+const transcription = require('./stt/transcription');
+const { createAi } = require('./stt/ai');
+const { createRateGate } = require('./stt/rate-gate');
+const sttProcessors = require('./processors/stt');
 const { createScheduler, DEFAULT_SCHEDULES, bucketKey, isoWeek, HOUR, DAY, WEEK } = require('./scheduler');
 const { createPlanResolver } = require('./plan-limits');
 
@@ -32,4 +36,10 @@ module.exports = {
   createWorkerApp, createChildRegistry,
   // T-602: repeatable maintenance schedules + plan limits for verification.
   registerMaintenanceProcessors, createScheduler, DEFAULT_SCHEDULES, bucketKey, isoWeek, HOUR, DAY, WEEK, createPlanResolver,
+  // T-603: transcription/AI in the worker.
+  registerSttProcessors, createAi, createRateGate,
+  createTranscriber: transcription.createTranscriber, sttConfigFromEnv: transcription.configFromEnv,
+  mapGroqJson: transcription.mapGroqJson, buildSpeechChunks: transcription.buildSpeechChunks, capChunkCount: transcription.capChunkCount,
+  parseSilences: transcription.parseSilences, generateTitle: transcription.generateTitle, WHISPER_NAME_TO_CODE: transcription.WHISPER_NAME_TO_CODE,
+  settleAiStatus: sttProcessors.settleAiStatus, isDefaultTitle: sttProcessors.isDefaultTitle, DEFAULT_TITLES: sttProcessors.DEFAULT_TITLES,
 };

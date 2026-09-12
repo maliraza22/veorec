@@ -10,6 +10,7 @@ const { createUploadRouter, defaultEntitlements } = require('./uploads.router');
 const { createRecordingsRouter, defaultEntitlements: defaultRecordingEntitlements } = require('./recordings.router');
 const { createMeRouter } = require('./me.router');
 const { createAdminJobsRouter } = require('./admin-jobs.router');
+const { createAiRouter } = require('./ai.router');
 const quota = require('./quota');
 const errors = require('./errors');
 const identity = require('./identity');
@@ -21,6 +22,8 @@ module.exports = {
   createMeRouter, ...quota,
   // T-601: processing-job triage (the failed rows are the dead-letter queue).
   createAdminJobsRouter,
+  // T-603: async transcription/AI triggers + /recordings/:id/status.
+  createAiRouter,
   ...identity,
   ...errors,
 };

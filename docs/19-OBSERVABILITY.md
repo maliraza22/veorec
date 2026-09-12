@@ -34,7 +34,7 @@ Rule: any log line about a recording/upload/job includes its id as a structured 
 **Dual-write (T-105, migration window only)**: `dualWriteAttempt/Success/Failure/Retryable` counters in the KPI snapshot as `dualWrite{attempts, successRatePct, failures, retryableFailures, reconciliationPending}`. Alert if `successRatePct` drops below 95% or `reconciliationPending` grows steadily — the response to either is `PG_DUAL_WRITE=false` (legacy is unaffected) followed by a reconciling import.
 **Pipeline**: `jobs_enqueued/completed/failed_total{queue}`, `job_duration_seconds{queue}` (histogram), `job_attempts` on completion, `queue_depth{queue}` (gauge), `recordings_ready_total`, `time_to_ready_seconds` (upload-complete → ready; the product's core latency).
 **Playback**: `media_url_minted_total{privacy}`, watch API latency; client beacons for `player_error_total{code}` (sampled).
-**STT/AI**: `groq_requests_total{kind,status}`, `stt_job_duration_seconds`, fallback counter.
+**STT/AI**: `groq_requests_total{kind,status}`, `stt_job_duration_seconds`, fallback counter. *(T-603: per-run counts live on the job row — `processing_jobs.result.stats = {groqCalls, groq429, groqErrors, chunkSkips, chunks, forced, fallback}` — and in the `transcript stored` log line; the queue's `job_duration_seconds` covers the job.)*
 **Billing**: `billing_events_total{type,status}`, `billing_events_failed_total`.
 **Infra**: DB pool saturation, Redis latency, worker scratch disk free, R2 error rate.
 

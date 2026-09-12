@@ -171,7 +171,7 @@ const DAY = 86400000;
       // ── C. the shipped registry ───────────────────────────────────────────
       console.log('\nC. Shipped registry');
       const reg = W.createDefaultRegistry();
-      ok(reg.types().sort().join() === 'cleanup,upload_expiry,usage_sync' && reg.queues().join() === 'maintenance', 'the default worker runs usage_sync, upload_expiry and cleanup on the maintenance queue');
+      ok(['cleanup', 'upload_expiry', 'usage_sync'].every((t) => reg.has(t) && reg.get(t).queue === 'maintenance') && reg.queues().includes('maintenance'), 'the default worker runs usage_sync, upload_expiry and cleanup on the maintenance queue');
       ok(!reg.has('subscription_sync') && Object.keys(W.JOB_TYPES).includes('subscription_sync'), 'subscription_sync is NOT registered (legacy JSON store, single writer) but stays in the catalog for its cutover');
       const calls = [];
       const fake = { usageSync: async () => { calls.push('usage'); return { synced: 1, errors: 0 }; }, storageVerification: async () => { calls.push('verify'); return { checked: 1, errors: 0, over: [] }; }, uploadExpiry: async (d) => { calls.push('expiry:' + !!d.storage); return { expired: 0 }; }, cleanup: async (d) => { calls.push('cleanup:' + d.orphanScan); return { purged: 0 }; } };
@@ -188,16 +188,18 @@ const DAY = 86400000;
       console.log('\nD. Scheduler: buckets → rows; BullMQ schedulers; end-to-end run visible in admin');
       await db.execute(sql`delete from processing_jobs where dedupe_key like ${'usage_sync:%'} or dedupe_key like ${'upload_expiry:%'} or dedupe_key like ${'cleanup:%'}`);
       const inline = W.createInlineJobQueue({ logger: silent });
-      let clock = Date.UTC(2026, 8, 12, 14, 10);
+      // A clock far from today: the real-BullMQ run below uses TODAY's bucket,
+      // and a settled row for that key would (correctly) block it.
+      let clock = Date.UTC(2031, 0, 5, 14, 10);
       const sched = W.createScheduler({ jobQueue: inline, repositories, logger: silent, now: () => clock });
       const t1 = await sched.tick({ scheduleId: 'usage_sync' });
       const t2 = await sched.tick({ scheduleId: 'usage_sync' });
-      ok(t1.created && !t2.created && t1.job.id === t2.job.id && t1.dedupeKey === 'usage_sync:2026-09-12', 'two ticks in the same day bucket produce ONE job row');
+      ok(t1.created && !t2.created && t1.job.id === t2.job.id && t1.dedupeKey === 'usage_sync:2031-01-05', 'two ticks in the same day bucket produce ONE job row');
       clock += DAY;
       const t3 = await sched.tick({ scheduleId: 'usage_sync' });
-      ok(t3.created && t3.dedupeKey === 'usage_sync:2026-09-13', 'the next day bucket produces a new row');
+      ok(t3.created && t3.dedupeKey === 'usage_sync:2031-01-06', 'the next day bucket produces a new row');
       const t4 = await sched.tick({ scheduleId: 'cleanup_orphans' });
-      ok(t4.created && t4.dedupeKey.startsWith('cleanup:orphans:2026-W') && t4.job.queue === 'cleanup' && t4.job.payload.orphanScan === true, 'the weekly orphan tick creates a cleanup job with orphanScan:true under its own key');
+      ok(t4.created && /^cleanup:orphans:2031-W\d\d$/.test(t4.dedupeKey) && t4.job.queue === 'cleanup' && t4.job.payload.orphanScan === true, 'the weekly orphan tick creates a cleanup job with orphanScan:true under its own key');
       ok((await sched.tick({ scheduleId: 'nope' })) === null, 'a tick for an unknown schedule is ignored');
       const all = await sched.tickAll();
       ok(all.length === 4 && all.every((r) => r && r.job), 'tickAll() ticks every schedule');

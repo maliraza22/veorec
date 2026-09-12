@@ -144,6 +144,13 @@ module.exports = function jobsRepo(db) {
       return row || null;
     },
 
+    /** Worker-side pipeline view (T-603 ai_status aggregate): every job of a recording. */
+    async listByRecordingSystem(recordingId, reason) {
+      requireSystemReason(reason);
+      return exec('processing_job', () => db.select().from(processingJobs)
+        .where(eq(processingJobs.recordingId, recordingId)).orderBy(asc(processingJobs.createdAt)));
+    },
+
     /** Admin listing by status (and optionally job type), newest first. */
     async listSystem({ status = null, queue = null, limit = 100 } = {}, reason) {
       requireSystemReason(reason);

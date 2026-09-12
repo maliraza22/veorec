@@ -144,7 +144,7 @@ Virtual trim stays synchronous via PATCH `/recordings/:id/meta` (no render neede
 | POST `/recordings/:id/summary` | ⚿ owner, `aiDocsEnabled` | `202 {jobId}` → writes description |
 | POST `/recordings/:id/chapters` | ⚿ owner, `aiDocsEnabled` | `202 {jobId}` → writes chapters |
 
-Clients poll `GET /recordings/:id/status` (or the transcript endpoint) — replacing today's long-held HTTP requests that die on restart.
+Clients poll `GET /recordings/:id/status` (or the transcript endpoint) — replacing today's long-held HTTP requests that die on restart. *(T-603 delivered this section on `/api/v1` — `api/src/ai.router.js`: every trigger answers `202 {jobId, status, reused}` and writes rows only; `translate` answers `200 {cached:true}` from the cache; `title/auto` needs `transcriptionEnabled`, `summary`/`chapters`/`translate` need `aiDocsEnabled` (403 `feature_locked` + `upgradeRequired`); 501 `transcription_unconfigured` without a provider; 409 `not_transcribable` before the media landed, 409 `transcript_required` for AI triggers without a done transcript; `GET /recordings/:id/transcript` → `{status, configured, language, text, segments:[{idx,start,end,text,language}], source, spokenLang, error, note}`; `GET /recordings/:id/status` → `{status, failureCode, aiStatus, jobs:[{id,queue,status,attempts,progress,error}], assets:[{kind,variant,status}], transcript:{status}}`. `POST /recordings/:id/reprocess` is Phase 7.)*
 
 ## 13. Plans, billing, usage
 

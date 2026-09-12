@@ -28,6 +28,14 @@ function createJobRunner({ repositories, registry, logger = silentLogger(), deps
 
   const inflight = new Map();   // job id → AbortController (shutdown aborts them)
 
+  // Post-settlement hook (registry opts.onSettled): runs after the row is
+  // marked completed/failed, never throws into the lifecycle.
+  async function settle(proc, ctx) {
+    if (!proc || !proc.onSettled) return;
+    try { await proc.onSettled(ctx); }
+    catch (e) { ctx.logger.warn({ err: { message: e && e.message } }, 'onSettled hook failed'); }
+  }
+
   async function runJob({ id, type, payload, attemptsMade }) {
     const repos = repositories();
     specFor(type);
@@ -78,6 +86,7 @@ function createJobRunner({ repositories, registry, logger = silentLogger(), deps
       inflight.delete(id);
       await repos.jobs.markCompletedSystem(id, result === undefined ? null : result, REASON);
       jobLogger.info({ attempt: active.attempts, duration_ms: now() - started }, 'job completed');
+      await settle(proc, { status: 'completed', job: active, result, repositories, deps, logger: jobLogger });
       return result;
     } catch (err) {
       clearTimeout(timer);
@@ -87,6 +96,7 @@ function createJobRunner({ repositories, registry, logger = silentLogger(), deps
       const fields = { attempt: active.attempts, max_attempts: active.maxAttempts, duration_ms: now() - started, code: err && err.code, err: { message: err && err.message }, terminal };
       if (terminal) jobLogger.error(fields, 'job failed (terminal)');
       else jobLogger.warn(fields, 'job failed — will retry with backoff');
+      if (terminal) await settle(proc, { status: 'failed', job: active, error: err, repositories, deps, logger: jobLogger });
       if (terminal) { const e = new Error(err && err.message ? err.message : 'job failed'); e.unrecoverable = true; e.cause = err; throw e; }
       throw err;
     }

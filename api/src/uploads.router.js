@@ -83,6 +83,10 @@ function createUploadRouter(deps) {
     // as the legacy path. A no-op by default, so the router stays usable
     // without it and no parallel metrics store is created.
     telemetry = { uploadStarted() {}, uploadFinished() {} },
+    // T-603: optional auto-processing chain after a completed upload
+    // (docs/15 §6) — { enabled(), transcriptionEnabled(req), aiDocsEnabled(req) }.
+    // Absent → nothing is enqueued beyond the probe (byte-identical to T-301).
+    autoProcess = null,
     // T-306: the quota ledger (api/src/quota createQuota). When present, session
     // creation reserves quota atomically in the same transaction that inserts
     // the session, completion reconciles, and abort releases. When absent the
@@ -486,6 +490,25 @@ function createUploadRouter(deps) {
         queue: 'probe', dedupeKey: `probe:${session.recordingId}`,
         recordingId: session.recordingId, payload: { storageKey: session.storageKey },
       });
+      // T-603 (docs/15 §6): the auto-processing chain — transcribe → title
+      // (→ summary + chapters with AI docs) — as rows in the SAME transaction.
+      // Gated by config + entitlement + duration ≥ 3 s, exactly as the legacy
+      // autoProcessRecording was; the worker runs it, never this process.
+      if (autoProcess && autoProcess.enabled()) {
+        const dur = Number(req.body && req.body.clientDuration);
+        const longEnough = !(Number.isFinite(dur) && dur > 0 && dur < 3);
+        if (longEnough && await autoProcess.transcriptionEnabled(req)) {
+          const aiDocs = !!(await autoProcess.aiDocsEnabled(req));
+          const { created } = await tx.jobs.enqueue({
+            queue: 'transcribe', dedupeKey: `stt:${session.recordingId}`, recordingId: session.recordingId,
+            payload: { recordingId: session.recordingId, language: '', trigger: 'auto', aiDocs },
+          });
+          if (created) {
+            await tx.transcripts.upsertSystem(session.recordingId, { status: 'queued' }, 'T-603: auto-processing queued after upload');
+            await tx.recordings.updateSystem(session.recordingId, { aiStatus: 'queued' }, 'T-603: auto-processing queued after upload');
+          }
+        }
+      }
       return tx.uploads.getSession(scope, session.id);
     }).catch(async (err) => {
       // A quota verdict threw out of the transaction: nothing was committed.

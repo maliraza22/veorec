@@ -30,6 +30,10 @@ Ported verbatim from `transcription.js` with its tuning env vars:
 - Rate-limit budget is enforced by the queue's limiter group (`10` §3) so multiple workers can exist without exceeding Groq quotas; chunk pacing remains inside the job.
 - Restart-safe: a killed job re-runs from scratch (idempotent — transcript upsert keyed by recording).
 
+### 2.1 As implemented (T-603)
+
+`worker/src/stt/transcription.js` — `createTranscriber({ config, rateGate, fetchImpl, logger })`, config from env (`FFMPEG_BIN`, `FFPROBE_BIN`, `WHISPER_BIN` + `WHISPER_ARGS`, `WHISPER_MODEL_PATH`, `GROQ_API_KEY`, `GROQ_STT_MODEL`, `GROQ_BASE_URL`, the `STT_*` tuning values) and overridable per instance — no module globals, so the tests run the whole pipeline against a scriptable Groq mock and a fake `whisper-cli` with real ffmpeg on synthetic audio. The algorithm is the one above, verbatim: 16 kHz WAV → `silencedetect` → padded/merged/capped chunks → pass 1 per-chunk auto-detect → pass 2 forced dominant language → merge with absolute offsets and the hallucination filter → whole-file fallback. **Changed for the worker (all covered by `tests/stt.test.js`)**: a 429 honours `Retry-After` (bounded by `STT_MAX_RETRY_AFTER_MS`, `STT_CHUNK_RETRIES` per chunk) before the legacy "retry once then skip the chunk" rule; a persistent Groq failure falls back to whisper.cpp **within the same attempt** when a model is present, otherwise the job fails *transiently* and retries; every Groq call passes the shared rate gate (`10` §3); an `AbortSignal` stops the pipeline between steps and kills ffmpeg; the result carries `source` (`groq` | `whisper_cpp`) and per-run stats (calls, 429s, skips, forced chunks, fallback). `worker/src/stt/ai.js` is the LLM helper with the same prompts, the summary-first title and the extractive/heuristic fallbacks.
+
 ## 3. Language detection & VAD
 
 As above (per-chunk auto-detect is the language detection mechanism; there is deliberately no single up-front detection — that was the original mixed-language bug: one detect locks the whole file, `transcription.js:34-38`). Config via env: `STT_VAD_NOISE, STT_VAD_MIN_SIL, STT_CHUNK_MAX/MIN, STT_DOMINANT_SHARE, STT_MAX_CHUNKS, STT_CHUNK_GAP_MS` — all preserved.
@@ -53,7 +57,7 @@ LLM numbered-line protocol from `ai.js:126-138` (kept). New: results cached in `
 
 - `recordings.ai_status`: `none → queued → running → done|failed` — aggregate for the "AI is working" spinner.
 - `transcripts.status` separately (`08` §12 responses).
-- Manual triggers return `202 {jobId}`; UI polls. Failures show a retry affordance with the taxonomy message (`18` §8).
+- Manual triggers return `202 {jobId}`; UI polls. Failures show a retry affordance with the taxonomy message (`18` §8). *(T-603: `POST /api/v1/recordings/:id/transcribe` → 202 and `transcripts.status='queued'`; a repeat while queued/running reuses the job; a repeat after completion requeues the same logical job with attempts reset; `GET /recordings/:id/transcript` exposes `none | queued | running | done | failed` (+ `note:'no_speech'`, `error`, `source`, `spokenLang`); `GET /recordings/:id/status` projects jobs/assets/transcript/`aiStatus`. `ai_status` is settled by the worker after each job row is marked, so it is race-free across concurrent chain jobs. The LEGACY synchronous `/api/recordings/:id/transcribe` stays for legacy (Cloudinary/JSON) recordings until the Phase 8 read cutover.)*
 
 ## 8. Retries & failure isolation
 

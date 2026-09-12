@@ -348,7 +348,7 @@ app.get('/api/client-config', requireAuth, async (req, res) => {
 // every current client uses.
 if (process.env.V1_UPLOAD_API === 'true') {
   try {
-    const { createUploadRouter, createRecordingsRouter, createMeRouter, createAdminJobsRouter, createQuota } = require('../api/src/index.js');
+    const { createUploadRouter, createRecordingsRouter, createMeRouter, createAdminJobsRouter, createAiRouter, createQuota } = require('../api/src/index.js');
     const { repositories, withTransaction } = require('../db/src/index.js');
     const storagePkg = require('../storage/src/index.js');
     // T-306: the quota ledger. Limits come from the ONE plan catalog
@@ -376,6 +376,15 @@ if (process.env.V1_UPLOAD_API === 'true') {
         uploadStarted: (r, meta) => kpi.uploadStarted(r, { ...meta, path: 'v1', store: 'r2', recovery: r.get('X-VeoRec-Recovery') === '1' }),
         uploadFinished: (r, outcome, meta) => kpi.uploadFinished(r, outcome, { ...meta, path: 'v1', store: 'r2', recovery: r.get('X-VeoRec-Recovery') === '1' }),
       },
+      // T-603: the auto-processing chain after a v1 upload (docs/15 §6), gated
+      // like the legacy autoProcessRecording: AUTO_PROCESS_ON_UPLOAD, the
+      // user's transcription entitlement, duration ≥ 3 s. Rows only — the
+      // worker transcribes; nothing runs here.
+      autoProcess: {
+        enabled: () => process.env.AUTO_PROCESS_ON_UPLOAD !== 'false' && transcription.isConfigured(),
+        transcriptionEnabled: async (r) => permissions.canUseTranscription(users.findById(r.legacyUserId || r.userId)).allowed,
+        aiDocsEnabled: async (r) => permissions.canUseAiDocs(users.findById(r.legacyUserId || r.userId)).allowed,
+      },
     }));
     // T-306: the caller's own dual quota meters (docs/16 §4.5).
     app.use('/api/v1', createMeRouter({ repositories, requireAuth, quota, logger }));
@@ -390,6 +399,22 @@ if (process.env.V1_UPLOAD_API === 'true') {
     // T-602: the PostgreSQL maintenance jobs (usage_sync, upload_expiry,
     // cleanup) run in the worker as repeatable queue jobs — nothing v1 is
     // scheduled in this process any more (docs/10 §3).
+    // T-603: transcription/AI triggers answer 202 and write rows; the worker
+    // runs stt.transcribe and the ai.* chain. Feature gates come from the
+    // legacy permission checks (the entitlement source during the migration
+    // window); `configured` mirrors the legacy transcription.isConfigured().
+    app.use('/api/v1', createAiRouter({
+      repositories, withTransaction, requireAuth, logger,
+      configured: () => transcription.isConfigured(),
+      entitlements: {
+        isFeatureEnabled: async (feature, ctx) => {
+          const u = users.findById((ctx.req && (ctx.req.legacyUserId || ctx.req.userId)) || (ctx.scope && ctx.scope.userId));
+          if (feature === 'transcriptionEnabled') return permissions.canUseTranscription(u).allowed;
+          if (feature === 'aiDocsEnabled') return permissions.canUseAiDocs(u).allowed;
+          return false;
+        },
+      },
+    }));
     // T-302: recordings CRUD, served from PostgreSQL. Same flag, same
     // rollback: the legacy /api/recordings routes are untouched and remain what
     // every current client uses.

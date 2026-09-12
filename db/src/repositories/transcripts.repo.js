@@ -112,5 +112,13 @@ module.exports = function transcriptsRepo(db) {
           eq(transcriptTranslations.lang, lang))).limit(1));
       return row || null;
     },
+
+    /** DELETE /recordings/:id/transcribe (T-603): segments and translations cascade. Idempotent. */
+    async deleteForRecordingSystem(recordingId, reason) {
+      requireSystemReason(reason);
+      const rows = await exec('transcript', () => db.delete(transcripts)
+        .where(eq(transcripts.recordingId, recordingId)).returning({ id: transcripts.id }));
+      return rows.length;
+    },
   };
 };

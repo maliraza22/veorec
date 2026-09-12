@@ -12,13 +12,17 @@ function createRegistry() {
   /**
    * @param {string} type              a `processing_jobs.queue` value
    * @param {Function} handler         async ({ payload, job, signal, logger, deps, repositories }) → result
-   * @param {{timeoutMs?: number}} [opts]
+   * @param {{timeoutMs?: number, onSettled?: Function}} [opts]
+   *        onSettled({ status:'completed'|'failed', job, result, error, repositories, deps, logger })
+   *        runs AFTER the row is marked — the place for aggregates that must
+   *        not see the calling job as still active.
    */
   function register(type, handler, opts = {}) {
     const spec = specFor(type);
     if (typeof handler !== 'function') throw new Error(`register(${type}): handler must be a function`);
     if (processors.has(type)) throw new Error(`register(${type}): already registered`);
-    processors.set(type, { type, handler, timeoutMs: opts.timeoutMs || spec.timeoutMs, queue: spec.queue });
+    if (opts.onSettled !== undefined && typeof opts.onSettled !== 'function') throw new Error(`register(${type}): onSettled must be a function`);
+    processors.set(type, { type, handler, timeoutMs: opts.timeoutMs || spec.timeoutMs, queue: spec.queue, onSettled: opts.onSettled || null });
     return () => processors.delete(type);
   }
 
