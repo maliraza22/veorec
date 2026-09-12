@@ -316,7 +316,8 @@ function writeWav(file, pattern) {
         const relayQ = mkQueue();
         const relay = W.createOutboxRelay({ repositories, jobQueue: relayQ, logger: silent });
         const relayed = await relay.relayOnce();
-        ok(relayed.relayed === 1, 'the transcribe row was handed to the transport');
+        // Other suites may leave unstamped rows behind; what matters is THIS row reaching the transport.
+        ok(relayed.relayed >= 1 && !!(await rowOf(`stt:${F}`)).enqueuedAt, `the transcribe row was handed to the transport (relayed ${relayed.relayed})`);
         const child = spawn(process.execPath, [path.join(__dirname, 'fixtures', 'hang-worker.js')], {
           env: { ...process.env, APP_ENV: 'test', DATABASE_URL_TEST: env.databaseUrl, REDIS_URL, QUEUE_PREFIX: prefix, HANG_TYPE: 'transcribe', WORKER_STALLED_INTERVAL_MS: '500', WORKER_LOCK_DURATION_MS: '1000', WORKER_SCHEDULER: 'false', LOG_LEVEL: 'silent' },
           stdio: ['ignore', 'pipe', 'pipe'],
