@@ -12,6 +12,8 @@ const { createMeRouter } = require('./me.router');
 const { createAdminJobsRouter } = require('./admin-jobs.router');
 const { createAiRouter } = require('./ai.router');
 const { createWatchRouter } = require('./watch.router');
+const { createFoldersRouter } = require('./folders.router');
+const { createNotificationsRouter } = require('./notifications.router');
 const authz = require('./authz');
 const rateLimit = require('./rate-limit');
 const quota = require('./quota');
@@ -29,6 +31,8 @@ module.exports = {
   createAiRouter,
   // T-801: the public watch read path — payload, unlock, signed media, HLS playlist proxy, transcript, lead gate.
   createWatchRouter, authz, ...rateLimit,
+  // T-803: the signed-in library — folders CRUD and the query-derived notifications feed.
+  createFoldersRouter, createNotificationsRouter,
   ...identity,
   ...errors,
 };

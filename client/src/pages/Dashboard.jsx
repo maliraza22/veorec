@@ -11,6 +11,14 @@ import API from '../api';
 import { useAuth } from '../AuthContext';
 import AppShell from '../components/AppShell';
 import UpgradeModal from '../components/UpgradeModal';
+import { useToast } from '../components/Toast';
+import { useLibraryClient } from '../hooks/useLibraryClient';
+
+// T-803: the library reads (and its writes) go through the library data layer:
+// PostgreSQL via /api/v1 when the server says `library.path === 'v1'`, the
+// legacy routes otherwise. A v1 card never builds a Cloudinary URL — its
+// thumbnail/poster/preview are signed storage URLs minted by the API, and a
+// legacy row the backfill has not reached arrives with `legacyMedia`.
 
 const CLIENT_BASE = typeof window !== 'undefined' ? window.location.origin : '';
 
@@ -42,53 +50,53 @@ export default function Dashboard() {
   const [upgrade, setUpgrade] = useState(null);
   const [confirmState, setConfirmState] = useState(null);
 
+  const { client, ready } = useLibraryClient();
+  const toast = useToast();
+  const byId = (id) => recordings.find((x) => x.id === id);
+
   async function load() {
+    if (!client) return;
     try {
-      const [rRes, fRes] = await Promise.all([authFetch(`${API}/api/recordings`), authFetch(`${API}/api/folders`)]);
-      setRecordings(await rRes.json());
-      setFolders(await fRes.json());
-    } finally { setLoading(false); }
+      const [r, f] = await Promise.all([client.listRecordings(), client.listFolders()]);
+      setRecordings(r);
+      setFolders(f);
+    } catch (e) { toast.error(e.message || 'Could not load your library.'); }
+    finally { setLoading(false); }
   }
-  useEffect(() => { load(); /* eslint-disable-next-line */ }, []);
+  useEffect(() => { if (ready) load(); /* eslint-disable-next-line */ }, [ready, client]);
 
   function deleteRec(id) {
     setConfirmState({
       title: 'Delete recording?', message: 'This permanently removes the video and its link. This cannot be undone.',
       danger: true, confirmLabel: 'Delete',
-      onConfirm: async () => { await authFetch(`${API}/api/recordings/${id}`, { method: 'DELETE' }); setRecordings((r) => r.filter((x) => x.id !== id)); },
+      onConfirm: async () => { const r = await client.remove(byId(id)); if (r.ok) setRecordings((rs) => rs.filter((x) => x.id !== id)); else toast.error('Could not delete this video.'); },
     });
   }
   async function duplicateRec(id) {
+    const rec = byId(id);
+    if (rec && rec.source === 'v1') { toast.info('Duplicating is coming to migrated recordings soon.'); return; }
     const res = await authFetch(`${API}/api/recordings/${id}/duplicate`, { method: 'POST' });
     const d = await res.json().catch(() => ({}));
-    if (res.ok && d.id) load(); else alert(d.error || 'Could not duplicate this video.');
+    if (res.ok && d.id) load(); else toast.error(d.error || 'Could not duplicate this video.');
   }
   async function saveTitle(id) {
     const title = (editTitle || '').trim();
     if (!title) { setEditingId(null); return; }  // don't save empty titles
-    const res = await authFetch(`${API}/api/recordings/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title }) });
-    if (res.ok) {
-      const d = await res.json().catch(() => ({}));
-      setRecordings((r) => r.map((x) => (x.id === id ? { ...x, title: d.title || title } : x)));
-      setEditingId(null);
-    } else {
-      const d = await res.json().catch(() => ({}));
-      alert(d.error || 'Could not rename the video. Please try again.');
-    }
+    const r = await client.rename(byId(id), title);
+    if (r.error) { toast.error(r.error); return; }
+    setRecordings((rs) => rs.map((x) => (x.id === id ? { ...x, title: r.title } : x)));
+    setEditingId(null);
   }
   function copyLink(id) { navigator.clipboard.writeText(`${CLIENT_BASE}/watch/${id}`); setCopied(id); setTimeout(() => setCopied(null), 2000); }
-  async function moveToFolder(id, folderId) {
-    await authFetch(`${API}/api/recordings/${id}/meta`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ folder: folderId }) });
-    setRecordings((r) => r.map((x) => (x.id === id ? { ...x, folder: folderId } : x)));
+  async function patchRec(id, patch, local = patch) {
+    const r = await client.patchMeta(byId(id), patch);
+    if (r.error) { toast.error(r.error); return false; }
+    setRecordings((rs) => rs.map((x) => (x.id === id ? { ...x, ...local } : x)));
+    return true;
   }
-  async function setArchived(id, archived) {
-    await authFetch(`${API}/api/recordings/${id}/meta`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ archived }) });
-    setRecordings((r) => r.map((x) => (x.id === id ? { ...x, archived } : x)));
-  }
-  async function setAnimated(id, animatedThumbnail) {
-    await authFetch(`${API}/api/recordings/${id}/meta`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ animatedThumbnail }) });
-    setRecordings((r) => r.map((x) => (x.id === id ? { ...x, animatedThumbnail } : x)));
-  }
+  const moveToFolder = (id, folderId) => patchRec(id, { folder: folderId });
+  const setArchived = (id, archived) => patchRec(id, { archived });
+  const setAnimated = (id, animatedThumbnail) => patchRec(id, { animatedThumbnail });
 
   const archivedCount = recordings.filter((r) => r.archived).length;
   const filtered = recordings
@@ -168,7 +176,7 @@ export default function Dashboard() {
 
       {confirmState && <Confirm state={confirmState} onClose={() => setConfirmState(null)} />}
       {settingsRec && (
-        <ShareSettings rec={settingsRec} folders={folders} authFetch={authFetch}
+        <ShareSettings rec={settingsRec} folders={folders} client={client}
           onClose={() => setSettingsRec(null)}
           onUpgrade={(feature, reason) => { setSettingsRec(null); setUpgrade({ feature, reason }); }}
           onAnimated={setAnimated}
@@ -277,13 +285,26 @@ function Card({ r, view, folders, copied, editing, editTitle, onCopy, onShare, o
 
 function Thumb({ r, small }) {
   const [hover, setHover] = useState(false);
-  const src = r.cloudinary ? r.filename : `${API}/uploads/${r.filename}`;
+  // Legacy rows keep the legacy hover rule (the full file, muted, looping).
+  // A v1 row shows the pipeline's animated WebP preview when there is one —
+  // never the full video, never a Cloudinary URL.
+  const isV1 = r.source === 'v1';
+  const legacySrc = !isV1 && r.filename ? (r.cloudinary ? r.filename : `${API}/uploads/${r.filename}`) : null;
+  const showPreview = hover && !small && r.animatedThumbnail !== false;
   return (
-    <Link to={`/watch/${r.id}`} className={small ? styles.thumbSmall : styles.thumb} onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)}>
+    <Link to={`/watch/${r.id}`} className={small ? styles.thumbSmall : styles.thumb} onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)} data-source={r.source || 'legacy'}>
       {r.thumbnail ? <img src={r.thumbnail} className={styles.preview} alt={r.title} loading="lazy" /> : <div className={styles.preview} style={{ background: '#1a1a2e' }} />}
-      {hover && !small && (
-        <video className={styles.previewVid} src={src} muted autoPlay loop playsInline
+      {showPreview && isV1 && r.previewUrl && (
+        <img className={styles.previewVid} src={r.previewUrl} alt="" />
+      )}
+      {showPreview && !isV1 && legacySrc && (
+        <video className={styles.previewVid} src={legacySrc} muted autoPlay loop playsInline
           onLoadedMetadata={(e) => { const v = e.target; if (v.duration === Infinity || isNaN(v.duration)) { v.currentTime = 1e101; v.ontimeupdate = () => { v.ontimeupdate = null; v.currentTime = 0; v.play(); }; } }} />
+      )}
+      {isV1 && r.status && r.status !== 'ready' && (
+        <span className={styles.duration} style={{ left: 8, right: 'auto', background: r.status === 'failed' || r.status === 'rejected_limit' ? '#b91c1c' : '#5b5bf6' }} data-status={r.status}>
+          {r.status === 'failed' || r.status === 'rejected_limit' ? 'Failed' : 'Processing…'}
+        </span>
       )}
       <div className={styles.duration}>{fmtDur(r.duration)}</div>
       {r.privacy && r.privacy !== 'public' && <div className={styles.lock}>{r.privacy === 'password' ? <Lock size={12} /> : <UsersIcon size={12} />}</div>}
@@ -308,7 +329,7 @@ function Confirm({ state, onClose }) {
 }
 
 /* ── Share settings modal (unchanged behaviour) ───────────────────────────── */
-function ShareSettings({ rec, folders, authFetch, onClose, onSaved, onUpgrade, onAnimated }) {
+function ShareSettings({ rec, folders, client, onClose, onSaved, onUpgrade, onAnimated }) {
   const [title, setTitle] = useState(rec.title || '');
   const [animated, setAnimated] = useState(rec.animatedThumbnail !== false);
   function toggleAnimated() {
@@ -336,14 +357,15 @@ function ShareSettings({ rec, folders, authFetch, onClose, onSaved, onUpgrade, o
       trimStart: trimStart === '' ? null : Number(trimStart), trimEnd: trimEnd === '' ? null : Number(trimEnd),
     };
     if (privacy === 'password' && password) body.password = password;
-    const res = await authFetch(`${API}/api/recordings/${rec.id}/meta`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    // The write follows the recording's source (v1 → /api/v1, legacy → /api).
+    // v1 answers the nested error contract: a Pro gate is `feature_locked`.
+    const r = await client.patchMeta(rec, body);
     setSaving(false);
-    if (res.ok) {
-      const d = await res.json();
-      onSaved({ title: title.trim() || rec.title, privacy: d.privacy, description: d.description, cta: d.cta, folder: d.folder, trimStart: d.trimStart, trimEnd: d.trimEnd });
-    } else if (res.status === 403) {
-      const d = await res.json().catch(() => ({}));
-      if (d.upgradeRequired && onUpgrade) onUpgrade(d.feature || 'default', d.error);
+    if (r.meta) {
+      const d = r.meta;
+      onSaved({ title: title.trim() || rec.title, privacy: d.privacy, description: d.description, cta: d.cta, folder: d.folder ?? d.folder_id ?? null, trimStart: d.trimStart, trimEnd: d.trimEnd });
+    } else if (r.code === 'feature_locked' || /upgrade/i.test(r.error || '')) {
+      if (onUpgrade) onUpgrade('default', r.error);
     }
   }
 
@@ -395,6 +417,9 @@ function ShareSettings({ rec, folders, authFetch, onClose, onSaved, onUpgrade, o
 function Analytics({ rec, authFetch, onClose, onUpgrade }) {
   const [data, setData] = useState(null);
   useEffect(() => {
+    // The per-recording analytics endpoint is legacy-only until Phase 10; a
+    // v1 recording shows what its summary already carries.
+    if (rec.source === 'v1') { setData({ views: rec.views || 0, comments: [], reactions: [], viewers: [], v1: true }); return; }
     authFetch(`${API}/api/recordings/${rec.id}/analytics`)
       .then(async (r) => { if (r.status === 403) { const d = await r.json().catch(() => ({})); if (d.upgradeRequired && onUpgrade) onUpgrade(d.feature || 'analytics', d.error); return null; } return r.json(); })
       .then((d) => { if (d) setData(d); }).catch(() => setData({}));

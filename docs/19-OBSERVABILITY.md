@@ -135,6 +135,8 @@ numbers, which have their own acceptance criterion. `decision` is one of
 `web_legacy_disabled` (gate off — includes every rollback), `web_v1_enabled`, or
 `account_not_migrated`. No user identifier; there is no bucket to report.
 
+**`library_decision`** (T-803) — one line per authed `/client-config` lookup for the library gate: `library_path` and `decision` (`library_v1_enabled` | `library_legacy_disabled` | `account_not_migrated`); counters `libraryV1Selected` / `libraryLegacySelected` / `libraryAccountNotMigrated`, surfaced as `library` in the metrics report.
+
 **`watch_decision`** (T-802) — one line per `GET /api/client-config/public` lookup: `watch_path` (`v1`|`legacy`) and `decision` (`watch_v1_enabled` | `watch_legacy_disabled`); counters `watchV1Selected` / `watchLegacySelected`, surfaced as `watchPage` in the metrics report. No user identifier — the route is anonymous by design.
 
 **`upload_mode`** — added to `upload_started` / `upload_finished`: `single` (web, T-305),

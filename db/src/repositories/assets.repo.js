@@ -143,6 +143,23 @@ module.exports = function assetsRepo(db) {
       return new Set(rows.map((r) => r.storageKey));
     },
 
+    /**
+     * T-803 library list: the READY image assets (poster / thumbnail / hover
+     * preview) for a page of recordings in one query. The caller passes only
+     * ids its scoped list already proved are the owner's.
+     */
+    async listImagesForRecordingsSystem(recordingIds, reason) {
+      requireSystemReason(reason);
+      if (!Array.isArray(recordingIds) || recordingIds.length === 0) return [];
+      return exec('video_asset', () => db.select({
+        recordingId: videoAssets.recordingId, kind: videoAssets.kind, variant: videoAssets.variant, storageKey: videoAssets.storageKey,
+      }).from(videoAssets).where(and(
+        inArray(videoAssets.recordingId, recordingIds),
+        inArray(videoAssets.kind, ['poster', 'thumbnail', 'preview_gif']),
+        eq(videoAssets.status, 'ready'),
+      )));
+    },
+
     /** Playback resolution, after the caller has authorised the recording. */
     async findReadySystem(recordingId, kind, reason, { variant = null } = {}) {
       requireSystemReason(reason);

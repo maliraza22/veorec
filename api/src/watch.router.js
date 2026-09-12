@@ -25,6 +25,7 @@ const { errorHandler, badRequest, forbidden, notFound, ApiError } = require('./e
 const authz = require('./authz');
 const { createRateLimiter, ipOf } = require('./rate-limit');
 const { transcriptBody } = require('./ai.router');
+const { legacyPosterUrl: legacyPoster } = require('./legacy-media');   // T-803: the READ fallback for un-backfilled rows
 
 const asyncRoute = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 const REASON = 'T-801 watch: public read path (authorised by authz.resolveWatchAccess before every call)';
@@ -222,11 +223,28 @@ function createWatchRouter({ repositories, storage, keys, viewer, accessSecret, 
       const q = gated ? `?a=${encodeURIComponent(authz.signAccess(accessSecret, { rec: recording.id, grants: ['hls'], exp: Math.floor(now() / 1000) + ttl, sub: req.watchViewer ? req.watchViewer.id : null }, now))}` : '';
       hlsUrl = `${baseUrlOf(req)}/watch/${encodeURIComponent(recording.id)}/hls/master.m3u8${q}`;
     }
+    // T-803 (docs/23 Phase 7): a legacy recording the backfill has not reached
+    // has no v1 playable asset yet — its Cloudinary URL stays the READ fallback
+    // (no signature, no expiry; a plain read of the legacy media map, never a
+    // listing or a write). The moment an MP4/HLS asset lands, this branch is
+    // never taken again for that recording.
+    if (!mp4Url && !hlsUrl && recording.status === 'ready') {
+      const legacyUrl = (await repos.recordings.legacyMediaSystem([recording.id], REASON)).get(recording.id);
+      if (legacyUrl) {
+        return res.json({
+          status: recording.status,
+          mp4Url: legacyUrl, hlsUrl: null,
+          posterUrl: posterUrl || legacyPoster(legacyUrl), captionsUrl,
+          expiresAt: null, ttlSeconds: null, legacyMedia: true,
+          download: privileged || (recording.audience || {}).download !== false,
+        });
+      }
+    }
     return res.json({
       status: recording.status,
       mp4Url, hlsUrl, posterUrl, captionsUrl,
       expiresAt: new Date(now() + ttl * 1000).toISOString(),
-      ttlSeconds: ttl,
+      ttlSeconds: ttl, legacyMedia: false,
       download: privileged || (recording.audience || {}).download !== false,
     });
   }));

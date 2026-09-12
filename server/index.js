@@ -333,7 +333,29 @@ app.get('/api/client-config', requireAuth, async (req, res) => {
     web = { path: 'legacy', decision: rollout.WEB_DECISION.legacyDisabled };
   }
   kpi.webUploadDecision(req, web);
-  res.json(rollout.clientConfigBody(decision, web, rollout.decideWatch()));
+
+  // T-803: the LIBRARY pages' decision (dashboard / folders / notifications) —
+  // its own gate, the same mirror rule, never derived from the gates above.
+  let library;
+  try {
+    if (rollout.libraryEnabled()) {
+      let hasMirror = null;
+      try {
+        const { repositories } = require('../db/src/index.js');
+        const { idFor } = require('../db/src/legacy-ids.js');
+        hasMirror = !!(await repositories().users.findById(idFor('usr', req.userId)));
+      } catch (e) {
+        hasMirror = false;
+      }
+      library = rollout.decideLibrary({ hasPostgresMirror: hasMirror });
+    } else {
+      library = rollout.decideLibrary();
+    }
+  } catch (e) {
+    library = { path: 'legacy', decision: rollout.LIBRARY_DECISION.legacyDisabled };
+  }
+  kpi.libraryDecision(req, library);
+  res.json(rollout.clientConfigBody(decision, web, rollout.decideWatch(), library));
 });
 
 // T-802: the PUBLIC client configuration — what an ANONYMOUS viewer may know.
@@ -359,7 +381,7 @@ app.get('/api/client-config/public', (req, res) => {
 // every current client uses.
 if (process.env.V1_UPLOAD_API === 'true') {
   try {
-    const { createUploadRouter, createRecordingsRouter, createMeRouter, createAdminJobsRouter, createAiRouter, createWatchRouter, authz: v1authz, createQuota } = require('../api/src/index.js');
+    const { createUploadRouter, createRecordingsRouter, createMeRouter, createAdminJobsRouter, createAiRouter, createWatchRouter, createFoldersRouter, createNotificationsRouter, authz: v1authz, createQuota } = require('../api/src/index.js');
     const { repositories, withTransaction } = require('../db/src/index.js');
     const storagePkg = require('../storage/src/index.js');
     // T-306: the quota ledger. Limits come from the ONE plan catalog
@@ -426,6 +448,12 @@ if (process.env.V1_UPLOAD_API === 'true') {
         },
       },
     }));
+    // T-803: the signed-in library on PostgreSQL — folders CRUD and the
+    // query-derived notifications feed (docs/08 §9–§10, docs/13 §6). The
+    // legacy /api/folders and /api/notifications routes are untouched; the
+    // client switches on the `library` block of /api/client-config (V1_LIBRARY).
+    app.use('/api/v1', createFoldersRouter({ repositories, requireAuth, logger }));
+    app.use('/api/v1', createNotificationsRouter({ repositories, requireAuth, logger }));
     // T-801: the public watch read path (docs/08 §7, docs/12). Auth is
     // OPTIONAL: a legacy Bearer resolves to the viewer's PostgreSQL id (the
     // canonical mapping) or to anonymous; the privacy level decides. Media

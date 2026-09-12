@@ -42,7 +42,7 @@ Workspace-level rollups on `/analytics/overview` (totals per recording, 30-day t
 
 ## 6. Notifications feed
 
-Query-derived (no feed table): union of comments, reactions, view_sessions newer than `notification_reads.last_read_at`, on the owner's recordings, excluding events where `actor user_id = owner` (unverified anonymous events are included — they are genuine viewer activity). Ordered desc, limit 50. The current O(all-meta) scan (`index.js:875-918`) becomes three indexed queries.
+Query-derived (no feed table): union of comments, reactions, view_sessions newer than `notification_reads.last_read_at`, on the owner's recordings, excluding events where `actor user_id = owner` (unverified anonymous events are included — they are genuine viewer activity). Ordered desc, limit 50. The current O(all-meta) scan (`index.js:875-918`) becomes three indexed queries. *(T-803 ✅ `db/src/repositories/notifications.repo.js` — `feedForOwner` returns the newest 50 across the three sources (each query capped, merged in memory) so the bell can show recent read items too; `unread` is computed against the read marker in the router. An anonymous commenter who happens to share the owner's display name is correctly kept — exclusion is by user id only.)*
 
 ## 7. Privacy considerations
 

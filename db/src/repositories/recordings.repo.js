@@ -212,6 +212,42 @@ module.exports = function recordingsRepo(db) {
     },
 
     /** Cleanup job: soft-deleted rows past their retention window. */
+    /**
+     * T-803: where a legacy recording's bytes still live (docs/07 §13
+     * `legacy.media_map`), for the READ fallback while the backfill runs.
+     * @returns {Promise<Map<string, string>>} recordingId → legacy URL (only rows that have one)
+     */
+    async legacyMediaSystem(recordingIds, reason) {
+      requireSystemReason(reason);
+      const out = new Map();
+      if (!Array.isArray(recordingIds) || recordingIds.length === 0) return out;
+      const res = await exec('recording', () => db.execute(sql`
+        select recording_id, legacy_url from legacy.media_map
+        where recording_id in ${sql`(${sql.join(recordingIds.map((id) => sql`${id}`), sql`, `)})`} and legacy_url is not null`));
+      for (const row of res.rows || []) out.set(row.recording_id, row.legacy_url);
+      return out;
+    },
+
+    /**
+     * T-803: unique non-owner views and live comment counts for a page of
+     * recordings (docs/13 §3) — two grouped queries, never one per card.
+     * @returns {Promise<Map<string, {views: number, comments: number}>>}
+     */
+    async engagementCountsSystem(recordingIds, reason) {
+      requireSystemReason(reason);
+      const out = new Map();
+      if (!Array.isArray(recordingIds) || recordingIds.length === 0) return out;
+      const list = sql`(${sql.join(recordingIds.map((id) => sql`${id}`), sql`, `)})`;
+      const [views, comments] = await Promise.all([
+        exec('view_session', () => db.execute(sql`select recording_id, count(*)::int as n from view_sessions where recording_id in ${list} and is_owner = false group by recording_id`)),
+        exec('comment', () => db.execute(sql`select recording_id, count(*)::int as n from comments where recording_id in ${list} and deleted_at is null group by recording_id`)),
+      ]);
+      for (const id of recordingIds) out.set(id, { views: 0, comments: 0 });
+      for (const row of views.rows || []) out.get(row.recording_id).views = Number(row.n);
+      for (const row of comments.rows || []) out.get(row.recording_id).comments = Number(row.n);
+      return out;
+    },
+
     async listPurgeableSystem({ before, limit = 100 }, reason) {
       requireSystemReason(reason);
       return exec('recording', () => db.select().from(recordings)

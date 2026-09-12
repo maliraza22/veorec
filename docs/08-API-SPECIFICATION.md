@@ -56,7 +56,7 @@ Error (every non-2xx):
 | POST `/recordings/:id/duplicate` | ⚿ owner | → `{id,title}` | enqueues a copy job (server-side R2 copy of source + re-process); returns new recording with status 'processing' |
 | POST `/recordings/:id/thumbnail` | ⚿ owner, Pro | small image upload (≤5MB, the one multipart the API accepts) → `{ok}` | gate `customThumbnailEnabled` |
 
-`RecordingSummary`: `{id,title,status,duration,size_bytes,created_at,privacy,folder_id,thumbnailUrl,posterUrl,views,commentCount,archived,tags,ai_status}` — URLs are signed (`12` §5).
+`RecordingSummary`: `{id,title,status,duration,size_bytes,created_at,privacy,folder_id,thumbnailUrl,posterUrl,views,commentCount,archived,tags,ai_status}` — URLs are signed (`12` §5). *(T-803 ✅: also `previewUrl` (the animated WebP hover preview, null when `animatedThumbnail` is off), `legacyMedia`, and the share-settings fields `description, cta, trimStart, trimEnd, animatedThumbnail`. The list resolves them in three batched queries per page — ready image assets, `legacy.media_map`, unique non-owner views + live comment counts — plus one 24 h signature per image. A legacy row without image assets gets its Cloudinary poster (`so_0` + `.jpg`, the legacy rule) from the media map as a READ fallback (`23` Phase 7) and `legacyMedia:true`; nothing to show is `null`.)*
 
 ## 5. Upload (full detail in `06`)
 
@@ -115,12 +115,12 @@ Error (every non-2xx):
 |---|---|---|
 | GET `/recordings/:id/analytics` | ⚿ owner, Pro `analyticsEnabled` | `{views, uniqueViewers, viewers:[{name,email,at,maxProgress}], engagement:{avgViewThrough,completionRate,samples}, reactions, comments, leads}` — SQL aggregates over view_sessions |
 | GET `/analytics/overview` | ⚿, Pro | per-recording rollup for the analytics page |
-| GET `/notifications` | ⚿ | `{items:[Event], unread, lastReadAt}` — query over comments/reactions/view_sessions newer-than, excluding actor==owner **by user_id** (not display-name matching) |
-| POST `/notifications/read` | ⚿ | `{lastReadAt}` |
+| GET `/notifications` | ⚿ | `{items:[Event], unread, lastReadAt}` — query over comments/reactions/view_sessions newer-than, excluding actor==owner **by user_id** (not display-name matching) *(T-803 ✅: `Event = {type:'comment'|'reaction'|'view', name, videoId, videoTitle, text?, emoji?, at}` with `at`/`lastReadAt` in epoch ms — the bell's existing shape; three indexed queries (live recordings only, deleted comments and owner self-views excluded, signed-in viewers named from `users`), merged newest first, capped at 50; `unread` = events after the read marker)* |
+| POST `/notifications/read` | ⚿ | `{lastReadAt}` *(T-803 ✅: upserts `notification_reads`; monotonic — an older stamp never moves it back)* |
 
 ## 10. Folders
 
-CRUD as today: GET/POST `/folders`, PATCH/DELETE `/folders/:id` (⚿ owner; name 1–60; delete sets recordings.folder_id NULL). POST returns 409 on duplicate name.
+CRUD as today: GET/POST `/folders`, PATCH/DELETE `/folders/:id` (⚿ owner; name 1–60; delete sets recordings.folder_id NULL). POST returns 409 on duplicate name. *(T-803 ✅ `api/src/folders.router.js`: `GET → {items:[{id,name,created_at,updated_at}]}`, `POST → 201`, duplicate names (case-insensitive, per owner) `409 folder_exists`, a non-owner PATCH is `404 folder_not_found`, DELETE is idempotent `{ok, removed}` and never touches another owner's folder.)*
 
 ## 11. Editing (full spec `14`)
 
@@ -200,6 +200,8 @@ client cannot opt into the rollout.
 - Unauthenticated ⇒ `401`. Any server-side failure while deciding (database down,
   configuration unreadable) resolves to `legacy`, never to `v1`: the endpoint fails
   toward the path production already runs.
+
+*(T-803: `/api/client-config` gained a fourth independent block `library: { path: 'v1'|'legacy', v1Enabled }` for the signed-in library pages (dashboard, folders, notifications) — `V1_LIBRARY` exactly `'true'` while `V1_UPLOAD_API` is on, the same PostgreSQL-mirror rule as the web editor (`account_not_migrated` under its own reason), KPI `library_decision`. It is never served on the public route.)*
 
 ### 14b. Public client configuration (T-802)
 

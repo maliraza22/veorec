@@ -25,6 +25,7 @@ const crypto = require('crypto');
 const express = require('express');
 const { errorHandler, badRequest, forbidden, notFound } = require('./errors');
 const { createIdentityBridge, scopeOf } = require('./identity');
+const { legacyPosterUrl } = require('./legacy-media');   // T-803: the READ fallback for un-backfilled rows
 
 const MAX_TITLE = 200;
 const MAX_DESCRIPTION = 5000;
@@ -45,6 +46,9 @@ const GATED_FIELDS = {
 
 // Playback URLs are short-lived for private media (docs/12 §6).
 const SIGNED_URL_TTL_SECONDS = 600;
+// T-803: the batched, system-scoped reads behind the list page run only over
+// ids the scoped list query already proved are the caller's own.
+const LIST_MEDIA_REASON = 'T-803 library list: image assets, legacy media map and engagement counts for a page of OWNED recordings';
 
 const asyncRoute = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -150,8 +154,11 @@ function createRecordingsRouter(deps) {
       ? page.filter((r) => String(r.title || '').toLowerCase().includes(q))
       : page;
 
+    // T-803: thumbnails/posters/previews (signed) and engagement counts for the
+    // page, resolved in batch AFTER the scoped read returned only owned rows.
+    const media = await mediaForPage(repos, storage, filtered, LIST_MEDIA_REASON);
     return res.json({
-      items: filtered.map((r) => summary(r, null)),
+      items: filtered.map((r) => summary(r, media.get(r.id) || null)),
       nextCursor: hasMore ? page[page.length - 1].createdAt : null,
     });
   }));
@@ -423,8 +430,12 @@ async function buildMetaPatch(body, { entitlements, repos, scope, recording }) {
   return patch;
 }
 
-/** docs/08 §4 RecordingSummary. Never exposes a storage key or a password hash. */
-function summary(r) {
+/**
+ * docs/08 §4 RecordingSummary. Never exposes a storage key or a password hash.
+ * `media` (T-803) carries the signed image URLs and the engagement counts the
+ * list handler resolves in batch: {thumbnailUrl, posterUrl, previewUrl, legacyMedia, views, commentCount}.
+ */
+function summary(r, media = null) {
   return {
     id: r.id,
     title: r.title,
@@ -437,13 +448,65 @@ function summary(r) {
     archived: r.archived,
     tags: r.tags ?? [],
     ai_status: r.aiStatus ?? null,
-    // Populated once the thumbnail/poster assets and the watch payload land
-    // (T-802); null is the honest answer until then rather than a guessed URL.
-    thumbnailUrl: null,
-    posterUrl: null,
-    views: r.viewCount ?? 0,
-    commentCount: r.commentCount ?? 0,
+    // The library card's owner-editable bits (the share-settings modal edits
+    // them in place; a second request per card would be the old dual-fetch).
+    description: r.description ?? '',
+    cta: r.cta ?? null,
+    trimStart: numOrNull(r.trimStart),
+    trimEnd: numOrNull(r.trimEnd),
+    animatedThumbnail: r.animatedThumbnail !== false,
+    // Signed (24 h) storage URLs for the thumbnail / poster / hover preview
+    // when the pipeline produced them; a legacy recording the backfill has not
+    // reached yet falls back to its Cloudinary poster (a READ of the legacy
+    // media map — never a listing, never a write). null = nothing to show yet.
+    thumbnailUrl: media ? media.thumbnailUrl : null,
+    posterUrl: media ? media.posterUrl : null,
+    previewUrl: media ? media.previewUrl : null,
+    legacyMedia: media ? !!media.legacyMedia : false,
+    views: media ? media.views : (r.viewCount ?? 0),
+    commentCount: media ? media.commentCount : (r.commentCount ?? 0),
   };
+}
+
+const IMAGE_TTL_SECONDS = 24 * 60 * 60;   // docs/12 §5.1: posters/thumbnails for lists
+
+/**
+ * Resolve the per-recording media fields for a page of summaries in THREE
+ * batched queries (image assets, legacy media map, engagement counts) plus
+ * one signature per image — never a query per card.
+ */
+async function mediaForPage(repos, storage, rows, reason) {
+  const ids = rows.map((r) => r.id);
+  if (ids.length === 0) return new Map();
+  const [images, legacy, counts] = await Promise.all([
+    repos.assets.listImagesForRecordingsSystem(ids, reason),
+    repos.recordings.legacyMediaSystem(ids, reason),
+    repos.recordings.engagementCountsSystem(ids, reason),
+  ]);
+  const byRec = new Map();
+  for (const a of images) {
+    const m = byRec.get(a.recordingId) || {};
+    if (a.kind === 'poster' && (a.variant ?? null) === null) m.poster = a;
+    else if (a.kind === 'thumbnail') m.thumb = a;
+    else if (a.kind === 'preview_gif') m.preview = a;
+    byRec.set(a.recordingId, m);
+  }
+  const sign = (a) => (a && storage ? storage.getSignedDownloadUrl(a.storageKey, { expiresIn: IMAGE_TTL_SECONDS }).catch(() => null) : Promise.resolve(null));
+  const out = new Map();
+  await Promise.all(rows.map(async (r) => {
+    const m = byRec.get(r.id) || {};
+    const [posterUrl, thumbUrl, previewUrl] = await Promise.all([sign(m.poster), sign(m.thumb), sign(m.preview)]);
+    const legacyUrl = !posterUrl && !thumbUrl ? legacyPosterUrl(legacy.get(r.id)) : null;
+    const c = counts.get(r.id) || { views: 0, comments: 0 };
+    out.set(r.id, {
+      thumbnailUrl: thumbUrl || posterUrl || legacyUrl,
+      posterUrl: posterUrl || legacyUrl,
+      previewUrl: r.animatedThumbnail === false ? null : previewUrl,
+      legacyMedia: !!legacyUrl,
+      views: c.views, commentCount: c.comments,
+    });
+  }));
+  return out;
 }
 
 const metaBody = (r) => ({
@@ -485,6 +548,6 @@ function defaultEntitlements() {
 
 module.exports = {
   createRecordingsRouter, defaultEntitlements,
-  derivedRecordingId, normaliseTitle, buildMetaPatch, summary,
+  derivedRecordingId, normaliseTitle, buildMetaPatch, summary, mediaForPage,
   MAX_TITLE, MAX_PAGE, PRIVACY, SOURCE_KINDS,
 };

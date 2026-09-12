@@ -1,8 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Bell, MessageSquare, Eye, Smile, Loader2 } from 'lucide-react';
-import { useAuth } from '../AuthContext';
-import API from '../api';
+import { useLibraryClient } from '../hooks/useLibraryClient';
 import s from './NotificationsBell.module.css';
 
 function timeAgo(ts) {
@@ -24,8 +23,11 @@ const TYPE = {
   view:     { Icon: Eye,           verb: 'viewed',        color: '#10b981' },
 };
 
+// T-803: the feed comes from the library data layer — PostgreSQL (query-derived,
+// docs/13 §6) when the server says `library.path === 'v1'`, the legacy JSON
+// scan otherwise. The rendering is unchanged: the two APIs answer the same shape.
 export default function NotificationsBell() {
-  const { authFetch } = useAuth();
+  const { client, ready } = useLibraryClient();
   const navigate = useNavigate();
   const [open, setOpen] = useState(false);
   const [items, setItems] = useState([]);
@@ -34,21 +36,23 @@ export default function NotificationsBell() {
   const ref = useRef(null);
 
   async function load() {
+    if (!client) return;
     setLoading(true);
     try {
-      const r = await authFetch(`${API}/api/notifications`);
-      const d = await r.json();
-      if (r.ok) { setItems(d.items || []); setUnread(d.unread || 0); }
+      const d = await client.notifications();
+      if (d) { setItems(d.items); setUnread(d.unread); }
     } catch {}
     setLoading(false);
   }
 
   // Initial fetch + lightweight poll so the badge stays fresh.
   useEffect(() => {
+    if (!ready) return undefined;
     load();
     const t = setInterval(load, 60000);
     return () => clearInterval(t);
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ready, client]);
 
   useEffect(() => {
     function onDoc(e) { if (ref.current && !ref.current.contains(e.target)) setOpen(false); }
@@ -61,14 +65,12 @@ export default function NotificationsBell() {
     setOpen(next);
     if (next) {
       await load();
-      if (unread > 0) {
-        try { await authFetch(`${API}/api/notifications/read`, { method: 'POST' }); } catch {}
+      if (unread > 0 && client) {
+        try { await client.markNotificationsRead(); } catch {}
         setUnread(0);
       }
     }
   }
-
-  const lastReadCutoff = items.length && unread ? items[unread - 1]?.at : 0;
 
   return (
     <div className={s.wrap} ref={ref}>

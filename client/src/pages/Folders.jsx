@@ -4,15 +4,19 @@ import {
   Folder, FolderPlus, ArrowLeft, Pencil, Trash2, Plus, X, Check,
   MoreHorizontal, FolderInput, CornerUpLeft,
 } from 'lucide-react';
-import { useAuth } from '../AuthContext';
-import API from '../api';
 import AppShell from '../components/AppShell';
+import { useToast } from '../components/Toast';
+import { useLibraryClient } from '../hooks/useLibraryClient';
 import s from './Folders.module.css';
 
 function fmtDur(sec) { const m = Math.floor(sec / 60); return `${m}:${String(sec % 60).padStart(2, '0')}`; }
 
+// T-803: folders and the recordings inside them come from the library data
+// layer (PostgreSQL when the server says `library.path === 'v1'`, the legacy
+// stores otherwise). Every write follows the recording's own source.
 export default function Folders() {
-  const { authFetch } = useAuth();
+  const { client, ready } = useLibraryClient();
+  const toast = useToast();
   const [folders, setFolders] = useState([]);
   const [recordings, setRecordings] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -25,13 +29,15 @@ export default function Folders() {
   const [confirm, setConfirm] = useState(null);
 
   async function load() {
+    if (!client) return;
     try {
-      const [fRes, rRes] = await Promise.all([authFetch(`${API}/api/folders`), authFetch(`${API}/api/recordings`)]);
-      setFolders(await fRes.json());
-      setRecordings(await rRes.json());
-    } finally { setLoading(false); }
+      const [f, r] = await Promise.all([client.listFolders(), client.listRecordings()]);
+      setFolders(f);
+      setRecordings(r);
+    } catch (e) { toast.error(e.message || 'Could not load your folders.'); }
+    finally { setLoading(false); }
   }
-  useEffect(() => { load(); /* eslint-disable-next-line */ }, []);
+  useEffect(() => { if (ready) load(); /* eslint-disable-next-line */ }, [ready, client]);
 
   const countIn = (fid) => recordings.filter((r) => r.folder === fid).length;
   const openFolder = folders.find((f) => f.id === open);
@@ -41,32 +47,34 @@ export default function Folders() {
   async function createFolder() {
     const name = newName.trim();
     if (!name) return;
-    const res = await authFetch(`${API}/api/folders`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) });
-    if (res.ok) { const nf = await res.json(); setFolders((f) => [...f, nf]); }
+    const r = await client.createFolder(name);
+    if (r.folder) setFolders((f) => [...f, r.folder]); else toast.error(r.error);
     setCreating(false); setNewName('');
   }
   async function rename(id) {
     const name = renameVal.trim();
     if (!name) { setRenaming(null); return; }
-    const res = await authFetch(`${API}/api/folders/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) });
-    if (res.ok) { const u = await res.json(); setFolders((f) => f.map((x) => (x.id === id ? u : x))); }
+    const r = await client.renameFolder(id, name);
+    if (r.folder) setFolders((f) => f.map((x) => (x.id === id ? r.folder : x))); else toast.error(r.error);
     setRenaming(null);
   }
   function deleteFolder(f) {
     setConfirm({
       title: `Delete “${f.name}”?`, message: 'The folder is removed. Videos inside it are kept and moved back to your Library.',
       onConfirm: async () => {
-        await authFetch(`${API}/api/folders/${f.id}`, { method: 'DELETE' });
+        const r = await client.deleteFolder(f.id);
+        if (!r.ok) { toast.error('Could not delete the folder.'); return; }
         // move its videos back to no-folder locally
-        setRecordings((rs) => rs.map((r) => (r.folder === f.id ? { ...r, folder: null } : r)));
+        setRecordings((rs) => rs.map((x) => (x.folder === f.id ? { ...x, folder: null } : x)));
         setFolders((fs) => fs.filter((x) => x.id !== f.id));
         if (open === f.id) setOpen(null);
       },
     });
   }
-  async function move(recId, folderId) {
-    await authFetch(`${API}/api/recordings/${recId}/meta`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ folder: folderId }) });
-    setRecordings((rs) => rs.map((r) => (r.id === recId ? { ...r, folder: folderId } : r)));
+  async function move(rec, folderId) {
+    const r = await client.patchMeta(rec, { folder: folderId });
+    if (r.error) { toast.error(r.error); return; }
+    setRecordings((rs) => rs.map((x) => (x.id === rec.id ? { ...x, folder: folderId } : x)));
   }
 
   return (
@@ -149,7 +157,7 @@ export default function Folders() {
                     <span className={s.fileDur}>{fmtDur(r.duration)}</span>
                   </Link>
                   <div className={s.fileMain}><strong>{r.title}</strong><small>{r.views || 0} views</small></div>
-                  <button className={s.removeBtn} title="Remove from folder" onClick={() => move(r.id, null)}><CornerUpLeft size={15} /> Remove</button>
+                  <button className={s.removeBtn} title="Remove from folder" onClick={() => move(r, null)}><CornerUpLeft size={15} /> Remove</button>
                 </div>
               ))}
             </div>
@@ -168,7 +176,7 @@ export default function Folders() {
                   <div key={r.id} className={s.pickRow}>
                     <div className={s.fileThumbSm}>{r.thumbnail ? <img src={r.thumbnail} alt="" /> : <div className={s.fileThumbBlank} />}</div>
                     <div className={s.fileMain}><strong>{r.title}</strong><small>{r.folder ? 'In another folder' : 'No folder'}</small></div>
-                    <button className={s.miniPrimary} onClick={() => move(r.id, open)}><Plus size={14} /> Add</button>
+                    <button className={s.miniPrimary} onClick={() => move(r, open)}><Plus size={14} /> Add</button>
                   </div>
                 ))}
               </div>

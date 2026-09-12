@@ -165,6 +165,27 @@ function decideWatch({ env = process.env } = {}) {
     : { path: 'legacy', decision: WATCH_DECISION.legacyDisabled };
 }
 
+// ── T-803: the LIBRARY gate (dashboard / folders / notifications) ────────────
+// A fourth independent on/off gate for the signed-in library pages, with the
+// same mirror rule as the web editor: an account with no PostgreSQL row cannot
+// be served its library from PostgreSQL, and that reason is recorded.
+const LIBRARY_DECISION = {
+  legacyDisabled: 'library_legacy_disabled',
+  v1Enabled: 'library_v1_enabled',
+  accountNotMigrated: 'account_not_migrated',
+};
+
+/** Only the literal 'true' enables the v1 library, and only while the v1 API is on. */
+function libraryEnabled(env = process.env) {
+  return env.V1_LIBRARY === 'true' && v1ApiEnabled(env);
+}
+
+function decideLibrary({ env = process.env, hasPostgresMirror = null } = {}) {
+  if (!libraryEnabled(env)) return { path: 'legacy', decision: LIBRARY_DECISION.legacyDisabled };
+  if (hasPostgresMirror === false) return { path: 'legacy', decision: LIBRARY_DECISION.accountNotMigrated };
+  return { path: 'v1', decision: LIBRARY_DECISION.v1Enabled };
+}
+
 /** The wire body for GET /api/client-config/public — no auth, no identifiers. */
 function publicConfigBody(watchDecision = { path: 'legacy' }) {
   return {
@@ -174,8 +195,13 @@ function publicConfigBody(watchDecision = { path: 'legacy' }) {
 }
 
 /** The wire body for GET /api/client-config. Contains no identifiers. */
-function clientConfigBody(decision, webDecision = { path: 'legacy' }, watchDecision = { path: 'legacy' }) {
+function clientConfigBody(decision, webDecision = { path: 'legacy' }, watchDecision = { path: 'legacy' }, libraryDecision = { path: 'legacy' }) {
   return {
+    // T-803: the signed-in library pages' decision (dashboard / folders / notifications).
+    library: {
+      path: libraryDecision.path,
+      v1Enabled: libraryDecision.path === 'v1',
+    },
     upload: {
       // The client obeys this; it never computes eligibility itself.
       path: decision.path,
@@ -201,5 +227,6 @@ module.exports = {
   decide, bucketFor, resolvePercent, clientConfigBody, v1ApiEnabled,
   decideWeb, webUploadEnabled, WEB_DECISION,
   decideWatch, watchPageEnabled, publicConfigBody, WATCH_DECISION,
+  decideLibrary, libraryEnabled, LIBRARY_DECISION,
   DECISION, SALT, BUCKETS,
 };
