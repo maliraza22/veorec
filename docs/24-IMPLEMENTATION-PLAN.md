@@ -128,6 +128,10 @@ Repo layout target (created incrementally):
 
 **T-1401** legacy upload route removal (fleet <1% + forced update); **T-1402** delete JSON store modules + Cloudinary SDK + dead client hacks; **T-1403** final import freeze + Cloudinary export & plan cancellation; **T-1404** docs cleanup (remove migration shims from specs).
 
+> **Status (2026-09-12): Phases 1–13 are implemented and verified locally; Phase 14 is BLOCKED on production evidence by design.** Every removal above is gated on facts only production can supply: the extension fleet share on the legacy upload route (< 1 % after a forced update), the deprecation counters (, ) staying at zero over a full observation window, the Cloudinary export and plan cancellation (an external, financial operator action), and the final import freeze after the last dual-write reconciliation. The cutover runbook is ; the gates to flip are  →  /  /  /  /  (each exact , each independently reversible), plus the operator steps recorded in  (the T-204 backfill run, the Paddle notification URL switch,  /  / storage credentials). Nothing in Phase 14 will be performed without that evidence; no production observation is claimed here.
+
+**Standing items that cannot be closed locally** (carried from earlier phases): production KPI observation windows (T-304/T-305/T-802/T-803/T-1201/T-1302 gates), the production T-204 backfill run, Safari/iOS playback (), a staging deployment of the worker fleet + Docker Compose ( §2.2 — no Docker on this machine by directive), Sentry/Prometheus dashboards against a live deployment ().
+
 ---
 
 ## Ordering summary (critical path)
