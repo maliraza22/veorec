@@ -234,3 +234,51 @@ flowchart LR
     P12 --> P14
     P13 --> P14
 ```
+
+
+---
+
+## Railway deployment of the v1 stack (as performed, 2026-09-13)
+
+A staging deployment of the whole v1 stack, in a project **separate from the legacy
+`screenrec-api`** so production is never at risk. Reproducible from this repository.
+
+**Services** — project `veorec-v1`: `Postgres`, `Redis`, `api`, `worker`.
+
+**Images.** The legacy `server/Dockerfile` builds with `server/` as its context and so
+cannot see the sibling packages the v1 routers require. Two root-context images replace
+it, selected per service with the `RAILWAY_DOCKERFILE_PATH` variable:
+
+- `Dockerfile.api` — installs `db`/`storage`/`api`/`server` and builds the SPA in a
+  first stage. `client/dist` is git-ignored, so it must be BUILT IN THE IMAGE rather than
+  copied from the upload. `server/index.js` serves `../client/dist`, so the app and the
+  API share one origin and the browser makes no cross-origin request.
+- `Dockerfile.worker` — installs `db`/`storage`/`worker` **with devDependencies**, because
+  `ffmpeg-static`/`ffprobe-static` supply the binaries `resolveBinaries()` falls back to;
+  no apt ffmpeg is needed. Also copies `server/plans.js`, the one plan catalog.
+
+**Migrations.** Set as the api service's **pre-deploy command**
+(`sh -c "cd /app/db && npm run db:migrate"`), which runs inside Railway's network where
+the internal `DATABASE_URL` resolves. This is the correct permanent pattern: schema is
+applied before each new version serves traffic. Verified: `applied 5 migration(s) … now at 5/5`.
+
+**Persistence (the trap).** The legacy JSON stores live on `DATA_DIR`; `server/users.js`
+resolves `path.join(process.env.DATA_DIR || __dirname, 'users.json')`. A Railway volume must
+be **attached at `/data`** AND `DATA_DIR` must equal `/data`. Setting that variable from Git
+Bash silently rewrote the value to `C:/Program Files/Git/data` (MSYS path conversion), so the
+container created that directory and wrote accounts to the ephemeral layer — they vanished on
+every redeploy while every dashboard field still looked correct. **Set leading-slash values
+from PowerShell (or with `MSYS_NO_PATHCONV=1`), then prove persistence behaviourally:** sign
+up, redeploy, log in again. Do not infer it from the variable or the mount being listed.
+
+**Storage credentials.** BOTH services need `STORAGE_ACCESS_KEY_ID` and
+`STORAGE_SECRET_ACCESS_KEY`; each proves it at boot — the api logs
+`/api/v1 upload API failed to mount — missing storage configuration` (the whole v1 mount is
+inside one try/catch, so **no** v1 router mounts) and the worker logs
+`no storage provider configured — processors that need storage will fail their jobs`. The
+remaining `STORAGE_*` settings are non-secret and are set in the repo's deploy notes.
+
+**Known sharp edge (open).** `rollout.v1ApiEnabled()` tests only the env flag, not whether
+the routers actually mounted, and `app.get('*')` serves the SPA for unmatched paths. With the
+flags on but storage missing, `/api/client-config/public` advertises `v1` while
+`/api/v1/*` answers **200 with HTML**. Fix both before any cutover.
